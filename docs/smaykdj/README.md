@@ -25,7 +25,7 @@ git clone https://github.com/SMAYKDJ/opendj.git ~/dev/opendj
 cd ~/dev/opendj
 git checkout smaykdj
 cargo build --release -p opendj
-cargo run --release --bin opendj
+cargo run --release -p opendj --bin opendj
 ```
 
 A primeira compilação depois de mudar arquivos `.slint` demora bastante
@@ -34,6 +34,9 @@ A primeira compilação depois de mudar arquivos `.slint` demora bastante
 O `--bin opendj` é necessário: o projeto tem quatro programas (`opendj`,
 `opendj-plugin-host`, `phrase-bench`, `stem-bench`) e sem ele o `cargo run`
 não sabe qual abrir. Também dá para abrir direto: `./target/release/opendj`.
+Sem o `-p opendj`, o `cargo` recompila o projeto inteiro com outra
+configuração (vários GB a mais em disco). Depois de compilado, o jeito mais
+rápido de abrir é `./target/release/opendj`, que não compila nada.
 
 Se o terminal disser `cargo: command not found`, rode
 `source "$HOME/.cargo/env"` uma vez, ou acrescente essa linha ao `~/.zshrc`.

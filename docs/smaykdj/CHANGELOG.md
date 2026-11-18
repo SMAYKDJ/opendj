@@ -8,7 +8,7 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ### Verificado
 - Branch `smaykdj` compilado no MacBook Air (release, 11m52s) sem erros,
   incluindo o MAP MIDI completo e o progresso dos stems.
-- Para abrir: `cargo run --release --bin opendj` (o projeto tem mais de um
+- Para abrir: `cargo run --release -p opendj --bin opendj` (o projeto tem mais de um
   programa; sem `--bin` o `cargo run` não abre nada).
 
 ### Adicionado
