@@ -5,6 +5,12 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 
 ## 2026-11-18
 
+### Verificado
+- Branch `smaykdj` compilado no MacBook Air (release, 11m52s) sem erros,
+  incluindo o MAP MIDI completo e o progresso dos stems.
+- Para abrir: `cargo run --release --bin opendj` (o projeto tem mais de um
+  programa; sem `--bin` o `cargo run` não abre nada).
+
 ### Adicionado
 - **Progresso da separação de stems em alta qualidade.** Enquanto o HTDemucs
   separa uma faixa, aparece uma pílula lilás embaixo do título do deck que se
