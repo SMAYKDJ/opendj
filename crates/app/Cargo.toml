@@ -22,6 +22,7 @@ rtrb = "0.4"
 opendj-library = { version = "0.6.0", path = "../library" }
 opendj-export = { path = "../export" }
 opendj-plugins = { path = "../plugins" }
+opendj-live = { path = "../live" }
 opendj-remote = { path = "../remote" }
 opendj-osc = { path = "../osc" }
 # Bonjour: tablets find the OSC port on the network.

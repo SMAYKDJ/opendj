@@ -33,6 +33,7 @@ import { UsbExport, UsbExportDialog } from "usb_export.slint";
 import { Tour, TourSetup, TourSetupDialog, TourTip, TourOffer } from "tour.slint";
 import { MapMode, MapMidiButton, MappingSidebar, MappingEntry } from "mapmark.slint";
 import { RemoteButton, RemoteUi, RemoteDevice } from "remote.slint";
+import { LiveButton, LiveUi } from "live.slint";
 import { ControllerEditor, ControllerEditorOverlay, EditorRow, EditorPart, EditorPanel, EditorOption, EditorSetting } from "controller_editor.slint";
 
 export { SourceUi, SourceTab, SearchItem, FoundRow, QueueLine, StatusLine } from "sources.slint";
@@ -51,6 +52,7 @@ export { LyricsUi, LyricLine, LyricMatch, WaveLyrics, WaveLine, WaveWord, DeckLi
 export { NowPlayingUi, NowDetail } from "nowplaying.slint";
 export { KaraokeWindow } from "karaoke.slint";
 export { RemoteUi, RemoteDevice }
+export { LiveUi }
 export { MixerMode, InputSettings, InputRow }
 export { BroadcastState, BroadcastStation }
 export { InstrumentsUi, LiveItem, ParamMatch, PresetItem, PresetUi, Theme, Controls, DeckActions, PhraseView, PhraseTip, BeatCounter, BeatCount, GrooveUi, GrooveKit, GrooveGenre, GrooveName, AudioSettings, OutputRow, EffectList, FxRow, KeyNotation, DeckInfo, KeyItem, Folder, TrackRow, SideRow, SideTab, SideTabs, RailOrder, TrackDrag, LibraryEdit, KeepGoingUi, UpNextUi, MenuListRow, MenuTag, StoreUi, StreamMatch, WantedUi, FilesUi, AlbumsUi, AlbumTile, HealthUi, HealthCard, HealthStage, HealthLine, HealthArea, HealthChip, HealthReview, CleanupUi, CleanupRow, FixNamesUi, GenreRow, BuyUi, BuyGroup, BuyRow, Preferences, PrefItem, ImportWizard, PluginErrors, StorageUi, StoragePart, ControllerEditor, EditorRow, EditorPart, EditorPanel, EditorOption, EditorSetting, UsbExport }
@@ -2003,6 +2005,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     if !player: MapMidiButton { }
+                    if !player: LiveButton { }
                     RemoteButton { }
                     // Player keeps the top bar for search: no MIC button,
                     // REC (File › Record Mix) only while recording, and no

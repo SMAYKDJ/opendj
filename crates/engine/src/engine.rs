@@ -1690,6 +1690,9 @@ pub struct Engine {
     /// Copies the master out for broadcasting, while on air.
     broadcast: RecordTap,
     broadcast_feed: Option<Feed>,
+    /// Copies the master out for Battle Live (video), while live.
+    live: RecordTap,
+    live_feed: Option<Feed>,
     /// Plays a track into the headphones for the info panel.
     preview: Preview,
     preview_input: Option<PreviewInput>,
@@ -1893,6 +1896,7 @@ impl Engine {
         let (meter, meter_feed) = recorder::tap(sample_rate);
         meter_feed.set_active(true);
         let (broadcast, broadcast_feed) = recorder::tap(sample_rate);
+        let (live, live_feed) = recorder::tap(sample_rate);
         let mut live_wave_rx = Vec::with_capacity(NUM_DECKS);
         let live_waves = std::array::from_fn(|_| {
             let (wave, rx) = crate::live_wave::channel(sample_rate);
@@ -1926,6 +1930,8 @@ impl Engine {
                 groove_hit_rx,
                 broadcast,
                 broadcast_feed: Some(broadcast_feed),
+                live,
+                live_feed: Some(live_feed),
                 preview,
                 preview_input: Some(preview_input),
                 sampler_input: Some(sampler_input),
@@ -2013,6 +2019,11 @@ impl Engine {
     /// The other end of the broadcast's tap; there is only one.
     pub(crate) fn take_broadcast_feed(&mut self) -> Option<Feed> {
         self.broadcast_feed.take()
+    }
+
+    /// The other end of Battle Live's tap; there is only one.
+    pub(crate) fn take_live_feed(&mut self) -> Option<Feed> {
+        self.live_feed.take()
     }
 
     /// Plays input `input` (see [`crate::inputs`]) from `feed`, or from
@@ -3124,13 +3135,14 @@ impl Engine {
         // Recording or on air (either tap copying), the limiter keeps true
         // peaks under the air ceiling (-1 dBTP), where lossy encoders don't
         // clip; otherwise under -0.5 dB.
-        let ceiling = if self.record.is_active() || self.broadcast.is_active() {
-            10f32
-                .powf(self.master.air_ceiling.get() as f32 / 20.0)
-                .min(LIMIT_CEILING)
-        } else {
-            LIMIT_CEILING
-        };
+        let ceiling =
+            if self.record.is_active() || self.broadcast.is_active() || self.live.is_active() {
+                10f32
+                    .powf(self.master.air_ceiling.get() as f32 / 20.0)
+                    .min(LIMIT_CEILING)
+            } else {
+                LIMIT_CEILING
+            };
         if ceiling != self.limiter.ceiling() {
             self.limiter.set_ceiling(ceiling);
         }
@@ -4132,15 +4144,18 @@ impl Engine {
             self.record.push(rec, 2);
             self.meter.push(rec, 2);
             self.broadcast.push(rec, 2);
+            self.live.push(rec, 2);
         } else if external {
             let rec = self.main_buf[..frames].as_flattened();
             self.record.push(rec, 2);
             self.meter.push(rec, 2);
             self.broadcast.push(rec, 2);
+            self.live.push(rec, 2);
         } else {
             self.record.push(out, channels);
             self.meter.push(out, channels);
             self.broadcast.push(out, channels);
+            self.live.push(out, channels);
         }
     }
 }

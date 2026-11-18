@@ -148,6 +148,8 @@ pub struct AudioEngine {
     groove_hits: Mutex<Option<[rtrb::Consumer<groove::GrooveHit>; NUM_DECKS]>>,
     /// The master for broadcasting, until the broadcaster takes it.
     broadcast_feed: Mutex<Option<recorder::Feed>>,
+    /// The master for Battle Live, until it takes it.
+    live_feed: Mutex<Option<recorder::Feed>>,
     /// Picks the outputs MIDI clock goes to.
     midi_clock: midi_clock::MidiClock,
 }
@@ -206,6 +208,7 @@ impl AudioEngine {
             engine.take_meter_feed().expect("meter feed"),
         );
         let broadcast_feed = engine.take_broadcast_feed();
+        let live_feed = engine.take_live_feed();
         let preview = engine.take_preview_input().expect("preview input");
         let samplers = engine.take_sampler_input().expect("sampler input");
         let visual = engine.visual_positions();
@@ -266,6 +269,7 @@ impl AudioEngine {
             live_waves: Mutex::new(Some(live_waves)),
             groove_hits: Mutex::new(Some(groove_hits)),
             broadcast_feed: Mutex::new(broadcast_feed),
+            live_feed: Mutex::new(live_feed),
             midi_clock,
         }
     }
@@ -279,6 +283,13 @@ impl AudioEngine {
     /// calls get `None`.
     pub fn take_master_feed(&self) -> Option<MasterFeed> {
         self.broadcast_feed.lock().ok()?.take().map(MasterFeed)
+    }
+
+    /// A second copy of the master, for Battle Live (the vertical video
+    /// stream), so it can run beside the radio broadcast; there is only
+    /// one, so later calls get `None`.
+    pub fn take_live_feed(&self) -> Option<MasterFeed> {
+        self.live_feed.lock().ok()?.take().map(MasterFeed)
     }
 
     /// The rate the engine runs at, in Hz.

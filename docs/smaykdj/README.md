@@ -11,7 +11,7 @@ continua igual; as mudanças ficam no branch `smaykdj` e estão listadas em
 | --- | --- | --- |
 | MAP MIDI | Botão na barra superior que liga o modo de mapeamento e abre uma barra lateral com todos os controles já mapeados | Pronto, aguardando teste no Mac |
 | Progresso dos stems HQ | Mostra no deck quanto falta para a separação em alta qualidade (HTDemucs) terminar | Pronto, aguardando teste no Mac |
-| Battle Live (TikTok) | Transmissão vertical para a live do TikTok com câmeras de celular e diretor de cenas automático | Especificação: [live-tiktok.md](live-tiktok.md) |
+| Battle Live (TikTok) | Botão LIVE na barra superior: transmissão vertical para a live do TikTok com câmeras de celular, diretor de cenas automático e gravação | Pronto, aguardando teste no Mac: [live-tiktok.md](live-tiktok.md) |
 
 ## Base
 
@@ -40,6 +40,14 @@ rápido de abrir é `./target/release/opendj`, que não compila nada.
 
 Se o terminal disser `cargo: command not found`, rode
 `source "$HOME/.cargo/env"` uma vez, ou acrescente essa linha ao `~/.zshrc`.
+
+## Battle Live precisa do ffmpeg
+
+O vídeo é codificado pelo ffmpeg, que não vem junto com o openDJ. No Mac:
+
+```bash
+brew install ffmpeg
+```
 
 ## Branches
 

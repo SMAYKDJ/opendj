@@ -1,0 +1,405 @@
+// LIVE in the top bar: Battle Live, a vertical (9:16) livestream for
+// TikTok with phone cameras. The panel shows the QR code for each phone,
+// the mode (Solo or B2B), the DJs' names, where to send it (the TikTok
+// stream key, a recording, or both), and a preview of what the audience
+// sees. openDJ's own screen never changes: only the stream gets the
+// picture with the cameras.
+import { Theme, EdgeLine } from "theme.slint";
+import { Switch } from "preferences.slint";
+
+export global LiveUi {
+    // The camera server is running (the panel was opened).
+    in property <bool> started;
+    // Sending or recording now, for how long, and how it's going.
+    in property <bool> on-air;
+    in property <string> time;
+    in property <string> health;
+    in property <string> error;
+    // No ffmpeg on this computer: how to get it.
+    in property <bool> ffmpeg-missing;
+    // B2B (two DJs) or Solo.
+    in property <bool> b2b: true;
+    in property <string> dj-a: "DJ A";
+    in property <string> dj-b: "DJ B";
+    // Seconds or bars between shots when nothing happens.
+    in property <int> rotate-bars: 16;
+    // The phones' QR codes and how each camera is doing.
+    in property <image> qr1;
+    in property <image> qr2;
+    in property <string> url1;
+    in property <string> url2;
+    in property <bool> cam1-live;
+    in property <bool> cam2-live;
+    in property <string> cam1-status;
+    in property <string> cam2-status;
+    // The picture the audience sees, a few times a second.
+    in property <image> preview;
+    // The shot now, as words, and the one picked by hand (-1 automatic).
+    in property <string> shot;
+    in property <int> manual: -1;
+    // Where it goes.
+    in property <bool> stream: true;
+    in property <bool> record: true;
+    in property <string> server;
+    in property <string> key;
+    in property <string> record-folder;
+    callback opened();
+    callback set-b2b(bool);
+    callback set-names(string, string);
+    callback set-rotate(int);
+    callback set-stream(bool);
+    callback set-record(bool);
+    callback set-server(string);
+    callback set-key(string);
+    // -1 automatic; B2B: 0 DJ A, 1 DJ B, 2 both; Solo: 0 face, 1 hands.
+    callback pick(int);
+    callback go();
+    callback stop();
+    // Switch the cameras off and close the server.
+    callback finish();
+}
+
+component LiveIcon inherits Path {
+    in property <color> ink;
+    width: 16px;
+    height: 16px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    stroke: ink;
+    stroke-width: 2px;
+    stroke-line-cap: round;
+    fill: transparent;
+    // A phone on its side with a record dot: a vertical stream.
+    commands: "M 8 2.5 L 16 2.5 A 2 2 0 0 1 18 4.5 L 18 19.5 A 2 2 0 0 1 16 21.5 L 8 21.5 A 2 2 0 0 1 6 19.5 L 6 4.5 A 2 2 0 0 1 8 2.5 Z M 10.5 12 A 1.5 1.5 0 1 0 13.5 12 A 1.5 1.5 0 1 0 10.5 12";
+}
+
+component Choice inherits Rectangle {
+    in property <[string]> choices;
+    in property <int> chosen;
+    callback picked(index: int);
+    height: 26px;
+    border-radius: Theme.radius;
+    background: Theme.control;
+    border-width: 1px;
+    border-color: Theme.border;
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        for c[i] in choices: Rectangle {
+            border-radius: Theme.radius - 2px;
+            background: i == chosen ? Theme.n-3a3a3d : cta.has-hover ? Theme.n-222225 : transparent;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                Text { text: c; color: i == chosen ? Theme.text : Theme.text-dim; font-size: 11px; font-weight: i == chosen ? 600 : 400; vertical-alignment: center; horizontal-alignment: center; }
+            }
+            cta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.picked(i); }
+            }
+        }
+    }
+}
+
+component Field inherits Rectangle {
+    in property <string> text;
+    in property <string> placeholder;
+    in property <bool> secret;
+    callback edited(string);
+    height: 26px;
+    border-radius: Theme.radius;
+    background: Theme.well;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.separator;
+    if input.text == "": Text {
+        x: 8px;
+        text: placeholder;
+        color: Theme.text-dim;
+        font-size: 12px;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+    input := TextInput {
+        x: 8px;
+        width: parent.width - 16px;
+        text: root.text;
+        input-type: secret ? InputType.password : InputType.text;
+        color: Theme.text;
+        font-size: 12px;
+        vertical-alignment: center;
+        single-line: true;
+        edited => { root.edited(self.text); }
+    }
+}
+
+component Action inherits Rectangle {
+    in property <string> label;
+    in property <color> tint: Theme.accent;
+    in property <bool> filled: true;
+    callback clicked();
+    height: 34px;
+    border-radius: 10px;
+    background: filled ? (ata.pressed ? tint.darker(0.2) : ata.has-hover ? tint.brighter(0.1) : tint) : (ata.has-hover ? Theme.n-2e2e32 : Theme.control);
+    border-width: filled ? 0px : 1px;
+    border-color: Theme.border;
+    Text { text: label; color: filled ? #14101f : Theme.text; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+    ata := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component Label inherits Text {
+    color: Theme.text-dim;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+}
+
+// A phone's QR code and how its camera is doing.
+component CameraCard inherits VerticalLayout {
+    in property <string> title;
+    in property <image> qr;
+    in property <string> url;
+    in property <bool> live;
+    in property <string> status;
+    spacing: 6px;
+    HorizontalLayout {
+        spacing: 6px;
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 4px;
+            background: live ? Theme.automix : Theme.n-48484c;
+        }
+        Text { text: title; color: Theme.text; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+    }
+    Rectangle {
+        width: 132px;
+        height: 132px;
+        border-radius: 8px;
+        background: Theme.n-ffffff;
+        clip: true;
+        Image { source: qr; width: 132px; height: 132px; image-rendering: pixelated; }
+    }
+    Text { text: status; color: live ? Theme.automix : Theme.text-dim; font-size: 11px; width: 132px; wrap: word-wrap; }
+}
+
+export component LivePanel inherits PopupWindow {
+    width: 640px;
+    close-policy: close-on-click-outside;
+    Rectangle {
+        background: Theme.panel-raised;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: Theme.s-000000b0;
+    }
+    HorizontalLayout {
+        padding: 16px;
+        spacing: 16px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 12px;
+            VerticalLayout {
+                spacing: 2px;
+                Text { text: "Battle Live"; color: Theme.text; font-size: 17px; font-weight: 700; }
+                Text {
+                    text: "Live vertical no TikTok, com as câmeras dos celulares. A tela do openDJ não muda: só a transmissão recebe a imagem montada.";
+                    color: Theme.text-dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Choice {
+                    choices: ["Solo · 1 DJ", "B2B · 2 DJs"];
+                    chosen: LiveUi.b2b ? 1 : 0;
+                    picked(i) => { LiveUi.set-b2b(i == 1); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                a := Field {
+                    horizontal-stretch: 1;
+                    text: LiveUi.dj-a;
+                    placeholder: LiveUi.b2b ? "Nome do DJ A" : "Nome do DJ";
+                    edited(t) => { LiveUi.set-names(t, b.text); }
+                }
+                b := Field {
+                    horizontal-stretch: 1;
+                    visible: LiveUi.b2b;
+                    text: LiveUi.dj-b;
+                    placeholder: "Nome do DJ B";
+                    edited(t) => { LiveUi.set-names(a.text, t); }
+                }
+            }
+            Text {
+                text: "Leia o QR code com a câmera do celular (mesma rede Wi-Fi). Na primeira vez o celular avisa que a conexão não é particular: toque em Mostrar detalhes › Visitar o site.";
+                color: Theme.text;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 16px;
+                alignment: start;
+                CameraCard {
+                    title: LiveUi.b2b ? "Celular 1 · " + LiveUi.dj-a : "Celular 1 · rosto";
+                    qr: LiveUi.qr1;
+                    url: LiveUi.url1;
+                    live: LiveUi.cam1-live;
+                    status: LiveUi.cam1-status;
+                }
+                CameraCard {
+                    title: LiveUi.b2b ? "Celular 2 · " + LiveUi.dj-b : "Celular 2 · mãos";
+                    qr: LiveUi.qr2;
+                    url: LiveUi.url2;
+                    live: LiveUi.cam2-live;
+                    status: LiveUi.cam2-status;
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Label { text: "TROCA DE CÂMERA"; vertical-alignment: center; }
+                Choice {
+                    choices: ["8 compassos", "16", "32"];
+                    chosen: LiveUi.rotate-bars <= 8 ? 0 : LiveUi.rotate-bars <= 16 ? 1 : 2;
+                    picked(i) => { LiveUi.set-rotate(i == 0 ? 8 : i == 1 ? 16 : 32); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Label { text: "CENA"; vertical-alignment: center; }
+                Choice {
+                    choices: LiveUi.b2b ? ["Automático", LiveUi.dj-a, LiveUi.dj-b, "Os dois"] : ["Automático", "Rosto", "Mãos"];
+                    chosen: LiveUi.manual + 1;
+                    picked(i) => { LiveUi.pick(i - 1); }
+                }
+            }
+            EdgeLine { line-color: Theme.border; }
+            HorizontalLayout {
+                spacing: 10px;
+                Switch { on: LiveUi.stream; toggled(on) => { LiveUi.set-stream(on); } }
+                Text { text: "Transmitir para o TikTok"; color: Theme.text; font-size: 12px; vertical-alignment: center; }
+            }
+            if LiveUi.stream: VerticalLayout {
+                spacing: 6px;
+                Field {
+                    text: LiveUi.server;
+                    placeholder: "URL do servidor (rtmp://…)";
+                    edited(t) => { LiveUi.set-server(t); }
+                }
+                Field {
+                    text: LiveUi.key;
+                    secret: true;
+                    placeholder: "Chave de transmissão";
+                    edited(t) => { LiveUi.set-key(t); }
+                }
+                Text {
+                    text: "No TikTok LIVE Studio ou em tiktok.com/live/producer: copie a URL do servidor e a chave.";
+                    color: Theme.text-dim;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                }
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                Switch { on: LiveUi.record; toggled(on) => { LiveUi.set-record(on); } }
+                Text { text: "Gravar em " + LiveUi.record-folder; color: Theme.text; font-size: 12px; vertical-alignment: center; overflow: elide; }
+            }
+            if LiveUi.ffmpeg-missing: Text {
+                text: "Falta o ffmpeg, que codifica o vídeo. No Terminal: brew install ffmpeg";
+                color: Theme.c-e5484d;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            if LiveUi.error != "": Text {
+                text: LiveUi.error;
+                color: Theme.c-e5484d;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                if !LiveUi.on-air: Action {
+                    horizontal-stretch: 1;
+                    label: LiveUi.stream ? "Entrar ao vivo" : "Começar a gravar";
+                    tint: #fe2c55;
+                    clicked => { LiveUi.go(); }
+                }
+                if LiveUi.on-air: Action {
+                    horizontal-stretch: 1;
+                    label: "Encerrar · " + LiveUi.time;
+                    tint: #fe2c55;
+                    clicked => { LiveUi.stop(); }
+                }
+                if !LiveUi.on-air: Action {
+                    width: 120px;
+                    label: "Desligar câmeras";
+                    filled: false;
+                    clicked => { LiveUi.finish(); }
+                }
+            }
+        }
+        // What the audience sees.
+        VerticalLayout {
+            spacing: 6px;
+            Label { text: "O QUE O PÚBLICO VÊ"; }
+            Rectangle {
+                width: 216px;
+                height: 384px;
+                border-radius: 10px;
+                background: #0b0b0e;
+                border-width: 1px;
+                border-color: Theme.border;
+                clip: true;
+                Image { source: LiveUi.preview; width: 216px; height: 384px; image-fit: contain; }
+            }
+            Text { text: LiveUi.shot; color: Theme.text-dim; font-size: 11px; width: 216px; wrap: word-wrap; }
+            if LiveUi.on-air: Text { text: LiveUi.health; color: Theme.text-dim; font-size: 11px; width: 216px; wrap: word-wrap; }
+        }
+    }
+}
+
+// The top bar button: LIVE, red with the time while on air.
+export component LiveButton inherits Rectangle {
+    property <bool> on: LiveUi.on-air;
+    property <color> tint: #fe2c55;
+    background: ta.pressed ? Theme.control-pressed : on ? tint.with-alpha(0.16) : ta.has-hover ? Theme.n-2e2e32 : Theme.panel-raised;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: on ? tint : LiveUi.started ? Theme.lilac : transparent;
+    height: 36px;
+    y: 8px;
+    horizontal-stretch: 0;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 7px;
+        LiveIcon {
+            y: (parent.height - self.height) / 2;
+            ink: on ? tint : Theme.text-dim;
+            opacity: on && mod(animation-tick() / 1ms, 1000) > 600 ? 0.4 : 1.0;
+        }
+        Text {
+            text: on ? LiveUi.time : "LIVE";
+            color: on ? Theme.text : Theme.text-dim;
+            font-size: on ? 13px : 11px;
+            font-weight: on ? 500 : 700;
+            letter-spacing: on ? 0px : 0.5px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            LiveUi.opened();
+            panel.show();
+        }
+    }
+    panel := LivePanel {
+        x: root.width - self.width;
+        y: root.height + 6px;
+    }
+}

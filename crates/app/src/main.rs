@@ -90,6 +90,7 @@ mod presets;
 mod put_back;
 mod quality;
 mod quick_search;
+mod live;
 mod remote;
 mod sampler;
 mod scrobble;
@@ -983,6 +984,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The phone remote: REMOTE in the top bar.
     let remote = Rc::new(RefCell::new(remote::Remote::new(&registry)));
     remote::Remote::install(&remote, &app);
+
+    // Battle Live: LIVE in the top bar, the vertical stream with phone
+    // cameras.
+    let _live = live::Live::install(&app, &registry, &engine);
 
     // Keyboard shortcuts, each an openDJscript line.
     {

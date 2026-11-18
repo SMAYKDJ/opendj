@@ -1,8 +1,24 @@
 # Battle Live: transmissão para o TikTok
 
-Especificação de um recurso ainda **não implementado**: transmitir uma sessão
-do openDJ direto para a live do TikTok, com câmeras de celular e um diretor
-de cenas automático, sem precisar do OBS.
+Transmitir uma sessão do openDJ direto para a live do TikTok, com câmeras de
+celular e um diretor de cenas automático, sem precisar do OBS.
+
+**Estado (2026-11-18):** implementado no branch `smaykdj` (botão **LIVE**),
+aguardando o primeiro teste no Mac com celulares e chave do TikTok. Precisa
+do ffmpeg (`brew install ffmpeg`).
+
+## Como usar
+
+1. Clique em **LIVE** na barra superior.
+2. Escolha **Solo** ou **B2B** e escreva os nomes.
+3. Em cada celular, leia o QR code com a câmera. Na primeira vez o navegador
+   avisa que a conexão não é particular: toque em *Mostrar detalhes* ›
+   *Visitar o site* (iPhone) ou *Avançado* › *Continuar* (Android). Depois
+   toque em **Ligar câmera** e permita o acesso.
+4. Cole a URL do servidor e a chave de transmissão (TikTok LIVE Studio ou
+   tiktok.com/live/producer). Deixe **Gravar** ligado para ter o MP4.
+5. **Entrar ao vivo**. Feche o painel antes: o que está na janela do openDJ
+   vai para a transmissão, inclusive o painel aberto.
 
 ## Fluxo
 
@@ -74,20 +90,15 @@ Não depende do crossfader: muitos DJs mixam pelo volume do canal.
 - Saída: vídeo vertical 1080×1920, 30 fps, H.264, com o áudio da mixagem
   master em AAC.
 
-## O que precisa ser construído
+## Como foi construído
 
-Hoje o openDJ transmite só áudio (rádio pela internet, crate `broadcast`).
-Para esta função faltam:
-
-1. Receber o vídeo dos celulares pelo QR code (o openDJ já pareia o celular
-   por QR para o controle remoto, crate `remote`).
-2. Capturar a tela do openDJ.
-3. Montar a imagem vertical com as câmeras e a tela.
-4. O diretor de cenas, lendo o nível dos canais e o tempo restante das faixas.
-5. Codificar vídeo + áudio master e enviar ao servidor RTMP do TikTok.
-
-Primeira etapa sugerida: os passos 1 a 4, salvando a imagem vertical como
-gravação. A transmissão ao TikTok (passo 5) vem depois.
+| Etapa | Onde | Como |
+| --- | --- | --- |
+| 1. Câmeras dos celulares | `crates/live/src/phones.rs`, `camera.html` | Servidor HTTPS na porta 7497 (certificado feito no notebook e guardado), uma chave aleatória por sessão no QR code, o celular manda JPEG pelo WebSocket (até 24 por segundo, lado maior 960 px) |
+| 2. Tela do openDJ | `crates/app/src/live.rs` | `take_snapshot` da janela, 10 vezes por segundo ao vivo e 2,5 na prévia, reduzida para o tamanho em que aparece |
+| 3. Imagem vertical | `crates/live/src/compose.rs` | 720 × 1280 desenhado com tiny-skia e a fonte Inter, no layout do design |
+| 4. Diretor de cenas | `crates/live/src/director.rs` | Regras acima, lendo `VuMeter`, `volume`, `crossfader`, `duration`, `playposition` e `bpm` |
+| 5. Envio | `crates/live/src/output.rs`, `session.rs` | ffmpeg com a imagem pela entrada padrão e o master por um socket local; H.264 pelo VideoToolbox do Mac e AAC; RTMP (FLV), MP4 fragmentado ou os dois |
 
 ## Fontes
 

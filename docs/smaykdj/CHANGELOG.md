@@ -3,6 +3,47 @@
 Tudo o que mudou nesta edição em relação ao openDJ original, do mais novo
 para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 
+## 2026-11-18 (tarde)
+
+### Adicionado
+- **Battle Live: live vertical no TikTok, sem OBS.** Botão **LIVE** na barra
+  superior (fora do modo Player). O painel tem:
+  - modo **Solo · 1 DJ** ou **B2B · 2 DJs** e o nome de cada DJ;
+  - um QR code para cada celular. O celular abre uma página do próprio
+    openDJ (HTTPS na rede Wi-Fi) e manda a câmera, sem instalar aplicativo.
+    Na primeira vez o celular avisa que a conexão "não é particular", porque
+    o certificado foi feito pelo próprio notebook: é só seguir para o site;
+  - a prévia do que o público vê (720 × 1280);
+  - troca de câmera a cada 8, 16 ou 32 compassos e escolha de cena na mão;
+  - URL do servidor e chave de transmissão do TikTok (a chave fica nas
+    Chaves do macOS, não no arquivo de configurações) e gravação em MP4
+    na pasta das gravações.
+- **Diretor de cenas** que segue o que está soando, não o crossfader: o
+  nível de cada canal com o fader e o crossfader aplicados, acima de −30 dB.
+  A faixa com menos tempo restante é a que sai; o outro DJ é o próximo.
+  Testado com 12 casos (fader do canal baixo, mixagem pelos dois, faixa
+  acabando, troca a cada 16 compassos, mínimo de 4 compassos por cena, cena
+  na mão, Solo com uma ou duas câmeras).
+- **Segunda cópia do master no motor** (`take_live_feed`), para a live
+  poder rodar junto com a rádio pela internet.
+- Arquivos: novo crate `crates/live` (`phones`, `compose`, `director`,
+  `output`, `session`, página `camera.html`), `crates/app/src/live.rs`,
+  `crates/app/ui/live.slint`, `crates/engine/src/engine.rs`,
+  `crates/engine/src/lib.rs`; plano em
+  `openspec/changes/add-battle-live/`.
+
+### Verificado na nuvem
+- 26 testes do crate `opendj-live`, incluindo um celular falso mandando
+  imagem pelo HTTPS e uma gravação real com o ffmpeg: 3,02 s de imagem para
+  2,99 s de som (imagem e som juntos).
+
+### Falta testar no Mac
+- Celulares de verdade (iPhone e Android), o custo de copiar a tela do
+  openDJ no MacBook Air e a transmissão no TikTok com a chave.
+- A votação #A/#B no chat ainda não conta votos: o TikTok não tem uma forma
+  oficial de um aplicativo ler o chat. A barra existe no desenho e aparece
+  quando houver votos.
+
 ## 2026-11-18
 
 ### Verificado

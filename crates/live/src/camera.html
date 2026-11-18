@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0e">
+<title>openDJ · Câmera</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b0b0e; --panel:#17151d; --text:#f2f0f7; --muted:#a59fb5; --accent:#b49cff; --live:#fe2c55; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font-family:-apple-system, system-ui, sans-serif; }
+  body { display:flex; flex-direction:column; padding: max(12px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); gap:12px; }
+  header { display:flex; align-items:center; justify-content:space-between; }
+  h1 { font-size:17px; margin:0; font-weight:700; }
+  h1 span { color:var(--accent); }
+  .pill { font-size:12px; font-weight:800; letter-spacing:.5px; padding:5px 10px; border-radius:999px; background:var(--panel); color:var(--muted); }
+  .pill.on { background:var(--live); color:#fff; }
+  .stage { position:relative; flex:1; min-height:0; border-radius:16px; overflow:hidden; background:var(--panel); display:flex; align-items:center; justify-content:center; }
+  video { width:100%; height:100%; object-fit:contain; background:#000; }
+  .mirror { transform:scaleX(-1); }
+  .msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; padding:24px; color:var(--muted); font-size:15px; line-height:1.45; }
+  .row { display:flex; gap:10px; }
+  button { flex:1; font:inherit; font-size:15px; font-weight:700; padding:14px; border-radius:14px; border:0; background:var(--panel); color:var(--text); }
+  button.primary { background:var(--accent); color:#14101f; }
+  #status { font-size:13px; color:var(--muted); text-align:center; min-height:18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>openDJ · <span id="title">Câmera</span></h1>
+  <div id="live" class="pill">DESLIGADA</div>
+</header>
+<div class="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <div id="msg" class="msg">Toque em <b>&nbsp;Ligar câmera&nbsp;</b> e permita o acesso.<br>Deixe o celular na tomada e com a tela ligada.</div>
+</div>
+<div class="row">
+  <button id="start" class="primary">Ligar câmera</button>
+  <button id="flip">Trocar câmera</button>
+</div>
+<div id="status"></div>
+<canvas id="canvas" hidden></canvas>
+<script>
+"use strict";
+const q = new URLSearchParams(location.search);
+const slot = q.get("s"), key = q.get("k");
+const FPS = 24, LONG_SIDE = 960, QUALITY = 0.7, MAX_BUFFERED = 256 * 1024;
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+$("title").textContent = "Câmera " + slot;
+let facing = slot === "2" ? "environment" : "user";
+let stream = null, ws = null, busy = false, sent = 0, lastCount = performance.now(), wake = null, replaced = false;
+
+function status(t) { $("status").textContent = t; }
+function setLive(on) { const p = $("live"); p.textContent = on ? "AO VIVO" : "DESLIGADA"; p.classList.toggle("on", on); }
+
+async function startCamera() {
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    $("msg").innerHTML = "Este navegador não liberou a câmera.<br>Abra o endereço do QR code com <b>https://</b> e aceite o aviso de segurança.";
+    return;
+  }
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    });
+  } catch (e) {
+    $("msg").textContent = "Sem acesso à câmera: " + (e.message || e.name);
+    return;
+  }
+  video.srcObject = stream;
+  video.classList.toggle("mirror", facing === "user");
+  await video.play().catch(() => {});
+  $("msg").style.display = "none";
+  $("start").textContent = "Reiniciar";
+  keepAwake();
+  connect();
+}
+
+async function keepAwake() {
+  try { if ("wakeLock" in navigator && !wake) { wake = await navigator.wakeLock.request("screen"); wake.addEventListener("release", () => (wake = null)); } } catch (_) {}
+}
+
+function connect() {
+  if (ws && ws.readyState <= 1) return;
+  replaced = false;
+  ws = new WebSocket(`wss://${location.host}/cam/ws?s=${slot}&k=${key}`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { setLive(true); status("Conectado ao openDJ"); };
+  ws.onmessage = (m) => { try { if (JSON.parse(m.data).replaced) { replaced = true; status("Outro celular assumiu esta câmera."); } } catch (_) {} };
+  ws.onclose = () => {
+    setLive(false);
+    if (replaced) return;
+    status("Reconectando…");
+    setTimeout(connect, 1000);
+  };
+}
+
+function send() {
+  if (!ws || ws.readyState !== 1 || busy || !video.videoWidth || ws.bufferedAmount > MAX_BUFFERED) return;
+  const k = Math.min(1, LONG_SIDE / Math.max(video.videoWidth, video.videoHeight));
+  const w = Math.round(video.videoWidth * k), h = Math.round(video.videoHeight * k);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  ctx.drawImage(video, 0, 0, w, h);
+  busy = true;
+  canvas.toBlob((b) => {
+    busy = false;
+    if (b && ws && ws.readyState === 1) { ws.send(b); sent++; }
+  }, "image/jpeg", QUALITY);
+  const now = performance.now();
+  if (now - lastCount > 2000) {
+    status(`Enviando ${Math.round((sent * 1000) / (now - lastCount))} quadros/s · ${w}×${h}`);
+    sent = 0; lastCount = now;
+  }
+}
+
+$("start").onclick = startCamera;
+$("flip").onclick = () => { facing = facing === "user" ? "environment" : "user"; startCamera(); };
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") keepAwake(); });
+setInterval(send, 1000 / FPS);
+</script>
+</body>
+</html>
