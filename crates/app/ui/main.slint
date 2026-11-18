@@ -31,7 +31,7 @@ import { Browser, Folder, TrackRow, SideRow, SideTab, SideTabs, RailOrder, DragG
 import { Preferences, PreferencesOverlay, PrefItem, ImportWizard, PluginErrors, StorageUi, StoragePart } from "preferences.slint";
 import { UsbExport, UsbExportDialog } from "usb_export.slint";
 import { Tour, TourSetup, TourSetupDialog, TourTip, TourOffer } from "tour.slint";
-import { MapMode } from "mapmark.slint";
+import { MapMode, MapMidiButton, MappingSidebar, MappingEntry } from "mapmark.slint";
 import { RemoteButton, RemoteUi, RemoteDevice } from "remote.slint";
 import { ControllerEditor, ControllerEditorOverlay, EditorRow, EditorPart, EditorPanel, EditorOption, EditorSetting } from "controller_editor.slint";
 
@@ -2002,6 +2002,7 @@ export component AppWindow inherits Window {
                             x: 10px + clamp(root.width / 2 - search-area.absolute-position.x - 10px - self.width / 2, 0px, room - self.width);
                         }
                     }
+                    if !player: MapMidiButton { }
                     RemoteButton { }
                     // Player keeps the top bar for search: no MIC button,
                     // REC (File › Record Mix) only while recording, and no
@@ -2485,6 +2486,12 @@ export component AppWindow inherits Window {
         if ControllerEditor.open: ControllerEditorOverlay {
             width: root.width;
             height: root.height;
+        }
+        // The mapped controls while Map mode is on (MAP MIDI button).
+        if MapMode.active && MapMode.sidebar-open: MappingSidebar {
+            x: root.width - self.width - 8px;
+            y: 60px;
+            height: root.height - 68px;
         }
         if UsbExport.open: UsbExportDialog {
             width: root.width;

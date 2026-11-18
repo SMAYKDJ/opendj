@@ -28,7 +28,7 @@ use opendj_controllers::{
 };
 use slint::ComponentHandle;
 
-use crate::{settings, short_port_name, AppWindow, ControllerEditor, MapMode};
+use crate::{settings, short_port_name, AppWindow, ControllerEditor, MapMode, MappingEntry};
 
 /// How long a knob or fader is listened to before it's learned, if it
 /// doesn't send enough to tell sooner.
@@ -834,6 +834,7 @@ impl Mapper {
     /// Reads which controls the controllers plugged in have bound.
     fn refresh_mapped(&mut self) {
         let mut bound = HashSet::new();
+        let mut entries: Vec<MappingEntry> = Vec::new();
         let own_dir = settings::own_mappings_dir();
         for (_, file) in self.ports() {
             let base = self.base(&file);
@@ -855,11 +856,36 @@ impl Mapper {
                 (Some(_), None) => continue,
             };
             bound.extend(learn::bound_controls(&built));
+            // The sidebar's list: each control, named as the controller's
+            // picture names it, or by its MIDI message without one.
+            let layout = opendj_controllers::layout::Layout::for_file(&file);
+            for (&(status, number), inputs) in &built.inputs {
+                for input in inputs {
+                    if input.options.has(opendj_controllers::mapping::Options::SCRIPT) {
+                        continue;
+                    }
+                    let control = match &input.action {
+                        Some(line) => format!("{}{line}", learn::SCRIPT),
+                        None => format!("{},{}", input.group, input.key),
+                    };
+                    let hardware = layout
+                        .as_ref()
+                        .and_then(|l| l.find(status, number).map(|(p, _)| p.label.clone()))
+                        .unwrap_or_else(|| opendj_controllers::view::message_text(status, number));
+                    entries.push(MappingEntry {
+                        hardware: hardware.into(),
+                        function: describe(&control).into(),
+                    });
+                }
+            }
         }
+        entries.sort_by(|a, b| a.function.cmp(&b.function));
         *self.mapped.borrow_mut() = bound;
         self.tick += 1;
         if let Some(app) = self.app.upgrade() {
-            app.global::<MapMode>().set_tick(self.tick);
+            let g = app.global::<MapMode>();
+            g.set_tick(self.tick);
+            g.set_entries(std::rc::Rc::new(slint::VecModel::from(entries)).into());
         }
     }
 }

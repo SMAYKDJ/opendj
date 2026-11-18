@@ -5,6 +5,12 @@
 // mode is on and takes the click.
 import { Theme } from "theme.slint";
 
+// One line of the mapped-controls sidebar: the hardware control and what it does.
+export struct MappingEntry {
+    hardware: string,
+    function: string,
+}
+
 export global MapMode {
     in property <bool> active;
     // The control picked on screen, waiting for a hardware control.
@@ -17,6 +23,10 @@ export global MapMode {
     // What the last control did before, now replaced; "" for nothing.
     in property <string> replaced;
     in property <bool> can-undo;
+    // The controls mapped so far, for the sidebar.
+    in property <[MappingEntry]> entries;
+    // The sidebar of mapped controls is showing (MAP MIDI button).
+    in-out property <bool> sidebar-open;
     // The mapping wizard (Quick map in the code): a walk through the usual
     // controls, one after another. First it asks which controller (one of
     // `devices`, or a press on it), then whether it's used with two decks
@@ -39,6 +49,99 @@ export global MapMode {
     callback choose-device(index: int);
     callback choose-decks(decks: int);
     callback skip();
+}
+
+// The MAP MIDI button for the top bar: starts Map mode and opens the sidebar
+// of mapped controls; while Map mode is on it shows and hides the sidebar.
+export component MapMidiButton inherits Rectangle {
+    height: 36px; y: 8px; horizontal-stretch: 0;
+    border-radius: 10px; border-width: 1px;
+    border-color: MapMode.active ? Theme.lilac : transparent;
+    background: MapMode.active ? Theme.lilac.with-alpha(0.16)
+        : ta.has-hover ? Theme.n-ffffff10 : Theme.panel-raised;
+    tl := HorizontalLayout {
+        padding-left: 12px; padding-right: 12px; spacing: 6px;
+        Path {
+            width: 14px; height: 14px; y: (parent.height - self.height) / 2;
+            viewbox-width: 14; viewbox-height: 14; fill: transparent; stroke-width: 1.5px;
+            stroke: MapMode.active ? Theme.lilac : Theme.text-dim;
+            commands: "M 2 7 L 12 7 M 2 4 A 2 2 0 1 0 2 10 A 2 2 0 1 0 2 4 M 12 4 A 2 2 0 1 0 12 10 A 2 2 0 1 0 12 4";
+        }
+        Text { text: "MAP MIDI"; color: MapMode.active ? Theme.lilac : Theme.text-dim;
+               font-size: 11px; font-weight: 700; letter-spacing: 0.5px; vertical-alignment: center; }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            if MapMode.active { MapMode.sidebar-open = !MapMode.sidebar-open; }
+            else { MapMode.start(); MapMode.sidebar-open = true; }
+        }
+    }
+}
+
+// The controls mapped so far, as a list on the right of the window while
+// Map mode is on: what each does, and the hardware control that does it.
+export component MappingSidebar inherits Rectangle {
+    width: 280px; background: Theme.panel; border-width: 1px;
+    border-color: Theme.lilac.with-alpha(0.4); clip: true;
+    VerticalLayout {
+        padding: 12px; spacing: 0px;
+        Rectangle {
+            height: 36px;
+            HorizontalLayout {
+                spacing: 8px;
+                Text { text: "CONTROLES MAPEADOS"; color: Theme.lilac-text; font-size: 10px;
+                       font-weight: 700; letter-spacing: 0.8px; vertical-alignment: center; horizontal-stretch: 1; }
+                close-btn := TouchArea {
+                    width: 24px; mouse-cursor: pointer;
+                    clicked => { MapMode.sidebar-open = false; }
+                    Rectangle {
+                        border-radius: 6px;
+                        background: close-btn.has-hover ? Theme.n-ffffff18 : transparent;
+                        Path { width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10;
+                               stroke: Theme.text-dim; stroke-width: 1.5px;
+                               commands: "M 1 1 L 9 9 M 9 1 L 1 9"; }
+                    }
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.border; }
+        if MapMode.entries.length == 0: Rectangle {
+            height: 60px;
+            Text { text: "Clique em um controle na tela\ne mova um botão do controlador.";
+                   color: Theme.text-dim; font-size: 11px; wrap: word-wrap;
+                   vertical-alignment: center; horizontal-alignment: center; }
+        }
+        if MapMode.entries.length > 0: Flickable {
+            vertical-stretch: 1;
+            content-height: el.preferred-height;
+            el := VerticalLayout {
+                spacing: 0px;
+                for entry[i] in MapMode.entries: Rectangle {
+                    height: 44px;
+                    background: mod(i, 2) == 0 ? Theme.n-ffffff0a : transparent;
+                    border-radius: 4px;
+                    VerticalLayout {
+                        padding-left: 8px; padding-right: 8px;
+                        padding-top: 6px; padding-bottom: 6px; spacing: 2px;
+                        Text { text: entry.function; color: Theme.text; font-size: 11px; font-weight: 600; overflow: elide; }
+                        Text { text: entry.hardware; color: Theme.text-dim; font-size: 10px; overflow: elide; }
+                    }
+                }
+            }
+        }
+        Rectangle { height: 10px; }
+        done-btn := TouchArea {
+            height: 32px; mouse-cursor: pointer;
+            clicked => { MapMode.done(); MapMode.sidebar-open = false; }
+            Rectangle {
+                border-radius: 8px;
+                background: done-btn.has-hover ? Theme.lilac : Theme.lilac.with-alpha(0.7);
+                Text { text: "Concluir mapeamento"; color: #1a1426; font-size: 11px; font-weight: 700;
+                       vertical-alignment: center; horizontal-alignment: center; }
+            }
+        }
+    }
 }
 
 export component MapMark inherits Rectangle {
