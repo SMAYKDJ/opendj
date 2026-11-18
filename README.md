@@ -1,3 +1,8 @@
+> **Edição SMAYKDJ** — fork do openDJ com ajustes próprios (botão MAP MIDI,
+> progresso dos stems HQ e a especificação de transmissão para o TikTok).
+> Veja [docs/smaykdj](docs/smaykdj/README.md) e o
+> [histórico de ajustes](docs/smaykdj/CHANGELOG.md).
+
 # openDJ
 
 **[Download the latest release](https://github.com/openwave-studio/opendj/releases/latest)** · [All releases](https://github.com/openwave-studio/opendj/releases)
