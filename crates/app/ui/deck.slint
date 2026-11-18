@@ -73,6 +73,8 @@ export struct DeckInfo {
     stem-hq: bool,
     // High-quality stems are being prepared.
     stem-preparing: bool,
+    // How far preparing them is, 0 to 1; -1 while it waits its turn.
+    stem-progress: float,
     // Whether high-quality stems can be prepared (a file without them,
     // nothing preparing).
     can-prepare-hq: bool,
@@ -1378,6 +1380,29 @@ export component Header inherits Rectangle {
                     alignment: center;
                     spacing: 2px;
                     Text { text: groove ? "Groove Box" : looper ? "Looper" : live > 0 ? live-name : info.loaded ? info.title : "Empty deck"; color: Theme.text; font-size: compact ? 14px : 18px; font-weight: 500; overflow: elide; }
+                    // High-quality stems being prepared: a pill that fills as it goes.
+                    if info.stem-preparing && info.loaded && live == 0 && !groove && !looper: HorizontalLayout {
+                        alignment: start;
+                        Rectangle {
+                            height: stem-text.preferred-height + 4px;
+                            width: stem-text.preferred-width + 14px;
+                            border-radius: self.height / 2;
+                            clip: true;
+                            background: Theme.lilac.with-alpha(0.18);
+                            Rectangle {
+                                x: 0;
+                                width: parent.width * max(0, info.stem-progress);
+                                background: Theme.lilac.with-alpha(0.45);
+                                animate width { duration: 400ms; }
+                            }
+                            stem-text := Text {
+                                text: info.stem-progress < 0 ? "STEMS · QUEUED" : "STEMS " + round(info.stem-progress * 100) + "%";
+                                color: Theme.lilac-text;
+                                font-size: compact ? 10px : 11px;
+                                font-weight: 700;
+                            }
+                        }
+                    }
                     // An instrument plugin: its format, as a chip.
                     if live == 3 && InstrumentsUi.format() != "": HorizontalLayout {
                         alignment: start;
@@ -2053,7 +2078,8 @@ component StemPad inherits Rectangle {
     if show-quality && count > 0: Text {
         x: parent.width - self.width - 4px;
         y: 2px;
-        text: info.stem-hq ? "HQ" : info.stem-preparing ? "HQ…" : "INSTANT";
+        text: info.stem-hq ? "HQ" : !info.stem-preparing ? "INSTANT"
+            : info.stem-progress < 0 ? "HQ…" : "HQ " + round(info.stem-progress * 100) + "%";
         font-size: 8px;
         font-weight: 700;
         letter-spacing: 0.5px;

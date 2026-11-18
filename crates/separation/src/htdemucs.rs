@@ -38,4 +38,30 @@ impl<B: Backend> HtDemucs<B> {
         .map_err(|e| e.to_string())?;
         Ok(stems.into_iter().map(|s| [s.left, s.right]).collect())
     }
+
+    /// [`HtDemucs::separate`], calling `progress` with 0..1 as each chunk
+    /// of the track is done.
+    pub fn separate_with_progress(
+        &self,
+        channels: [&[f32]; 2],
+        progress: impl FnMut(f32),
+    ) -> Result<Vec<[Vec<f32>; 2]>, String> {
+        use demucs_core::listener::{ForwardEvent, ForwardListener};
+        struct Chunks<F: FnMut(f32)>(F);
+        impl<F: FnMut(f32)> ForwardListener for Chunks<F> {
+            fn on_event(&mut self, event: ForwardEvent) {
+                if let ForwardEvent::ChunkDone { index, total } = event {
+                    (self.0)((index + 1) as f32 / total.max(1) as f32);
+                }
+            }
+        }
+        let stems = pollster::block_on(self.model.separate_with_listener(
+            channels[0],
+            channels[1],
+            crate::SAMPLE_RATE,
+            &mut Chunks(progress),
+        ))
+        .map_err(|e| e.to_string())?;
+        Ok(stems.into_iter().map(|s| [s.left, s.right]).collect())
+    }
 }

@@ -288,10 +288,15 @@ fn htdemucs(path: &Path, weights: &Path) -> Result<StemSource, String> {
     let audio = crate::decode::decode(path)?;
     let rate = audio.sample_rate;
     let [l, r] = channels(&audio);
+    // Decoding is the first 5%, the model up to 90%, writing the rest.
+    crate::stems::set_progress(path, Some(0.05));
     let bytes = std::fs::read(weights).map_err(|e| format!("{}: {e}", weights.display()))?;
     let device = Default::default();
     let model = HtDemucs::<opendj_separation::Gpu>::load(&bytes, &device)?;
-    let stems = model.separate([&l, &r])?;
+    let stems = model.separate_with_progress([&l, &r], |p| {
+        crate::stems::set_progress(path, Some(0.05 + 0.85 * p));
+    })?;
+    crate::stems::set_progress(path, Some(0.9));
     let model_rate = opendj_separation::SAMPLE_RATE;
     let dir = crate::cache::stems_dir(path).ok_or("no cache folder")?;
     let work = dir.with_extension(format!("work{}", std::process::id()));
@@ -308,6 +313,8 @@ fn htdemucs(path: &Path, weights: &Path) -> Result<StemSource, String> {
             let (sl, sr) = (fit(sl)?, fit(sr)?);
             crate::recorder::write_flac(&work.join(format!("{name}.flac")), rate, [&sl, &sr])
                 .map_err(|e| e.to_string())?;
+            let written = crate::stems::separation_progress(path).unwrap_or(0.9);
+            crate::stems::set_progress(path, Some(written + 0.025));
         }
         Ok(())
     })();

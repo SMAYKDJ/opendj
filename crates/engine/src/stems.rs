@@ -795,6 +795,29 @@ pub fn separation(path: &Path) -> Option<Separation> {
     JOBS.lock().unwrap().as_ref()?.get(path).cloned()
 }
 
+/// How far each running separation is, 0..1, by file. A separation that is
+/// waiting its turn has none.
+static PROGRESS: Mutex<Option<HashMap<PathBuf, f32>>> = Mutex::new(None);
+
+/// How far the running separation of `path` is (0..1); `None` while it
+/// waits its turn or when none runs.
+pub fn separation_progress(path: &Path) -> Option<f32> {
+    PROGRESS.lock().unwrap().as_ref()?.get(path).copied()
+}
+
+pub(crate) fn set_progress(path: &Path, done: Option<f32>) {
+    let mut all = PROGRESS.lock().unwrap();
+    let all = all.get_or_insert_with(HashMap::new);
+    match done {
+        Some(d) => {
+            all.insert(path.to_owned(), d.clamp(0.0, 1.0));
+        }
+        None => {
+            all.remove(path);
+        }
+    }
+}
+
 fn set_job(path: &Path, state: Separation) {
     JOBS.lock()
         .unwrap()
@@ -970,7 +993,9 @@ pub fn separate(path: &Path, done: impl FnOnce(Result<StemSource, String>) + Sen
                 // One at a time: each takes the GPU (or every core).
                 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
                 let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+                set_progress(&path, Some(0.0));
                 let result = crate::separation::separate_hq(&path);
+                set_progress(&path, None);
                 set_job(
                     &path,
                     match &result {

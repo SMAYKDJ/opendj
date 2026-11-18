@@ -2413,6 +2413,11 @@ impl Decks {
                 }
                 _ => false,
             },
+            // How far the HQ separation is (0..1), -1 while it waits its turn.
+            stem_progress: match &t.source {
+                Source::File(path) => stems::separation_progress(path).unwrap_or(-1.0),
+                _ => -1.0,
+            },
             can_prepare_hq: match &t.source {
                 Source::File(path) => {
                     !stems.is_some_and(|s| s.playing_quality() == stems::Quality::High)
