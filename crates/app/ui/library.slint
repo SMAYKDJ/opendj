@@ -4,6 +4,7 @@ import { LineEdit } from "std-widgets.slint";
 import { ListView, ScrollView } from "scroll.slint";
 import { Theme, EdgeLine, CloseIcon } from "theme.slint";
 import { HoverTip } from "controls.slint";
+import { MapMark, MapMode } from "mapmark.slint";
 import { SourceUi, SearchesPanel, SourceResults, SourceSetup } from "sources.slint";
 import { InstrumentsPanel } from "instruments.slint";
 import { InfoPanel, TrackInfo } from "info.slint";
@@ -4613,6 +4614,53 @@ component TrackList inherits Rectangle {
                         }
                     }
                 }
+                // Load selected track on a deck: arrows pointing left (deck 1)
+                // or right (deck 2+). Visible when Map MIDI is off; each also
+                // carries a MapMark so the hardware control can be mapped.
+                if !results: VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: 4px;
+                        for d[i] in LibraryEdit.decks >= 4 ? [1, 2, 3, 4] : [1, 2]: Rectangle {
+                            property <string> map-key: "[Channel" + d + "],LoadSelectedTrack";
+                            width: 28px; height: 28px;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: dkta.has-hover ? Theme.deck-color(i) : Theme.border;
+                            background: dkta.has-hover ? Theme.deck-color(i).with-alpha(0.18) : transparent;
+                            HorizontalLayout {
+                                alignment: center;
+                                spacing: 1px;
+                                // Left arrow for deck 1, right arrow for deck 2+
+                                if i == 0: Path {
+                                    width: 10px; height: 10px;
+                                    viewbox-width: 10; viewbox-height: 10;
+                                    stroke: dkta.has-hover ? Theme.deck-color(i) : Theme.text-dim;
+                                    stroke-width: 1.5px; fill: transparent;
+                                    commands: "M 7 1 L 2 5 L 7 9 M 2 5 L 9 5";
+                                }
+                                if i > 0: Path {
+                                    width: 10px; height: 10px;
+                                    viewbox-width: 10; viewbox-height: 10;
+                                    stroke: dkta.has-hover ? Theme.deck-color(i) : Theme.text-dim;
+                                    stroke-width: 1.5px; fill: transparent;
+                                    commands: "M 3 1 L 8 5 L 3 9 M 8 5 L 1 5";
+                                }
+                                Text {
+                                    text: d;
+                                    color: dkta.has-hover ? Theme.deck-color(i) : Theme.text-dim;
+                                    font-size: 10px; font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            dkta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { LibraryEdit.load-on-deck(current, i); }
+                            }
+                            MapMark { key: map-key; }
+                        }
+                    }
+                }
                 // Filter: shows or hides the filter bar; lit while the list
                 // is narrowed by a search or a filter.
                 VerticalLayout {
@@ -5000,6 +5048,10 @@ component TrackList inherits Rectangle {
     pure function stars(n: int) -> string {
         n == 1 ? "★" : n == 2 ? "★★" : n == 3 ? "★★★" : n == 4 ? "★★★★" : "★★★★★"
     }
+    // Scroll MapMark: overlay sobre a lista para mapeamento MIDI de rolagem.
+    // Invisible at the top-left corner (the list covers it); Map MIDI mode
+    // shows it as a tinted strip so the DJ can map a knob to scroll the list.
+    MapMark { key: "[Library],MoveVertical"; x: 0; y: 56px; width: 32px; height: 48px; }
 }
 
 // Starts and stops Automix: a play triangle and the word, green while on.
