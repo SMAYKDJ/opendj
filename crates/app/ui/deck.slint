@@ -2293,6 +2293,31 @@ component HotcueCell inherits Rectangle {
         }
     }
     if !set: Text { text: "+"; color: Theme.text-dim; font-size: 15px; font-weight: 400; }
+    // × button: appears on hover when the cue is set; click deletes the cue.
+    if set && touch.has-hover: Rectangle {
+        x: parent.width - self.width - 3px;
+        y: 3px;
+        width: 14px;
+        height: 14px;
+        border-radius: 3px;
+        background: x-ta.has-hover ? tint.with-alpha(0.25) : transparent;
+        Text {
+            text: "×";
+            color: tint.with-alpha(x-ta.has-hover ? 1.0 : 0.6);
+            font-size: 13px;
+            font-weight: 700;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+        x-ta := TouchArea {
+            mouse-cursor: pointer;
+            pointer-event(e) => {
+                if e.button != PointerEventButton.left { return; }
+                if e.kind == PointerEventKind.down  { Controls.set-value(clear-index, 1); }
+                if e.kind == PointerEventKind.up    { Controls.set-value(clear-index, 0); }
+            }
+        }
+    }
     touch := TouchArea {
         pointer-event(e) => {
             if e.button != PointerEventButton.left && e.kind != PointerEventKind.cancel {
