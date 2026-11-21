@@ -85,6 +85,7 @@ Released so far: v0.1.0 and v0.2.0 (2026-10-15, 2026-10-20) and v0.3.0 (prepared
 - [add-mixer-deck](changes/add-mixer-deck/proposal.md) (a Mixer deck with up to eight thin input strips in place of Aux 1 to 3, the mic as a strip, an FX switch per strip, and each interface opened once; a user request after the aux latency fix, issue #606, 2026-11-10)
 - [add-light-mode](changes/add-light-mode/proposal.md) (Dark, Light or Match system: light panels and library with the waveforms kept on dark wells as rekordbox does, a calm light Player, deeper lilac for text; a user request after a Serato, rekordbox, VirtualDJ and TIDAL comparison, issue #646, 2026-11-12)
 - [add-waveform-look-menu](changes/add-waveform-look-menu/proposal.md) (the waveforms button's drop-down gets a live height slider, Full/Half for the large waveforms too, Color without Blue and a Center/Left needle, out of Settings › Appearance; a user request, issue #730, 2026-11-14; moved to v0.7 at a user request)
+- [add-midi-map-feedback](changes/add-midi-map-feedback/proposal.md) (MIDI output feedback in Map mode: lights the pad or button being armed so the DJ has tactile confirmation; a user request, 2026-11-21)
 
 ## v0.8 · From the booth to the studio
 
