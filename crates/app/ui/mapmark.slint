@@ -9,6 +9,8 @@ import { Theme } from "theme.slint";
 export struct MappingEntry {
     hardware: string,
     function: string,
+    // The control key ("[Channel1],play") used to remove this mapping.
+    key: string,
 }
 
 export global MapMode {
@@ -40,6 +42,8 @@ export global MapMode {
     callback start();
     callback done();
     callback pick(key: string);
+    // Removes the mapping for a control (by its key) from all controllers.
+    callback remove(key: string);
     callback undo();
     // The last control does what it did before too.
     callback keep-both();
@@ -121,11 +125,26 @@ export component MappingSidebar inherits Rectangle {
                     height: 44px;
                     background: mod(i, 2) == 0 ? Theme.n-ffffff0a : transparent;
                     border-radius: 4px;
-                    VerticalLayout {
-                        padding-left: 8px; padding-right: 8px;
-                        padding-top: 6px; padding-bottom: 6px; spacing: 2px;
-                        Text { text: entry.function; color: Theme.text; font-size: 11px; font-weight: 600; overflow: elide; }
-                        Text { text: entry.hardware; color: Theme.text-dim; font-size: 10px; overflow: elide; }
+                    HorizontalLayout {
+                        padding-left: 8px; padding-right: 4px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            padding-top: 6px; padding-bottom: 6px; spacing: 2px;
+                            Text { text: entry.function; color: Theme.text; font-size: 11px; font-weight: 600; overflow: elide; }
+                            Text { text: entry.hardware; color: Theme.text-dim; font-size: 10px; overflow: elide; }
+                        }
+                        rm := TouchArea {
+                            width: 28px; mouse-cursor: pointer;
+                            clicked => { MapMode.remove(entry.key); }
+                            Rectangle {
+                                border-radius: 6px;
+                                background: rm.has-hover ? #ff444430 : transparent;
+                                Path { width: 9px; height: 9px; viewbox-width: 10; viewbox-height: 10;
+                                       stroke: rm.has-hover ? #ff6666 : Theme.text-dim;
+                                       stroke-width: 1.5px;
+                                       commands: "M 1 1 L 9 9 M 9 1 L 1 9"; }
+                            }
+                        }
                     }
                 }
             }
@@ -157,7 +176,10 @@ export component MapMark inherits Rectangle {
         border-color: armed ? Theme.lilac : Theme.lilac.with-alpha(mapped ? 0.7 : 0.35);
         ta := TouchArea {
             mouse-cursor: pointer;
-            clicked => { MapMode.pick(root.key); }
+            clicked => {
+                if mapped { MapMode.remove(root.key); }
+                else { MapMode.pick(root.key); }
+            }
         }
     }
 }

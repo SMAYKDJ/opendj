@@ -136,6 +136,8 @@ impl Mapper {
         let e = m.clone();
         g.on_choose_decks(move |n| e.borrow_mut().choose_decks(n.clamp(2, 4) as u8));
         let e = m.clone();
+        g.on_remove(move |key| e.borrow_mut().remove(&key));
+        let e = m.clone();
         g.on_skip(move || e.borrow_mut().next_step());
         m
     }
@@ -255,6 +257,42 @@ impl Mapper {
         g.set_last("".into());
         g.set_replaced("".into());
         self.say_status();
+    }
+
+    /// Removes the mapping for `key` from every controller's own mapping.
+    fn remove(&mut self, key: &str) {
+        let Some(dir) = settings::own_mappings_dir() else {
+            return;
+        };
+        let mut changed = false;
+        for (_, file) in self.ports() {
+            let Some(mut mine) = self.own_for(&file) else {
+                continue;
+            };
+            let before_len = mine.mapping.rows.len();
+            mine.mapping.rows.retain(|r| match &r.action {
+                Action::Bind { control: c, .. } => c != key,
+                _ => true,
+            });
+            if mine.mapping.rows.len() < before_len {
+                if own::save(&dir, &mine).is_ok() {
+                    if let Some(c) = &self.controllers {
+                        c.reload(&file);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.refresh_mapped();
+        }
+        // Deselect if this control was armed.
+        if self.armed.as_deref() == Some(key) {
+            self.armed = None;
+            if let Some(app) = self.app.upgrade() {
+                app.global::<MapMode>().set_armed("".into());
+            }
+        }
     }
 
     /// Called every frame.
@@ -875,6 +913,7 @@ impl Mapper {
                     entries.push(MappingEntry {
                         hardware: hardware.into(),
                         function: describe(&control).into(),
+                        key: control.clone().into(),
                     });
                 }
             }
