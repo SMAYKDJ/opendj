@@ -330,6 +330,10 @@ export global LibraryEdit {
     // The row's main artist and its album, for the menu's "Go to" lines.
     pure callback go-to-text(row: int) -> [string];
     callback load-on-deck(row: int, deck: int);
+    // The browse selector: move the pick `steps` rows (down for more), and
+    // press it (picks the row, or opens the folder, as the browse knob does).
+    callback browse(steps: int);
+    callback browse-press();
     // Opens the side panel's Info tab on the row's track.
     callback show-info(row: int);
     // The key that runs this openDJscript line (⌘I), for a menu line's hint.
@@ -4217,6 +4221,137 @@ component AlbumGrid inherits Rectangle {
     }
 }
 
+// The browse selector, as on a CDJ: a knob that moves through the list
+// (turn it with the wheel or drag it up and down, click to pick), in a ring
+// cut down the middle. The left half loads the picked track on the left
+// deck, the right half on the right deck. In Map MIDI each part takes a
+// control on the controller.
+component CdjSelector inherits Rectangle {
+    // The row picked in the list.
+    in property <int> current;
+    width: 96px;
+    height: 96px;
+    // How far the knob has turned, in turns, for its grip marks.
+    property <float> turns;
+    property <length> wheel-left;
+    property <int> drag-steps;
+    property <int> drag-to;
+    property <bool> dragged;
+    property <length> ring: 20px;
+
+    function step(n: int) {
+        if n == 0 { return; }
+        LibraryEdit.browse(n);
+        turns += n / 24;
+    }
+
+    // One half of the ring: deck 0 on the left, deck 1 on the right.
+    for d in [0, 1]: Rectangle {
+        x: d == 0 ? 0 : root.width / 2;
+        width: root.width / 2;
+        height: root.height;
+        property <bool> hot: half-ta.has-hover;
+        property <bool> down: half-ta.pressed;
+        Path {
+            x: d == 0 ? 0 : -root.width / 2;
+            width: root.width;
+            height: root.height;
+            viewbox-width: 100;
+            viewbox-height: 100;
+            fill: down ? Theme.deck-color(d).with-alpha(0.55)
+                : hot ? Theme.deck-color(d).with-alpha(0.28) : Theme.panel-raised;
+            stroke: hot || down ? Theme.deck-color(d) : Theme.border;
+            stroke-width: 1px;
+            commands: d == 0
+                ? "M 48.5 0.5 A 49.5 49.5 0 0 0 48.5 99.5 L 48.5 80 A 30 30 0 0 1 48.5 20 Z"
+                : "M 51.5 0.5 A 49.5 49.5 0 0 1 51.5 99.5 L 51.5 80 A 30 30 0 0 0 51.5 20 Z";
+        }
+        // Which deck this half loads, in the middle of the ring.
+        Text {
+            x: d == 0 ? 3px : parent.width - self.width - 3px;
+            y: (parent.height - self.height) / 2;
+            width: root.ring - 6px;
+            horizontal-alignment: center;
+            text: d == 0 ? "◀" : "▶";
+            color: hot || down ? Theme.deck-color(d) : Theme.text-dim;
+            font-size: 11px;
+        }
+        half-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { LibraryEdit.load-on-deck(root.current, d); }
+        }
+        MapMark {
+            key: "[Channel" + (d + 1) + "],LoadSelectedTrack";
+            corner: root.width / 2;
+        }
+    }
+
+    // The knob.
+    knob := Rectangle {
+        x: root.ring;
+        y: root.ring;
+        width: root.width - 2 * root.ring;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: knob-ta.pressed && !root.dragged ? Theme.lilac.with-alpha(0.35)
+            : @radial-gradient(circle, Theme.n-2a2a2e 0%, Theme.n-0a0a0b 100%);
+        border-width: 1px;
+        border-color: knob-ta.has-hover ? Theme.lilac : Theme.border;
+        // Grip marks round the edge, turning with the knob.
+        Path {
+            width: parent.width;
+            height: parent.height;
+            viewbox-width: 56;
+            viewbox-height: 56;
+            stroke: knob-ta.has-hover ? Theme.text : Theme.text-dim;
+            stroke-width: 1.2px;
+            fill: transparent;
+            transform-rotation: root.turns * 360deg;
+            animate transform-rotation { duration: 80ms; }
+            commands: "M 28 3 L 28 9 M 45.7 10.3 L 41.4 14.6 M 53 28 L 47 28 M 45.7 45.7 L 41.4 41.4 M 28 53 L 28 47 M 10.3 45.7 L 14.6 41.4 M 3 28 L 9 28 M 10.3 10.3 L 14.6 14.6";
+        }
+        knob-ta := TouchArea {
+            mouse-cursor: ns-resize;
+            pointer-event(e) => {
+                if e.kind == PointerEventKind.down {
+                    root.drag-steps = 0;
+                    root.dragged = false;
+                }
+            }
+            moved => {
+                // A step for each 14 px dragged; down goes down the list.
+                if self.pressed {
+                    root.drag-to = self.mouse-y >= self.pressed-y
+                        ? floor((self.mouse-y - self.pressed-y) / 14px)
+                        : -floor((self.pressed-y - self.mouse-y) / 14px);
+                    if root.drag-to != root.drag-steps {
+                        root.step(root.drag-to - root.drag-steps);
+                        root.drag-steps = root.drag-to;
+                        root.dragged = true;
+                    }
+                }
+            }
+            clicked => {
+                if !root.dragged { LibraryEdit.browse-press(); }
+            }
+            scroll-event(e) => {
+                if e.delta-y == 0 { return reject; }
+                root.wheel-left += e.delta-y;
+                // Wheel up goes up the list.
+                if root.wheel-left >= 24px {
+                    root.step(-floor(root.wheel-left / 24px));
+                    root.wheel-left = mod(root.wheel-left, 24px);
+                } else if root.wheel-left <= -24px {
+                    root.step(floor(-root.wheel-left / 24px));
+                    root.wheel-left = -mod(-root.wheel-left, 24px);
+                }
+                accept
+            }
+        }
+        MapMark { key: "[Library],MoveVertical"; corner: knob.width / 2; }
+    }
+}
+
 component TrackList inherits Rectangle {
     in property <[TrackRow]> rows;
     // Its selection is lilac while it has focus, gray while the folders do.
@@ -4617,7 +4752,7 @@ component TrackList inherits Rectangle {
                 // Load selected track on a deck: arrows pointing left (deck 1)
                 // or right (deck 2+). Visible when Map MIDI is off; each also
                 // carries a MapMark so the hardware control can be mapped.
-                if !results: VerticalLayout {
+                if !results && LibraryEdit.decks >= 4: VerticalLayout {
                     alignment: center;
                     HorizontalLayout {
                         spacing: 4px;
@@ -5048,10 +5183,12 @@ component TrackList inherits Rectangle {
     pure function stars(n: int) -> string {
         n == 1 ? "★" : n == 2 ? "★★" : n == 3 ? "★★★" : n == 4 ? "★★★★" : "★★★★★"
     }
-    // Scroll MapMark: overlay sobre a lista para mapeamento MIDI de rolagem.
-    // Invisible at the top-left corner (the list covers it); Map MIDI mode
-    // shows it as a tinted strip so the DJ can map a knob to scroll the list.
-    MapMark { key: "[Library],MoveVertical"; x: 0; y: 56px; width: 32px; height: 48px; }
+    // The CDJ-style browse selector, in the list's bottom right corner.
+    if !results && empty-title == "": CdjSelector {
+        x: root.width - self.width - 16px;
+        y: root.height - self.height - 16px;
+        current: root.current;
+    }
 }
 
 // Starts and stops Automix: a play triangle and the word, green while on.

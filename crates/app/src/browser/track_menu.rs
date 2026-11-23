@@ -111,6 +111,10 @@ impl Browser {
             w(&|b| b.load_row_on_deck(row as usize, deck as usize))
         });
         let w = with.clone();
+        edit.on_browse(move |steps| w(&|b| b.nudge_browse(steps)));
+        let w = with.clone();
+        edit.on_browse_press(move || w(&|b| b.press_browse()));
+        let w = with.clone();
         edit.on_show_info(move |row| w(&|b| b.show_info(row)));
         edit.on_key_for(|script| crate::shortcuts::key_for(&script).into());
         let w = with.clone();
@@ -124,6 +128,19 @@ impl Browser {
             let (artist, album) = text.into_inner();
             ModelRc::new(VecModel::from(vec![artist, album]))
         });
+    }
+
+    /// The browse selector on screen turned: moves the pick as a browse knob
+    /// on a controller does, on the next poll.
+    fn nudge_browse(&mut self, steps: i32) {
+        let c = &self.lib.steps[0].0;
+        c.set(c.get() + f64::from(steps));
+    }
+
+    /// The browse selector on screen pressed, as a browse knob's press.
+    fn press_browse(&mut self) {
+        let c = &self.lib.go_to_item;
+        c.set(c.get() + 1.0);
     }
 
     /// The library track at a row of the list.

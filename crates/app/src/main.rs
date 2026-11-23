@@ -45,6 +45,7 @@ mod automix;
 mod automix_order;
 mod automix_phrases;
 mod backup;
+mod apc_pads;
 mod beat_counter;
 mod broadcast;
 mod browser;
@@ -736,6 +737,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // VIEW (the DDJ-FLX4's SHIFT + right LOAD): the next of the DJ's
     // layouts (layouts.rs), round to the first.
     let layout_next = registry.push("[Skin]", "layout_next");
+    apc_pads::install(&registry);
+    apc_pads::show(&app);
     // The deck 3 and 4 switches for two-deck controllers (see
     // opendj_controllers::LAYER_KEYS): clicking a strip's deck number in
     // 4-Deck moves that side over. Outside 4-Deck they go back to decks 1
@@ -3050,6 +3053,25 @@ impl Gpu {
     ) {
         let global = app.global::<BeatCounter>();
         let mode = global.get_mode();
+        // The APC's pad rows follow the phrases whatever the counter shows.
+        let pads = match track {
+            Some(t) if d < 2 && apc_pads::active() => {
+                let phrases = if drawn.is_empty() {
+                    self.phrases(d, t)
+                } else {
+                    drawn.clone()
+                };
+                beat_counter::count(t, seconds, &phrases)
+            }
+            _ => None,
+        };
+        let lit = apc_pads::update(d, pads.as_ref(), playing);
+        if d < 2 {
+            let g = app.global::<ApcPads>();
+            if g.get_lit().row_data(d) != Some(lit as i32) {
+                g.get_lit().set_row_data(d, lit as i32);
+            }
+        }
         let count = match track {
             Some(t) if mode != beat_counter::MODE_OFF => {
                 // The overview's phrases, found even while it hides them.

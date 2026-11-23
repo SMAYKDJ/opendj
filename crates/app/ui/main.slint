@@ -17,6 +17,7 @@ import { WaveHeight, WaveHeightList, WaveHeightGrip } from "wave_height.slint";
 export { WaveHeight }
 import { WaveLook } from "wave_look.slint";
 export { WaveLook }
+export { ApcPads } from "apc.slint";
 import { LayoutsUi, LayoutEntry } from "layouts.slint";
 export { LayoutsUi, LayoutEntry } from "layouts.slint";
 import { CueList } from "cues.slint";
@@ -1812,6 +1813,9 @@ export component AppWindow inherits Window {
     // space bar pauses or resumes the master deck. Any other key goes to
     // the keyboard shortcuts, which run openDJscript (⌘1 to ⌘5 rate the
     // picked tracks).
+    // Room the mapped-controls sidebar takes at the window's right edge:
+    // the app narrows beside it instead of hiding under it.
+    property <length> map-side: MapMode.active && MapMode.sidebar-open ? 288px : 0px;
     keys := FocusScope {
         // ← and → bend the deck started last while held, by 2% (4% with
         // Shift), to nudge its beat into line (see key-pressed).
@@ -1946,6 +1950,8 @@ export component AppWindow inherits Window {
             reject
         }
         VerticalLayout {
+            x: 0;
+            width: root.width - root.map-side;
             // The window's black shows between the panels as thin lines:
             // one line under each panel that shows, so the panels folded to
             // nothing add no gaps.
@@ -2492,7 +2498,7 @@ export component AppWindow inherits Window {
             border-color: Theme.lilac;
         }
         if MapMode.active: MapBar {
-            x: (root.width - self.width) / 2;
+            x: (root.width - root.map-side - self.width) / 2;
             y: 58px;
         }
 
@@ -2514,9 +2520,10 @@ export component AppWindow inherits Window {
         }
         // The mapped controls while Map mode is on (MAP MIDI button).
         if MapMode.active && MapMode.sidebar-open: MappingSidebar {
-            x: root.width - self.width - 8px;
-            y: 60px;
-            height: root.height - 68px;
+            x: root.width - root.map-side + 4px;
+            y: 8px;
+            width: root.map-side - 12px;
+            height: root.height - 16px;
         }
         if UsbExport.open: UsbExportDialog {
             width: root.width;

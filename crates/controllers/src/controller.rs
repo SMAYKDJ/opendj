@@ -45,6 +45,9 @@ pub struct Controller {
     rows: ScriptRows,
     /// HID: the last input report, to skip repeats.
     repeats: Repeats,
+    /// The APC Key 25 mk2's top pad rows as phrase bars (its own
+    /// feature, on whatever mapping it runs).
+    phrase_rows: Option<crate::apc_phrase::PhraseRows>,
 }
 
 /// The device an HID mapping talks to when there is none (a test, or the
@@ -256,6 +259,7 @@ impl Controller {
             layers: ([false; 2], 0),
             rows,
             repeats: Repeats::default(),
+            phrase_rows: crate::apc_phrase::is_apc(name).then(Default::default),
         };
         let id = serde_str(&c.name);
         for p in c.prefixes.clone() {
@@ -498,6 +502,9 @@ impl Controller {
                 o.last = None;
             }
             self.rows.resend();
+            if let Some(p) = &mut self.phrase_rows {
+                p.resend();
+            }
         }
         {
             let registry = self.host.borrow().registry.clone();
@@ -505,6 +512,25 @@ impl Controller {
             self.rows.poll(&registry, now, &mut sent);
             self.host.borrow_mut().sent.extend(sent);
         }
+        // The APC's phrase rows; their LEDs aren't the mapping's while on,
+        // and when they go off the mapping's are sent again.
+        let rows_on = match &mut self.phrase_rows {
+            Some(p) => {
+                let registry = self.host.borrow().registry.clone();
+                let mut sent = Vec::new();
+                if p.poll(&registry, &mut sent) {
+                    for o in &mut self.outputs {
+                        if crate::apc_phrase::takes(o.output.status, o.output.control) {
+                            o.version = None;
+                            o.last = None;
+                        }
+                    }
+                }
+                self.host.borrow_mut().sent.extend(sent);
+                p.on()
+            }
+            None => false,
+        };
         let mut h = self.host.borrow_mut();
         // A side switched decks, or the instrument the device follows
         // moved: the LEDs follow the other deck.
@@ -520,6 +546,9 @@ impl Controller {
             }
         }
         for o in &mut self.outputs {
+            if rows_on && crate::apc_phrase::takes(o.output.status, o.output.control) {
+                continue;
+            }
             let v = o.control.version();
             if o.version == Some(v) {
                 continue;
@@ -583,6 +612,22 @@ impl Controller {
     /// and lets go of any deck this controller still holds by its jog.
     pub fn shutdown(&mut self) {
         crate::pickup::forget_port(&self.name);
+        // LEDs it lit go dark: a mapping reloaded without one of them (its
+        // button mapped elsewhere or taken away) would leave it lit for good.
+        {
+            let mut h = self.host.borrow_mut();
+            if let Some(p) = &mut self.phrase_rows {
+                let mut sent = Vec::new();
+                p.dark(&mut sent);
+                h.sent.extend(sent);
+            }
+            for o in &mut self.outputs {
+                if o.output.off != 0xFF && o.last.is_some_and(|b| b != o.output.off) {
+                    h.sent.push(vec![o.output.status, o.output.control, o.output.off]);
+                    o.last = Some(o.output.off);
+                }
+            }
+        }
         for p in self.prefixes.clone() {
             if self.script.has_function(&format!("{p}.shutdown")) {
                 self.script.eval(&format!("{p}.shutdown()"));
