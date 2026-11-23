@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::catalog::describe;
-use crate::format::{Midi, OpenDjMapping, Row};
+use crate::format::{Light, LightSource, Midi, OpenDjMapping, Row};
 use crate::mapping::{Mapping, Options, When};
 
 /// What a hardware control sent, read as a binding: its message and how
@@ -104,6 +104,31 @@ pub fn hear_for(msgs: &[Vec<u8>], control: &str) -> Option<Heard> {
 /// `script:deck 1 set 'pad_tab' 2`.
 pub const SCRIPT: &str = "script:";
 
+/// The Mixxx control that shows whether `control` is active, or `None`
+/// when that control has no known visual indicator. Used to add a LED
+/// light automatically when a button is learned via Map mode.
+///
+/// For example, `[Channel1],play` → `[Channel1],play_indicator`;
+/// `[Channel1],hotcue_3_activate` → `[Channel1],hotcue_3_enabled`.
+fn light_for_bind(control: &str) -> Option<String> {
+    let (group, key) = control.split_once(',')?;
+    // Strip note-off suffix if present (shouldn't be, but guard anyway).
+    let indicator = if key == "play" {
+        "play_indicator".to_string()
+    } else if key == "cue_default" {
+        "cue_indicator".to_string()
+    } else if key == "sync_enabled" {
+        "sync_enabled".to_string()
+    } else if key == "pfl" {
+        "pfl".to_string()
+    } else if let Some(n) = key.strip_prefix("hotcue_").and_then(|s| s.strip_suffix("_activate")) {
+        format!("hotcue_{n}_enabled")
+    } else {
+        return None;
+    };
+    Some(format!("{group},{indicator}"))
+}
+
 /// Binds what was heard to `control` (`[Channel1],play`, or
 /// [`SCRIPT`] and a line) in the own mapping,
 /// pressing on no layer. What that message did there before goes, unless
@@ -163,6 +188,29 @@ pub fn learn(
     };
     row.name = name.to_string();
     own.rows.push(row);
+    // Add a light for button controls that have a known visual indicator,
+    // so the controller's LED follows the control's state automatically.
+    if let Some(light_control) = light_for_bind(control) {
+        let midi = heard.midi;
+        let already = own
+            .lights
+            .iter()
+            .any(|l| (l.midi.status, l.midi.number) == (midi.status, midi.number));
+        if !already {
+            let mut light = Light::new(
+                midi,
+                LightSource::Bind {
+                    control: light_control.to_string(),
+                    min: 0.5,
+                    max: 1.0,
+                    on: 0x7f,
+                    off: 0x00,
+                },
+            );
+            light.name = name.to_string();
+            own.lights.push(light);
+        }
+    }
     let mut said: Vec<String> = Vec::new();
     for i in before {
         if format!("{},{}", i.group, i.key) == control
