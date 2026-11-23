@@ -4272,6 +4272,15 @@ impl Browser {
             app.set_folders_focused(self.folders_focused);
         }
         let folder_steps: f64 = self.lib.folder_steps.iter().map(|(c, s)| take(c) * s).sum();
+        // The browse selector on screen shows the turn and its way, from
+        // the controller or the screen alike.
+        let moved = (steps + folder_steps).round() as i64;
+        if moved != 0 {
+            let edit = app.global::<LibraryEdit>();
+            edit.set_browse_way(moved.signum() as i32);
+            edit.set_browse_turns(edit.get_browse_turns().wrapping_add(moved as i32));
+            edit.set_browse_moves(edit.get_browse_moves().wrapping_add(1));
+        }
         let mut folder_steps = folder_steps.round() as i64;
         if self.folders_focused {
             folder_steps += steps.round() as i64;
@@ -4337,6 +4346,15 @@ impl Browser {
         for d in 0..NUM_DECKS {
             let load = take(&self.lib.load[d]) > 0.0;
             let and_play = take(&self.lib.load_and_play[d]) > 0.0;
+            // The selector's half for this deck flashes, as if clicked.
+            if (load || and_play) && d < 2 {
+                let edit = app.global::<LibraryEdit>();
+                if d == 0 {
+                    edit.set_load_presses_1(edit.get_load_presses_1().wrapping_add(1));
+                } else {
+                    edit.set_load_presses_2(edit.get_load_presses_2().wrapping_add(1));
+                }
+            }
             if let (Some(id), true) = (selected.filter(|&i| self.playable(i)), load || and_play) {
                 self.adopt(&[id]);
                 if self.engine.load_track(d, self.library[id].clone()) {
