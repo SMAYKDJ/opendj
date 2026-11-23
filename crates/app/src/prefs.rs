@@ -103,8 +103,10 @@ const FOLDERS_TAB: usize = 2;
 const BROADCAST: i32 = 11;
 /// Settings › Broadcast's tabs.
 const BROADCAST_TABS: [&str; 2] = ["Stations", "Now playing"];
+/// Settings › APC Key 25: its top pad rows following the phrases.
+const APC: i32 = 12;
 /// The page list's names, by page number.
-const PAGE_NAMES: [&str; 12] = [
+const PAGE_NAMES: [&str; 13] = [
     "Audio",
     "Mixer",
     "Decks",
@@ -117,6 +119,7 @@ const PAGE_NAMES: [&str; 12] = [
     "Player",
     "Plugins",
     "Broadcast",
+    "APC Key 25",
 ];
 
 /// Bitrates offered for a broadcast, in kb/s.
@@ -1034,6 +1037,13 @@ impl Prefs {
         self.refresh();
     }
 
+    /// Settings › APC Key 25's picture shows what was just picked.
+    fn show_apc(&self) {
+        if let Some(app) = self.app.upgrade() {
+            crate::apc_pads::show(&app);
+        }
+    }
+
     /// Fills the rows again for what is shown.
     fn refresh(&mut self) {
         let Some(app) = self.app.upgrade() else {
@@ -1520,6 +1530,7 @@ impl Prefs {
                 items
             }
             KEYBOARD => self.keyboard_page(),
+            APC => apc_items(),
             LAYOUTS => {
                 let mut items = Vec::new();
                 items.extend([PrefItem {
@@ -2632,6 +2643,13 @@ impl Prefs {
     }
 
     fn toggled(&mut self, id: &str, on: bool) {
+        if id == crate::apc_pads::ON_KEY || id == crate::apc_pads::TRAIL_KEY {
+            settings::set(id, json!(on));
+            crate::apc_pads::apply();
+            self.show_apc();
+            self.refresh();
+            return;
+        }
         if crate::midi_clock::toggled(&self.registry, id, on) {
             self.refresh();
             return;
@@ -2754,6 +2772,15 @@ impl Prefs {
     }
 
     fn picked(&mut self, id: &str, index: usize) {
+        if let Some(d) = crate::apc_pads::COLOR_KEYS.iter().position(|k| *k == id) {
+            if index < crate::apc_pads::COLORS.len() {
+                settings::set(crate::apc_pads::COLOR_KEYS[d], json!(index));
+                crate::apc_pads::apply();
+                self.show_apc();
+            }
+            self.refresh();
+            return;
+        }
         if crate::midi_clock::picked(id, index) {
             self.refresh();
             return;
@@ -3708,6 +3735,45 @@ fn record_source_item() -> PrefItem {
              comes in. With an external mixer, pick the channel its record out comes in on.",
         )
     }
+}
+
+/// Settings › APC Key 25: the phrase rows on or off, their colours and the
+/// trail. The picture above them is drawn by the page itself.
+fn apc_items() -> Vec<PrefItem> {
+    use crate::apc_pads;
+    let mut items = vec![switch(
+        apc_pads::ON_KEY,
+        "Frases nos pads",
+        "A 1ª fileira de pads acompanha a frase do deck 1, a 2ª a do deck 2. Cada fileira \
+         acende um pad por vez da direita para a esquerda (um pad a cada oitavo da frase) e \
+         apaga quando a próxima frase começa. Deck parado ou sem faixa: fileira apagada. \
+         Ligado, os pads dessas duas fileiras não acendem mais pelo mapeamento.",
+        apc_pads::on(),
+    )];
+    if !apc_pads::on() {
+        return items;
+    }
+    let names: Vec<&str> = apc_pads::COLORS.iter().map(|c| c.0).collect();
+    for d in 0..2 {
+        items.push(PrefItem {
+            choices: strings(&names),
+            chosen: apc_pads::color(d) as i32,
+            ..item(
+                apc_pads::COLOR_KEYS[d],
+                MENU,
+                if d == 0 { "Cor do deck 1" } else { "Cor do deck 2" },
+                if d == 0 { "A cor da 1ª fileira." } else { "A cor da 2ª fileira." },
+            )
+        });
+    }
+    items.push(switch(
+        apc_pads::TRAIL_KEY,
+        "Rastro",
+        "Os pads que já passaram ficam mais fracos e só o pad da agulha fica no brilho máximo. \
+         Desligado, todos os pads acesos ficam no brilho máximo.",
+        apc_pads::trail(),
+    ));
+    items
 }
 
 fn item(id: &str, kind: i32, title: &str, detail: &str) -> PrefItem {
