@@ -19,10 +19,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use opendj_controllers::edit;
-use opendj_controllers::format::{Action, Midi, OpenDjMapping, Row};
+use opendj_controllers::format::{Action, Light, LightSource, Midi, OpenDjMapping, Row};
 use opendj_controllers::learn::{self, Heard};
 use opendj_controllers::own::{self, OwnMapping};
 use opendj_controllers::quick;
+use opendj_controllers::routing::{self, DeckChoice};
 use opendj_controllers::{
     device_key, is_own_file, is_system_port, Controllers, Mapping, MappingChoice,
 };
@@ -231,7 +232,9 @@ impl Mapper {
             ),
             (None, _, None) => "Plug in a controller to map its controls.".to_string(),
             (Some(d), None, _) => format!("Click a control on screen, then move one on the {d}."),
-            (Some(d), Some(_), _) => format!("Now press or move a control on the {d}."),
+            (Some(d), Some(_), _) => format!(
+                "Now press or move a control on the {d}. Click it again on screen to remove its mapping."
+            ),
         };
         g.set_status(text.into());
     }
@@ -272,8 +275,18 @@ impl Mapper {
             let before_len = mine.mapping.rows.len();
             mine.mapping.rows.retain(|r| match &r.action {
                 Action::Bind { control: c, .. } => c != key,
+                // An openDJscript row is listed as `script:` and its line.
+                Action::Script(line) => format!("{}{line}", learn::SCRIPT) != key,
                 _ => true,
             });
+            // Its LED goes with it.
+            if mine.mapping.rows.len() < before_len {
+                if let Some(indicator) = learn::light_for_bind(key) {
+                    mine.mapping.lights.retain(|l| {
+                        !matches!(&l.source, LightSource::Bind { control: c, .. } if *c == indicator)
+                    });
+                }
+            }
             if mine.mapping.rows.len() < before_len {
                 if own::save(&dir, &mine).is_ok() {
                     if let Some(c) = &self.controllers {
@@ -454,6 +467,24 @@ impl Mapper {
             walk_at: walking.as_ref().map(|(at, _, _)| *at),
         };
         self.apply(&step, false);
+        // A device set to play another deck moves every deck it maps along:
+        // what was learned for deck 1 then reaches deck 2, and deck 2's
+        // controls a deck further on. Say so, or the mapping looks broken.
+        if matches!(
+            routing::deck_choice(port),
+            DeckChoice::Follow | DeckChoice::Deck(2..)
+        ) {
+            let last = format!("{} now does {}.", step.name, describe(&step.control));
+            g.set_last(
+                format!(
+                    "{last} But in Settings › Controllers the {} is set to play another deck, \
+                     so its deck 1 controls can reach deck 2 and its deck 2 controls another \
+                     deck. Set it to \"As mapped\" to use the decks as mapped.",
+                    short_port_name(port)
+                )
+                .into(),
+            );
+        }
         if step.walk_at.is_some() {
             self.after_step(&step);
         }
@@ -791,9 +822,31 @@ impl Mapper {
                     .iter()
                     .any(|r| (r.midi.status, r.midi.number) == (midi.status, midi.number));
                 if !used {
-                    let mut row = Row::bind(*midi, &format!("[Channel1],hotcue_{n}_activate"), &[]);
-                    row.name = format!("Pad {n} · deck 1");
+                    let control = format!("[Channel1],hotcue_{n}_activate");
+                    let pad_name = format!("Pad {n} · deck 1");
+                    let mut row = Row::bind(*midi, &control, &[]);
+                    row.name = pad_name.clone();
                     mine.mapping.rows.push(row);
+                    // LED: light up while hotcue N is set.
+                    let light_already = mine
+                        .mapping
+                        .lights
+                        .iter()
+                        .any(|l| (l.midi.status, l.midi.number) == (midi.status, midi.number));
+                    if !light_already {
+                        let mut light = Light::new(
+                            *midi,
+                            LightSource::Bind {
+                                control: format!("[Channel1],hotcue_{n}_enabled"),
+                                min: 0.5,
+                                max: 1.0,
+                                on: 0x7f,
+                                off: 0x00,
+                            },
+                        );
+                        light.name = pad_name;
+                        mine.mapping.lights.push(light);
+                    }
                 }
             }
             format!("Pads 1 to {} are hot cues.", pads.len() + 2)
@@ -898,6 +951,11 @@ impl Mapper {
             // picture names it, or by its MIDI message without one.
             let layout = opendj_controllers::layout::Layout::for_file(&file);
             for (&(status, number), inputs) in &built.inputs {
+                // A button's release (Note Off) is the same control as its
+                // press: list it once.
+                if status & 0xF0 == 0x80 && built.inputs.contains_key(&(0x90 | (status & 0x0F), number)) {
+                    continue;
+                }
                 for input in inputs {
                     if input.options.has(opendj_controllers::mapping::Options::SCRIPT) {
                         continue;
@@ -919,6 +977,10 @@ impl Mapper {
             }
         }
         entries.sort_by(|a, b| a.function.cmp(&b.function));
+        // The same button doing the same thing is one line, however many
+        // times it turns up (in both of a device's ports, or twice in a file).
+        let mut seen = HashSet::new();
+        entries.retain(|e| seen.insert((e.hardware.clone(), e.key.clone())));
         *self.mapped.borrow_mut() = bound;
         self.tick += 1;
         if let Some(app) = self.app.upgrade() {

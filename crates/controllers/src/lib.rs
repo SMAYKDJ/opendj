@@ -9,6 +9,7 @@
 //! controllers (the Traktor Kontrol range) run Mixxx's `.hid.xml` mappings
 //! the same way, with `controller.sendOutputReport` and its kin; see [`hid`].
 
+mod apc_phrase;
 pub mod catalog;
 mod controller;
 pub mod edit;

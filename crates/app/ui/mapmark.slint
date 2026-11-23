@@ -165,10 +165,12 @@ export component MappingSidebar inherits Rectangle {
 
 export component MapMark inherits Rectangle {
     in property <string> key;
+    // How round its corners are: half the width for a round control.
+    in property <length> corner: 4px;
     if MapMode.active: Rectangle {
         property <bool> armed: MapMode.armed == root.key;
         property <bool> mapped: MapMode.mapped(root.key, MapMode.tick);
-        border-radius: 4px;
+        border-radius: root.corner;
         background: armed ? Theme.lilac.with-alpha(0.5)
             : ta.has-hover ? Theme.lilac.with-alpha(0.35)
             : mapped ? Theme.lilac.with-alpha(0.24) : Theme.lilac.with-alpha(0.08);
@@ -177,7 +179,10 @@ export component MapMark inherits Rectangle {
         ta := TouchArea {
             mouse-cursor: pointer;
             clicked => {
-                if mapped { MapMode.remove(root.key); }
+                // A first click picks it, mapped or not, so a new control
+                // can replace what it has; a click on the one picked takes
+                // its mapping away.
+                if armed && mapped { MapMode.remove(root.key); }
                 else { MapMode.pick(root.key); }
             }
         }

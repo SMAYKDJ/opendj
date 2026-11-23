@@ -3200,6 +3200,7 @@ component BendButton inherits Rectangle {
             HoverTip.shown = true;
         }
     }
+    MapMark { key: group + "," + (faster ? "rate_temp_up" : "rate_temp_down"); width: root.width; height: root.height; }
 }
 
 // SLIP as a word, no button around it, as in djay Pro: light grey when

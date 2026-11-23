@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::catalog::describe;
-use crate::format::{Midi, OpenDjMapping, Row};
+use crate::format::{Action, Light, LightSource, Midi, OpenDjMapping, Row};
 use crate::mapping::{Mapping, Options, When};
 
 /// What a hardware control sent, read as a binding: its message and how
@@ -104,6 +104,76 @@ pub fn hear_for(msgs: &[Vec<u8>], control: &str) -> Option<Heard> {
 /// `script:deck 1 set 'pad_tab' 2`.
 pub const SCRIPT: &str = "script:";
 
+/// The Mixxx control that shows whether `control` is active, or `None`
+/// when that control has no known visual indicator. Used to add a LED
+/// light automatically when a button is learned via Map mode.
+///
+/// For example, `[Channel1],play` → `[Channel1],play_indicator`;
+/// `[Channel1],hotcue_3_activate` → `[Channel1],hotcue_3_enabled`.
+pub fn light_for_bind(control: &str) -> Option<String> {
+    let (group, key) = control.split_once(',')?;
+    // Strip note-off suffix if present (shouldn't be, but guard anyway).
+    let indicator = if key == "play" {
+        "play_indicator".to_string()
+    } else if key == "cue_default" {
+        "cue_indicator".to_string()
+    } else if key == "sync_enabled" {
+        "sync_enabled".to_string()
+    } else if key == "pfl" {
+        "pfl".to_string()
+    } else if let Some(n) = key.strip_prefix("hotcue_").and_then(|s| s.strip_suffix("_activate")) {
+        format!("hotcue_{n}_enabled")
+    } else {
+        return None;
+    };
+    Some(format!("{group},{indicator}"))
+}
+
+/// Where and how bright a learned button's LED lights for `indicator`: the
+/// button's own note at full velocity, except on the APC Key 25 mk2, whose
+/// pads take their brightness from the channel (10 % on channel 1) and their
+/// colour from the velocity: those light at full brightness in a colour for
+/// what they do, as on a CDJ.
+fn led_for(mapping: &str, midi: Midi, indicator: &str) -> (Midi, u8) {
+    let apc_pad = mapping.contains("APC Key 25 mk2")
+        && midi.status & 0xF0 == 0x90
+        && midi.number <= 0x27;
+    if !apc_pad {
+        return (midi, 0x7f);
+    }
+    let key = indicator.split_once(',').map_or(indicator, |(_, k)| k);
+    let colour = match key {
+        "play_indicator" => 21,          // green
+        "cue_indicator" => 9,            // orange
+        "sync_enabled" => 45,            // blue
+        "pfl" => 13,                     // yellow
+        k if k.starts_with("hotcue_") => 5, // red
+        _ => 3,                          // white
+    };
+    (Midi::new(0x96, midi.number), colour)
+}
+
+/// Whether `control` acts while held and stops when let go, so a button
+/// mapped to it needs its release heard as well.
+fn held(control: &str) -> bool {
+    let Some((_, key)) = control.split_once(',') else {
+        return false;
+    };
+    matches!(
+        key,
+        "cue_default"
+            | "cue_preview"
+            | "cue_play"
+            | "rate_temp_up"
+            | "rate_temp_down"
+            | "rate_temp_up_small"
+            | "rate_temp_down_small"
+            | "fwd"
+            | "back"
+            | "reverseroll"
+    ) || key.ends_with("_activate")
+}
+
 /// Binds what was heard to `control` (`[Channel1],play`, or
 /// [`SCRIPT`] and a line) in the own mapping,
 /// pressing on no layer. What that message did there before goes, unless
@@ -138,6 +208,31 @@ pub fn learn(
     let mine = own.rows.iter().any(same);
     if !keep {
         own.rows.retain(|r| !same(r));
+        // Mapping a control again moves it to the new button: the button it
+        // had lets it go (its release row and LED too), or the old button
+        // would go on doing it and lighting for it.
+        let moved: Vec<(u8, u8)> = own
+            .rows
+            .iter()
+            .filter(|r| {
+                r.layer.is_empty()
+                    && matches!(&r.action, Action::Bind { control: c, .. } if c == control)
+            })
+            .map(|r| (r.midi.status, r.midi.number))
+            .collect();
+        if !moved.is_empty() {
+            own.rows.retain(|r| {
+                !(r.layer.is_empty()
+                    && matches!(&r.action, Action::Bind { control: c, .. } if c == control))
+            });
+            let indicator = light_for_bind(control);
+            own.lights.retain(|l| {
+                let on_moved = moved.iter().any(|&(_, n)| n == l.midi.number);
+                let shows = matches!(&l.source, LightSource::Bind { control: c, .. }
+                    if Some(c) == indicator.as_ref());
+                !(on_moved && shows)
+            });
+        }
     } else if !mine && !before.is_empty() {
         // The base's bindings become rows of the file, so the new row
         // doesn't push them out.
@@ -163,6 +258,54 @@ pub fn learn(
     };
     row.name = name.to_string();
     own.rows.push(row);
+    // A button held for a push control (CUE, bend, a hot cue) must be heard
+    // let go too. Without a base mapping nothing else listens for its Note
+    // Off, so CUE would stay in preview and bend stay on.
+    if heard.midi.status & 0xF0 == 0x90 && control.strip_prefix(SCRIPT).is_none() && held(control)
+    {
+        let off = Midi::new(0x80 | (heard.midi.status & 0x0F), heard.midi.number);
+        own.rows.retain(|r| {
+            !((r.midi.status, r.midi.number) == (off.status, off.number)
+                && r.layer.is_empty()
+                && r.when == When::Press)
+        });
+        let mut release = Row::bind(off, control, &option_names);
+        release.name = format!("{name} (release)");
+        own.rows.push(release);
+    }
+    // Add a light for button controls that have a known visual indicator,
+    // so the controller's LED follows the control's state automatically.
+    // A button that does something else now no longer lights for what it
+    // did (a note's lights on any channel: some devices set the brightness
+    // by the channel).
+    if !keep && heard.midi.status & 0xF0 == 0x90 {
+        own.lights.retain(|l| {
+            !(l.midi.status & 0xF0 == 0x90
+                && l.midi.number == heard.midi.number
+                && matches!(l.source, LightSource::Bind { .. }))
+        });
+    }
+    if let Some(light_control) = light_for_bind(control) {
+        let (midi, on) = led_for(&own.name, heard.midi, &light_control);
+        let already = own
+            .lights
+            .iter()
+            .any(|l| (l.midi.status, l.midi.number) == (midi.status, midi.number));
+        if !already {
+            let mut light = Light::new(
+                midi,
+                LightSource::Bind {
+                    control: light_control.to_string(),
+                    min: 0.5,
+                    max: 1.0,
+                    on,
+                    off: 0x00,
+                },
+            );
+            light.name = name.to_string();
+            own.lights.push(light);
+        }
+    }
     let mut said: Vec<String> = Vec::new();
     for i in before {
         if format!("{},{}", i.group, i.key) == control
