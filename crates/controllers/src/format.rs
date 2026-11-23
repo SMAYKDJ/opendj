@@ -1155,14 +1155,32 @@ impl OpenDjMapping {
                                 },
                             );
                         }
-                        None => push(
-                            &mut m,
-                            row.midi.key(),
-                            Input {
+                        None => {
+                            let input = Input {
                                 options: Options::new(bits),
                                 ..input
-                            },
-                        ),
+                            };
+                            // When this mapping is used as an overlay on a
+                            // Mixxx base (base.is_some()), a note-on row for a
+                            // Push control (cue, hotcue) must also capture its
+                            // note-off so the control returns to false when the
+                            // button is released.  Add the synthetic entry only
+                            // when the base mapping does not already provide
+                            // one for that note-off address.
+                            //
+                            // When there is no base (e.g. round-tripping a
+                            // Mixxx file through from_mixxx → build) we skip
+                            // this: Mixxx handles note-off internally, and
+                            // adding synthetic entries would inflate the input
+                            // count relative to the original file.
+                            if base.is_some() && row.midi.status & 0xF0 == 0x90 {
+                                let off = (0x80 | (row.midi.status & 0x0F), row.midi.number);
+                                if !own_messages.contains(&off) && !m.inputs.contains_key(&off) {
+                                    push(&mut m, off, input.clone());
+                                }
+                            }
+                            push(&mut m, row.midi.key(), input);
+                        }
                     }
                 }
                 Action::Js { function, group } => push(

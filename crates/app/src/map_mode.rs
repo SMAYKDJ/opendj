@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use opendj_controllers::edit;
-use opendj_controllers::format::{Action, Midi, OpenDjMapping, Row};
+use opendj_controllers::format::{Action, Light, LightSource, Midi, OpenDjMapping, Row};
 use opendj_controllers::learn::{self, Heard};
 use opendj_controllers::own::{self, OwnMapping};
 use opendj_controllers::quick;
@@ -791,9 +791,31 @@ impl Mapper {
                     .iter()
                     .any(|r| (r.midi.status, r.midi.number) == (midi.status, midi.number));
                 if !used {
-                    let mut row = Row::bind(*midi, &format!("[Channel1],hotcue_{n}_activate"), &[]);
-                    row.name = format!("Pad {n} · deck 1");
+                    let control = format!("[Channel1],hotcue_{n}_activate");
+                    let pad_name = format!("Pad {n} · deck 1");
+                    let mut row = Row::bind(*midi, &control, &[]);
+                    row.name = pad_name.clone();
                     mine.mapping.rows.push(row);
+                    // LED: light up while hotcue N is set.
+                    let light_already = mine
+                        .mapping
+                        .lights
+                        .iter()
+                        .any(|l| (l.midi.status, l.midi.number) == (midi.status, midi.number));
+                    if !light_already {
+                        let mut light = Light::new(
+                            *midi,
+                            LightSource::Bind {
+                                control: format!("[Channel1],hotcue_{n}_enabled"),
+                                min: 0.5,
+                                max: 1.0,
+                                on: 0x7f,
+                                off: 0x00,
+                            },
+                        );
+                        light.name = pad_name;
+                        mine.mapping.lights.push(light);
+                    }
                 }
             }
             format!("Pads 1 to {} are hot cues.", pads.len() + 2)
