@@ -6,6 +6,10 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-24 (tarde)
 
 ### Adicionado
+- **B2B Online Remoto (Sincronização de Rede e Espelhamento em Tempo Real):**
+  - Implementado motor de rede `live_b2b::B2bNetworkSession` com suporte nativo a Host TCP e Convidado TCP de baixa latência (porta `7498` por padrão, TCP_NODELAY ativado).
+  - Protocolo de mensagens `B2bMessage` e `DeckStateMessage` codificado em JSON compacto (~40 bytes por frame): transmite Play/Pause, posição da agulha (`playposition`), BPM, volume, pitch slider (`rate`), equalizadores (`eq_low`, `eq_mid`, `eq_high`) e medidor de VU (`vu_meter`).
+  - Sincronização automática contínua em 30 Hz integrada ao loop de polling do LIVE: o deck do anfitrião envia seu estado e espelha em tempo real os faders, agulha e ondas do DJ convidado, e vice-versa.
 - **B2B Online Remoto (Modo Colaborativo sem Trava Engessada):**
   - Ambos os decks (controles de transporte, EQs, graves, médios, agudos, faders e jog/pitch bend) permanecem **100% liberados** para ambos os DJs, permitindo transições completas e ajustes finos de beatmatching durante o set/batalha.
   - Indicador visual em cada deck (`deck.slint`): exibe uma pílula informativa no topo do deck identificando a posse de cada faixa ("B2B · <Nome do DJ>").

@@ -83,6 +83,7 @@ pub struct Live {
     key: String,
     projector: Option<LiveProjectorWindow>,
     b2b_room_code: String,
+    b2b_net: Option<live_b2b::B2bNetworkSession>,
 }
 
 impl Live {
@@ -108,6 +109,7 @@ impl Live {
             key: key.clone(),
             projector: None,
             b2b_room_code: String::new(),
+            b2b_net: None,
         }));
 
         let ui = app.global::<LiveUi>();
@@ -242,7 +244,10 @@ impl Live {
             let weak = weak.clone();
             move || {
                 let code = live_b2b::generate_room_code();
-                live.borrow_mut().b2b_room_code = code.clone();
+                let net = live_b2b::B2bNetworkSession::start_host(live_b2b::DEFAULT_B2B_PORT);
+                let mut l = live.borrow_mut();
+                l.b2b_room_code = code.clone();
+                l.b2b_net = Some(net);
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
                     ui.set_b2b_room_code(code.into());
@@ -265,7 +270,12 @@ impl Live {
                 if code.len() < 4 {
                     return;
                 }
-                // Fase 1/2: simula conexão — Fase 2 fará o WebRTC P2P real.
+                let net = live_b2b::B2bNetworkSession::start_guest("127.0.0.1", live_b2b::DEFAULT_B2B_PORT);
+                net.send(live_b2b::B2bMessage::Handshake {
+                    guest_name: "DJ Convidado".into(),
+                    code: code.clone(),
+                });
+                live.borrow_mut().b2b_net = Some(net);
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
                     ui.set_b2b_online_state(3);
@@ -280,7 +290,10 @@ impl Live {
             let live = live.clone();
             let weak = weak.clone();
             move || {
-                let l = live.borrow();
+                let mut l = live.borrow_mut();
+                if let Some(net) = l.b2b_net.take() {
+                    net.close();
+                }
                 live_b2b::apply_deck_lock(&l.registry, false, 0);
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
@@ -580,6 +593,43 @@ impl Live {
             let names = [ui.get_dj_a().to_string(), ui.get_dj_b().to_string()];
             ui.set_shot(shot_text(&shot, &names).into());
         }
+
+        // ── B2B Online: Sincronização de Rede em 30 Hz ──────────────────────
+        if let Some(net) = &self.b2b_net {
+            // Se o host detectou a chegada do convidado, atualiza o status na UI
+            if ui.get_b2b_online_state() == 1 && net.is_connected() {
+                ui.set_b2b_online_state(3);
+                ui.set_b2b_guest_name("DJ Convidado".into());
+            }
+
+            // Processa mensagens recebidas do DJ remoto
+            while let Some(msg) = net.try_recv() {
+                match msg {
+                    live_b2b::B2bMessage::Handshake { guest_name, .. } => {
+                        ui.set_b2b_online_state(3);
+                        ui.set_b2b_guest_name(guest_name.into());
+                    }
+                    live_b2b::B2bMessage::DeckUpdate(remote_state) => {
+                        live_b2b::apply_remote_deck(&self.registry, &remote_state);
+                    }
+                    live_b2b::B2bMessage::CueTrigger { deck_index, position } => {
+                        let g = format!("[Channel{}]", deck_index + 1);
+                        if let Some(c) = self.registry.get(&g, "playposition") {
+                            c.force(position as f64);
+                        }
+                    }
+                    live_b2b::B2bMessage::Heartbeat => {}
+                }
+            }
+
+            // Transmite o estado do deck local para o DJ remoto
+            if net.is_connected() {
+                let own_deck = ui.get_b2b_own_deck() as usize;
+                let local_state = live_b2b::capture_local_deck(&self.registry, own_deck);
+                net.send(live_b2b::B2bMessage::DeckUpdate(local_state));
+            }
+        }
+        // ────────────────────────────────────────────────────────────────────
     }
 }
 

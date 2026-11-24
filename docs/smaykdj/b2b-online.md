@@ -59,9 +59,11 @@ O modo **B2B Online** permite que dois DJs em computadores e locais diferentes d
    - Campo para gerar e digitar Código de Sala.
    - Servidor leve de rendezvous (troca de chaves de sinalização).
 
-2. **Fase 2 — Conexão P2P, Câmera e Áudio:**
-   - Integração de canal WebRTC para envio do áudio do deck remoto com Opus.
-   - Entrada da câmera remota no motor `crates/live/src/composer.rs`.
+2. **Fase 2 — Conexão P2P, Câmera e Sincronização de Controles:**
+   - [x] Motor TCP de baixa latência (`live_b2b::B2bNetworkSession`) com suporte a Host e Convidado.
+   - [x] Pacote de estado de deck em 30 Hz (`DeckStateMessage`): Play, Cue, Posição da agulha, Faders, EQs e BPM.
+   - [x] Espelhamento mútuo instantâneo de controles no `ControlRegistry`.
+   - [ ] Entrada de câmera remota no compositor vertical.
 
 3. **Fase 3 — Modo Colaborativo e Waveforms Compartilhadas:**
    - [x] Modo colaborativo total (EQs, faders e jog wheel livres para ambos os DJs realizarem viradas).
