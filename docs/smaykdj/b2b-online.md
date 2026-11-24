@@ -63,7 +63,7 @@ O modo **B2B Online** permite que dois DJs em computadores e locais diferentes d
    - [x] Motor TCP de baixa latência (`live_b2b::B2bNetworkSession`) com suporte a Host e Convidado.
    - [x] Pacote de estado de deck em 30 Hz (`DeckStateMessage`): Play, Cue, Posição da agulha, Faders, EQs e BPM.
    - [x] Espelhamento mútuo instantâneo de controles no `ControlRegistry`.
-   - [ ] Entrada de câmera remota no compositor vertical.
+   - [x] Suporte à câmera do DJ remoto alimentando diretamente o slot 1 do compositor vertical 9:16.
 
 3. **Fase 3 — Modo Colaborativo e Waveforms Compartilhadas:**
    - [x] Modo colaborativo total (EQs, faders e jog wheel livres para ambos os DJs realizarem viradas).

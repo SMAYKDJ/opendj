@@ -6,6 +6,10 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-24 (tarde)
 
 ### Adicionado
+- **B2B Online Remoto (Suporte a Câmera Remota no Compositor Vertical):**
+  - Implementado `Session::set_remote_camera` em `crates/live/src/session.rs` para permitir alimentação direta do slot de câmera 1 (DJ B / convidado) a partir da rede.
+  - Adicionado `B2bMessage::CameraFrame { width, height, jpeg }` em `live_b2b.rs` com buffer expandido (512 KB) para transmissão contínua de frames comprimidos da webcam do parceiro.
+  - Decodificação de imagem em `live.rs` integrada à cena vertical 9:16 do TikTok (as câmeras do DJ 1 e DJ 2 aparecem lado a lado no topo da transmissão).
 - **B2B Online Remoto (Sincronização de Rede e Espelhamento em Tempo Real):**
   - Implementado motor de rede `live_b2b::B2bNetworkSession` com suporte nativo a Host TCP e Convidado TCP de baixa latência (porta `7498` por padrão, TCP_NODELAY ativado).
   - Protocolo de mensagens `B2bMessage` e `DeckStateMessage` codificado em JSON compacto (~40 bytes por frame): transmite Play/Pause, posição da agulha (`playposition`), BPM, volume, pitch slider (`rate`), equalizadores (`eq_low`, `eq_mid`, `eq_high`) e medidor de VU (`vu_meter`).

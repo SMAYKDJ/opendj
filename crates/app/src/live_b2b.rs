@@ -35,6 +35,7 @@ pub struct DeckStateMessage {
 pub enum B2bMessage {
     Handshake { guest_name: String, code: String },
     DeckUpdate(DeckStateMessage),
+    CameraFrame { width: u32, height: u32, jpeg: Vec<u8> },
     CueTrigger { deck_index: usize, position: f32 },
     Heartbeat,
 }
@@ -73,7 +74,7 @@ impl B2bNetworkSession {
                     let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
                     c.store(true, Ordering::Release);
 
-                    let mut buf = [0u8; 1024];
+                    let mut buf = vec![0u8; 1024 * 512]; // 512 KB buffer para frames de vídeo/JPEG
                     while !s.load(Ordering::Relaxed) {
                         // Envio de mensagens pendentes
                         while let Ok(msg) = out_rx.try_recv() {
@@ -90,7 +91,7 @@ impl B2bNetworkSession {
                         let mut len_buf = [0u8; 4];
                         if stream.read_exact(&mut len_buf).is_ok() {
                             let len = u32::from_le_bytes(len_buf) as usize;
-                            if len > 0 && len < buf.len() {
+                            if len > 0 && len <= buf.len() {
                                 if stream.read_exact(&mut buf[..len]).is_ok() {
                                     if let Ok(msg) = serde_json::from_slice::<B2bMessage>(&buf[..len]) {
                                         let _ = in_tx.send(msg);
@@ -135,7 +136,7 @@ impl B2bNetworkSession {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
             c.store(true, Ordering::Release);
 
-            let mut buf = [0u8; 1024];
+            let mut buf = vec![0u8; 1024 * 512]; // 512 KB buffer
             while !s.load(Ordering::Relaxed) {
                 // Envio
                 while let Ok(msg) = out_rx.try_recv() {
@@ -152,7 +153,7 @@ impl B2bNetworkSession {
                 let mut len_buf = [0u8; 4];
                 if stream.read_exact(&mut len_buf).is_ok() {
                     let len = u32::from_le_bytes(len_buf) as usize;
-                    if len > 0 && len < buf.len() {
+                    if len > 0 && len <= buf.len() {
                         if stream.read_exact(&mut buf[..len]).is_ok() {
                             if let Ok(msg) = serde_json::from_slice::<B2bMessage>(&buf[..len]) {
                                 let _ = in_tx.send(msg);

@@ -68,6 +68,7 @@ pub struct State {
 struct Shared {
     settings: Mutex<Settings>,
     screen: Mutex<Option<Frame>>,
+    remote_camera: Mutex<Option<Frame>>,
     preview: Mutex<Option<Arc<Frame>>>,
     state: Mutex<State>,
     stop: AtomicBool,
@@ -104,6 +105,7 @@ impl Session {
         let shared = Arc::new(Shared {
             settings: Mutex::new(settings),
             screen: Mutex::new(None),
+            remote_camera: Mutex::new(None),
             preview: Mutex::new(None),
             state: Mutex::default(),
             stop: AtomicBool::new(false),
@@ -147,6 +149,11 @@ impl Session {
     /// The newest picture of openDJ's screen.
     pub fn set_screen(&self, frame: Frame) {
         *self.shared.screen.lock().unwrap() = Some(frame);
+    }
+
+    /// Sets the picture of the remote DJ's camera (slot 1) received over B2B network.
+    pub fn set_remote_camera(&self, frame: Option<Frame>) {
+        *self.shared.remote_camera.lock().unwrap() = frame;
     }
 
     /// The picture as the audience sees it, a few times a second (or every frame when fast).
@@ -260,6 +267,14 @@ fn run(
             if let Some((seq, f)) = phones.latest(slot, *seen) {
                 *seen = seq;
                 composer.set_camera(slot, Some((*f).clone()));
+            } else if slot == 1 {
+                // If camera slot 1 (DJ B / remote) is fed over B2B network
+                if let Some(remote) = shared.remote_camera.lock().unwrap().take() {
+                    composer.set_camera(1, Some(remote));
+                } else if !phones.status()[slot].live && composer.has_camera(slot) {
+                    composer.set_camera(slot, None);
+                    *seen = 0;
+                }
             } else if !phones.status()[slot].live && composer.has_camera(slot) {
                 composer.set_camera(slot, None);
                 *seen = 0;

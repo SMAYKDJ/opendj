@@ -612,6 +612,18 @@ impl Live {
                     live_b2b::B2bMessage::DeckUpdate(remote_state) => {
                         live_b2b::apply_remote_deck(&self.registry, &remote_state);
                     }
+                    live_b2b::B2bMessage::CameraFrame { width, height, jpeg } => {
+                        if let Some(s) = &self.session {
+                            // Decodifica JPEG remoto e alimenta o compositor (slot 1)
+                            if let Ok(img) = image::load_from_memory(&jpeg) {
+                                let rgba = img.to_rgba8().into_raw();
+                                if let Some(frame) = Frame::new(width, height, rgba) {
+                                    s.set_remote_camera(Some(frame));
+                                    ui.set_cam2_live(true);
+                                }
+                            }
+                        }
+                    }
                     live_b2b::B2bMessage::CueTrigger { deck_index, position } => {
                         let g = format!("[Channel{}]", deck_index + 1);
                         if let Some(c) = self.registry.get(&g, "playposition") {
