@@ -76,3 +76,12 @@ O modo **B2B Online** permite que dois DJs em computadores e locais diferentes d
 4. **Fase 4 — Validação em Live com TikTok LIVE Studio:**
    - Ajustes de estabilidade para conexões Wi-Fi residenciais.
    - Teste prático de transmissão real entre dois DJs.
+
+---
+
+## Documentação
+
+- **[Manual Completo](manual-b2b-online.md):** guia detalhado cobrindo todos os passos, troubleshooting e referência técnica.
+- **[Tour Rápido](tour-b2b-online.md):** guia passo a passo para começar a tocar B2B Online em 5 minutos.
+- **[Battle Live (Solo)](live-tiktok.md):** como usar a transmissão solo para o TikTok.
+- **[Changelog](CHANGELOG.md):** histórico de todas as mudanças nesta edição.
