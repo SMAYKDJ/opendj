@@ -1,0 +1,44 @@
+// The live projector window: a dedicated 9:16 vertical window for TikTok LIVE
+// Studio, OBS or an external monitor, showing the composited picture
+// (phone cameras + openDJ screen).
+// Double-click or F toggles full screen; Esc leaves it.
+import { Theme } from "theme.slint";
+
+export component LiveProjectorWindow inherits Window {
+    title: "openDJ - TikTok Live";
+    icon: @image-url("icons/opendj.svg");
+    preferred-width: 450px;
+    preferred-height: 800px;
+    min-width: 270px;
+    min-height: 480px;
+    background: #000000;
+    default-font-family: Theme.font-family;
+
+    in property <image> frame;
+    callback toggle-full-screen();
+    callback leave-full-screen();
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            if e.text == Key.Escape {
+                root.leave-full-screen();
+                return accept;
+            }
+            if e.text == "f" || e.text == "F" {
+                root.toggle-full-screen();
+                return accept;
+            }
+            reject
+        }
+        TouchArea {
+            double-clicked => { root.toggle-full-screen(); }
+        }
+    }
+
+    Image {
+        width: 100%;
+        height: 100%;
+        source: root.frame;
+        image-fit: contain;
+    }
+}

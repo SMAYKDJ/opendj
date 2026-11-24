@@ -74,6 +74,7 @@ struct Shared {
     /// Asked for by the app; picked up by the drawing thread.
     go: Mutex<Option<output::Settings>>,
     halt: AtomicBool,
+    fast_preview: AtomicBool,
 }
 
 pub struct Session {
@@ -108,6 +109,7 @@ impl Session {
             stop: AtomicBool::new(false),
             go: Mutex::new(None),
             halt: AtomicBool::new(false),
+            fast_preview: AtomicBool::new(false),
         });
         let (s, p) = (shared.clone(), phones.clone());
         let fps = fps.clamp(10, 60);
@@ -147,9 +149,14 @@ impl Session {
         *self.shared.screen.lock().unwrap() = Some(frame);
     }
 
-    /// The picture as the audience sees it, a few times a second.
+    /// The picture as the audience sees it, a few times a second (or every frame when fast).
     pub fn preview(&self) -> Option<Arc<Frame>> {
         self.shared.preview.lock().unwrap().clone()
+    }
+
+    /// When true, refreshes the preview on every frame (30 fps) for the projector window.
+    pub fn set_fast_preview(&self, fast: bool) {
+        self.shared.fast_preview.store(fast, Ordering::Relaxed);
     }
 
     pub fn state(&self) -> State {
@@ -298,7 +305,12 @@ fn run(
             o.write_audio(&samples);
         }
         n += 1;
-        if n.is_multiple_of(PREVIEW_EVERY) {
+        let preview_every = if shared.fast_preview.load(Ordering::Relaxed) {
+            1
+        } else {
+            PREVIEW_EVERY
+        };
+        if n.is_multiple_of(preview_every) {
             if let Some(f) = Frame::new(w, h, picture.to_vec()) {
                 *shared.preview.lock().unwrap() = Some(Arc::new(f));
             }

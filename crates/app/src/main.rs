@@ -91,6 +91,7 @@ mod put_back;
 mod quality;
 mod quick_search;
 mod live;
+mod live_b2b;
 mod remote;
 mod sampler;
 mod scrobble;

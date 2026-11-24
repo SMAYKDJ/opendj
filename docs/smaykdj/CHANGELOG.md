@@ -3,6 +3,20 @@
 Tudo o que mudou nesta edição em relação ao openDJ original, do mais novo
 para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 
+## 2026-11-24 (tarde)
+
+### Adicionado
+- **B2B Online Remoto (Fase 1 - Interface e Código de Sala):**
+  - Seção "B2B ONLINE" adicionada ao painel LIVE com indicador de status em tempo real.
+  - Botões para "Criar Sala" (modo anfitrião) e "Entrar com Código" (modo convidado).
+  - Geração de código numérico de 4 dígitos (1000–9999) via `live_b2b::generate_room_code`.
+  - Botão "Copiar" que transfere o código diretamente para a área de transferência do macOS via `pbcopy`.
+  - Seletor de posse de deck ("MEU DECK: Deck A / Deck B") para definir qual deck cada DJ opera.
+  - Campo de entrada com botão "Conectar" para o DJ convidado inserir o código de 4 dígitos.
+  - Opções para cancelar ou encerrar a sessão B2B a qualquer momento.
+- **Janela de Projetor TikTok LIVE Studio:**
+  - Janela nativa 9:16 (`LiveProjectorWindow`) com suporte a tela cheia e captura direta de janela sem drivers virtuais.
+
 ## 2026-11-18 (tarde)
 
 ### Adicionado

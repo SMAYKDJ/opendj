@@ -31,7 +31,7 @@ for size in 16 32 128 256 512; do
   sips -z $size $size res/macos/opendj-1024.png --out "$icons/icon_${size}x${size}.png" >/dev/null
   sips -z $((size * 2)) $((size * 2)) res/macos/opendj-1024.png --out "$icons/icon_${size}x${size}@2x.png" >/dev/null
 done
-iconutil -c icns "$icons" -o "$app/Resources/openDJ.icns"
+iconutil -c icns "$icons" -o "$app/Resources/openDJ.icns" 2>/dev/null || true
 
 cat > "$app/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

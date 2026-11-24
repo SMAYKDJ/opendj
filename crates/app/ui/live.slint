@@ -40,10 +40,25 @@ export global LiveUi {
     // Where it goes.
     in property <bool> stream: true;
     in property <bool> record: true;
+    in property <bool> projector-open: false;
     in property <string> server;
     in property <string> key;
     in property <string> record-folder;
+    // B2B Online Remote
+    // 0 = Local, 1 = Host (aguardando convidado), 2 = Guest (digitando código), 3 = Conectado
+    in-out property <int> b2b-online-state: 0;
+    in property <string> b2b-room-code;
+    in-out property <string> b2b-join-code;
+    in property <string> b2b-guest-name;
+    // 0 = Deck A, 1 = Deck B
+    in property <int> b2b-own-deck: 0;
+    callback b2b-create-room();
+    callback b2b-join-room(string);
+    callback b2b-copy-code();
+    callback b2b-cancel();
+    callback b2b-set-own-deck(int);
     callback opened();
+    callback toggle-projector();
     callback set-b2b(bool);
     callback set-names(string, string);
     callback set-rotate(int);
@@ -219,6 +234,140 @@ export component LivePanel inherits PopupWindow {
                 }
                 Rectangle { horizontal-stretch: 1; }
             }
+            // ── B2B ONLINE REMOTO ──────────────────────────────────────────
+            if LiveUi.b2b: VerticalLayout {
+                spacing: 8px;
+                EdgeLine { line-color: Theme.border; }
+                // Cabeçalho com status
+                HorizontalLayout {
+                    spacing: 8px;
+                    Label { text: "B2B ONLINE"; vertical-alignment: center; }
+                    Rectangle {
+                        width: 8px; height: 8px;
+                        border-radius: 4px;
+                        background: LiveUi.b2b-online-state == 3 ? Theme.automix : Theme.n-48484c;
+                        y: (parent.height - self.height) / 2;
+                    }
+                    Text {
+                        text: LiveUi.b2b-online-state == 1 ? "Aguardando convidado…" :
+                              LiveUi.b2b-online-state == 2 ? "Digitando código…" :
+                              LiveUi.b2b-online-state == 3 ? "Conectado · " + LiveUi.b2b-guest-name : "";
+                        color: Theme.text-dim; font-size: 11px; vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                // ESTADO 0: botões iniciais
+                if LiveUi.b2b-online-state == 0: HorizontalLayout {
+                    spacing: 8px;
+                    Action {
+                        horizontal-stretch: 1;
+                        label: "Criar Sala";
+                        filled: false;
+                        clicked => { LiveUi.b2b-create-room(); }
+                    }
+                    Action {
+                        horizontal-stretch: 1;
+                        label: "Entrar com Código";
+                        filled: false;
+                        clicked => { LiveUi.b2b-online-state = 2; }
+                    }
+                }
+                // ESTADO 1: anfitrião — mostra o código e botão Copiar
+                if LiveUi.b2b-online-state == 1: VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Envie o código abaixo para o outro DJ pelo WhatsApp ou chat:";
+                        color: Theme.text-dim; font-size: 11px; wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 36px;
+                            border-radius: 8px;
+                            background: Theme.control;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            Text {
+                                text: LiveUi.b2b-room-code;
+                                color: Theme.text;
+                                font-size: 22px;
+                                font-weight: 700;
+                                letter-spacing: 6px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Action {
+                            width: 72px;
+                            label: "Copiar";
+                            filled: false;
+                            clicked => { LiveUi.b2b-copy-code(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Label { text: "MEU DECK"; vertical-alignment: center; }
+                        Choice {
+                            choices: ["Deck A", "Deck B"];
+                            chosen: LiveUi.b2b-own-deck;
+                            picked(i) => { LiveUi.b2b-set-own-deck(i); }
+                        }
+                    }
+                    Action {
+                        label: "Cancelar";
+                        filled: false;
+                        clicked => { LiveUi.b2b-cancel(); }
+                    }
+                }
+                // ESTADO 2: convidado — digita o código
+                if LiveUi.b2b-online-state == 2: VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Digite o código enviado pelo outro DJ:";
+                        color: Theme.text-dim; font-size: 11px; wrap: word-wrap;
+                    }
+                    join-field := Field {
+                        text: LiveUi.b2b-join-code;
+                        placeholder: "Ex: 7842";
+                        edited(t) => { LiveUi.b2b-join-code = t; }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Action {
+                            horizontal-stretch: 1;
+                            label: "Conectar";
+                            tint: Theme.automix;
+                            clicked => { LiveUi.b2b-join-room(join-field.text); }
+                        }
+                        Action {
+                            width: 80px;
+                            label: "Cancelar";
+                            filled: false;
+                            clicked => { LiveUi.b2b-cancel(); }
+                        }
+                    }
+                }
+                // ESTADO 3: conectado
+                if LiveUi.b2b-online-state == 3: VerticalLayout {
+                    spacing: 6px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Label { text: "MEU DECK"; vertical-alignment: center; }
+                        Choice {
+                            choices: ["Deck A", "Deck B"];
+                            chosen: LiveUi.b2b-own-deck;
+                            picked(i) => { LiveUi.b2b-set-own-deck(i); }
+                        }
+                    }
+                    Action {
+                        label: "Encerrar B2B Online";
+                        tint: Theme.c-e5484d;
+                        clicked => { LiveUi.b2b-cancel(); }
+                    }
+                }
+            }
+            // ── FIM B2B ONLINE ─────────────────────────────────────────────
             HorizontalLayout {
                 spacing: 8px;
                 a := Field {
@@ -355,6 +504,16 @@ export component LivePanel inherits PopupWindow {
                 border-color: Theme.border;
                 clip: true;
                 Image { source: LiveUi.preview; width: 216px; height: 384px; image-fit: contain; }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { LiveUi.toggle-projector(); }
+                }
+            }
+            Action {
+                label: LiveUi.projector-open ? "Fechar janela (TikTok)" : "Abrir janela (TikTok Studio)";
+                tint: LiveUi.projector-open ? Theme.accent : Theme.control;
+                filled: LiveUi.projector-open;
+                clicked => { LiveUi.toggle-projector(); }
             }
             Text { text: LiveUi.shot; color: Theme.text-dim; font-size: 11px; width: 216px; wrap: word-wrap; }
             if LiveUi.on-air: Text { text: LiveUi.health; color: Theme.text-dim; font-size: 11px; width: 216px; wrap: word-wrap; }

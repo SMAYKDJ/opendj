@@ -20,9 +20,13 @@ use opendj_live::output::{self, Destinations};
 use opendj_live::session::{AudioSource, Decks, Session, Settings};
 use opendj_live::Frame;
 use serde_json::json;
-use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode};
+use slint::winit_030::winit::window::Fullscreen;
+use slint::winit_030::WinitWindowAccessor;
+use slint::{
+    CloseRequestResponse, ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode,
+};
 
-use crate::{settings, AppWindow, LiveUi};
+use crate::{live_b2b, settings, AppWindow, LiveProjectorWindow, LiveUi};
 
 const MODE: &str = "live_b2b";
 const DJ_A: &str = "live_dj_a";
@@ -77,6 +81,8 @@ pub struct Live {
     last_screen: Instant,
     last_preview: Instant,
     key: String,
+    projector: Option<LiveProjectorWindow>,
+    b2b_room_code: String,
 }
 
 impl Live {
@@ -100,6 +106,8 @@ impl Live {
             last_screen: Instant::now(),
             last_preview: Instant::now(),
             key: key.clone(),
+            projector: None,
+            b2b_room_code: String::new(),
         }));
 
         let ui = app.global::<LiveUi>();
@@ -219,17 +227,87 @@ impl Live {
                 }
             }
         });
+        ui.on_toggle_projector({
+            let live = live.clone();
+            let weak = weak.clone();
+            move || {
+                if let Some(app) = weak.upgrade() {
+                    Self::toggle_projector(&live, &app);
+                }
+            }
+        });
+        // ── B2B Online Remote — Fase 1 callbacks ────────────────────────────
+        ui.on_b2b_create_room({
+            let live = live.clone();
+            let weak = weak.clone();
+            move || {
+                let code = live_b2b::generate_room_code();
+                live.borrow_mut().b2b_room_code = code.clone();
+                if let Some(app) = weak.upgrade() {
+                    let ui = app.global::<LiveUi>();
+                    ui.set_b2b_room_code(code.into());
+                    ui.set_b2b_online_state(1);
+                }
+            }
+        });
+        ui.on_b2b_copy_code({
+            let live = live.clone();
+            move || {
+                let code = live.borrow().b2b_room_code.clone();
+                live_b2b::copy_to_clipboard(&code);
+            }
+        });
+        ui.on_b2b_join_room({
+            let weak = weak.clone();
+            move |code| {
+                let code = code.trim().to_string();
+                if code.len() < 4 {
+                    return;
+                }
+                // Fase 1: simula conexão — Fase 2 fará o WebRTC P2P real.
+                if let Some(app) = weak.upgrade() {
+                    let ui = app.global::<LiveUi>();
+                    ui.set_b2b_online_state(3);
+                    ui.set_b2b_guest_name("Conectado (simulado)".into());
+                }
+            }
+        });
+        ui.on_b2b_cancel({
+            let weak = weak.clone();
+            move || {
+                if let Some(app) = weak.upgrade() {
+                    let ui = app.global::<LiveUi>();
+                    ui.set_b2b_online_state(0);
+                    ui.set_b2b_room_code("".into());
+                    ui.set_b2b_join_code("".into());
+                    ui.set_b2b_guest_name("".into());
+                }
+            }
+        });
+        ui.on_b2b_set_own_deck({
+            let weak = weak.clone();
+            move |deck| {
+                if let Some(app) = weak.upgrade() {
+                    app.global::<LiveUi>().set_b2b_own_deck(deck);
+                }
+            }
+        });
+        // ────────────────────────────────────────────────────────────────────
         ui.on_finish({
             let live = live.clone();
             let weak = weak.clone();
             move || {
                 let mut l = live.borrow_mut();
                 l.timer.stop();
+                if let Some(w) = l.projector.take() {
+                    let _ = w.hide();
+                }
                 l.session = None;
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
                     ui.set_started(false);
                     ui.set_on_air(false);
+                    ui.set_projector_open(false);
                     ui.set_qr1(Image::default());
                     ui.set_qr2(Image::default());
                     ui.set_preview(Image::default());
@@ -293,11 +371,80 @@ impl Live {
             let l2 = live.clone();
             live.borrow()
                 .timer
-                .start(TimerMode::Repeated, Duration::from_millis(50), move || {
+                .start(TimerMode::Repeated, Duration::from_millis(30), move || {
                     if let Some(app) = weak.upgrade() {
                         l2.borrow_mut().poll(&app);
                     }
                 });
+        }
+    }
+
+    fn toggle_projector(live: &Rc<RefCell<Self>>, app: &AppWindow) {
+        let is_open = live.borrow().projector.is_some();
+        if is_open {
+            live.borrow_mut().close_projector(app);
+        } else {
+            Self::open(live, app);
+            live.borrow_mut().open_projector(app);
+        }
+    }
+
+    fn open_projector(&mut self, app: &AppWindow) {
+        if self.projector.is_some() {
+            return;
+        }
+        let ui = app.global::<LiveUi>();
+        let Ok(window) = LiveProjectorWindow::new() else {
+            ui.set_projector_open(false);
+            return;
+        };
+        window.on_toggle_full_screen({
+            let weak = window.as_weak();
+            move || {
+                if let Some(p) = weak.upgrade() {
+                    p.window().with_winit_window(|w| {
+                        if w.fullscreen().is_some() {
+                            w.set_fullscreen(None);
+                        } else {
+                            w.set_fullscreen(Some(Fullscreen::Borderless(w.current_monitor())));
+                        }
+                    });
+                }
+            }
+        });
+        window.on_leave_full_screen({
+            let weak = window.as_weak();
+            move || {
+                if let Some(p) = weak.upgrade() {
+                    p.window().with_winit_window(|w| w.set_fullscreen(None));
+                }
+            }
+        });
+        let weak_app = app.as_weak();
+        window.window().on_close_requested(move || {
+            if let Some(app) = weak_app.upgrade() {
+                app.global::<LiveUi>().set_projector_open(false);
+            }
+            CloseRequestResponse::HideWindow
+        });
+        if window.show().is_ok() {
+            ui.set_projector_open(true);
+            if let Some(s) = &self.session {
+                s.set_fast_preview(true);
+            }
+            self.projector = Some(window);
+        } else {
+            ui.set_projector_open(false);
+        }
+    }
+
+    fn close_projector(&mut self, app: &AppWindow) {
+        if let Some(w) = self.projector.take() {
+            let _ = w.hide();
+        }
+        app.global::<LiveUi>().set_projector_open(false);
+        if let Some(s) = &self.session {
+            s.set_fast_preview(false);
         }
     }
 
@@ -351,8 +498,15 @@ impl Live {
         };
         let ui = app.global::<LiveUi>();
         let st = s.state();
+
+        let has_projector = self.projector.is_some();
+        if !ui.get_projector_open() && has_projector {
+            self.close_projector(app);
+            return;
+        }
+
         // The window's picture, for the screen part of the stream.
-        let every = if st.on_air {
+        let every = if st.on_air || has_projector {
             SCREEN_ON_AIR
         } else {
             SCREEN_PREVIEW
@@ -366,38 +520,51 @@ impl Live {
                 }
             }
         }
-        if self.last_preview.elapsed() >= Duration::from_millis(200) {
+        if has_projector {
+            if let Some(p) = s.preview() {
+                let img = Image::from_rgba8(
+                    SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&p.rgba, p.width, p.height),
+                );
+                if let Some(proj) = &self.projector {
+                    proj.set_frame(img.clone());
+                }
+                if self.last_preview.elapsed() >= Duration::from_millis(150) {
+                    self.last_preview = Instant::now();
+                    ui.set_preview(img);
+                }
+            }
+        } else if self.last_preview.elapsed() >= Duration::from_millis(200) {
             self.last_preview = Instant::now();
             if let Some(p) = s.preview() {
                 ui.set_preview(Image::from_rgba8(
                     SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&p.rgba, p.width, p.height),
                 ));
             }
-            let cams = &st.cameras;
-            ui.set_cam1_live(cams[0].live);
-            ui.set_cam2_live(cams[1].live);
-            ui.set_cam1_status(camera_text(&cams[0]).into());
-            ui.set_cam2_status(camera_text(&cams[1]).into());
-            ui.set_on_air(st.on_air);
-            ui.set_time(clock(st.seconds).into());
-            ui.set_health(
-                if st.output.fps > 0.0 {
-                    format!(
-                        "{:.0} quadros/s · {:.0} kbit/s · velocidade {:.2}×",
-                        st.output.fps, st.output.kbps, st.output.speed
-                    )
-                } else {
-                    "Conectando…".into()
-                }
-                .into(),
-            );
-            if let Some(e) = &st.error {
-                ui.set_error(e.as_str().into());
+        }
+        let cams = &st.cameras;
+        ui.set_cam1_live(cams[0].live);
+        ui.set_cam2_live(cams[1].live);
+        ui.set_cam1_status(camera_text(&cams[0]).into());
+        ui.set_cam2_status(camera_text(&cams[1]).into());
+        ui.set_on_air(st.on_air);
+        ui.set_time(clock(st.seconds).into());
+        ui.set_health(
+            if st.output.fps > 0.0 {
+                format!(
+                    "{:.0} quadros/s · {:.0} kbit/s · velocidade {:.2}×",
+                    st.output.fps, st.output.kbps, st.output.speed
+                )
+            } else {
+                "Conectando…".into()
             }
-            if let Some(shot) = st.shot {
-                let names = [ui.get_dj_a().to_string(), ui.get_dj_b().to_string()];
-                ui.set_shot(shot_text(&shot, &names).into());
-            }
+            .into(),
+        );
+        if let Some(e) = &st.error {
+            ui.set_error(e.as_str().into());
+        }
+        if let Some(shot) = st.shot {
+            let names = [ui.get_dj_a().to_string(), ui.get_dj_b().to_string()];
+            ui.set_shot(shot_text(&shot, &names).into());
         }
     }
 }

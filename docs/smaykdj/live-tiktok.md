@@ -15,10 +15,9 @@ do ffmpeg (`brew install ffmpeg`).
    avisa que a conexão não é particular: toque em *Mostrar detalhes* ›
    *Visitar o site* (iPhone) ou *Avançado* › *Continuar* (Android). Depois
    toque em **Ligar câmera** e permita o acesso.
-4. Cole a URL do servidor e a chave de transmissão (TikTok LIVE Studio ou
-   tiktok.com/live/producer). Deixe **Gravar** ligado para ter o MP4.
-5. **Entrar ao vivo**. Feche o painel antes: o que está na janela do openDJ
-   vai para a transmissão, inclusive o painel aberto.
+4. **Transmissão:**
+   - **Com TikTok LIVE Studio:** clique no botão **Abrir janela (TikTok Studio)** no painel LIVE (ou toque na prévia da imagem). Uma janela dedicada vertical 9:16 ("openDJ - TikTok Live") se abrirá a 30 FPS. No TikTok LIVE Studio, clique em **Adicionar Fonte › Captura de Janela (Window Capture)** e selecione a janela do openDJ!
+   - **Direto pelo openDJ (sem TikTok Live Studio):** cole a URL do servidor e a chave de transmissão (do tiktok.com/live/producer), deixe **Gravar** ligado se quiser o MP4 e clique em **Entrar ao vivo**. Feche o painel antes para ele não cobrir a tela da mixagem.
 
 ## Fluxo
 

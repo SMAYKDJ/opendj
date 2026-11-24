@@ -11,7 +11,8 @@ continua igual; as mudanças ficam no branch `smaykdj` e estão listadas em
 | --- | --- | --- |
 | MAP MIDI | Botão na barra superior que liga o modo de mapeamento e abre uma barra lateral com todos os controles já mapeados | Pronto, aguardando teste no Mac |
 | Progresso dos stems HQ | Mostra no deck quanto falta para a separação em alta qualidade (HTDemucs) terminar | Pronto, aguardando teste no Mac |
-| Battle Live (TikTok) | Botão LIVE na barra superior: transmissão vertical para a live do TikTok com câmeras de celular, diretor de cenas automático e gravação | Pronto, aguardando teste no Mac: [live-tiktok.md](live-tiktok.md) |
+| Battle Live (TikTok) | Botão LIVE na barra superior: transmissão vertical para a live do TikTok com câmeras de celular, projetor para TikTok LIVE Studio, diretor de cenas automático e gravação | Pronto, aguardando teste no Mac: [live-tiktok.md](live-tiktok.md) |
+| B2B Online Remoto | Sessão P2P com Código de Sala para 2 DJs tocarem juntos pela internet com waveforms ao vivo e live conjunta no TikTok | Especificado e planejado: [b2b-online.md](b2b-online.md) |
 
 ## Base
 
