@@ -54,6 +54,7 @@ pub enum B2bMessage {
     TrackLoaded(RemoteTrackMessage),
     TrackUnloaded { deck_index: usize },
     CameraFrame { width: u32, height: u32, jpeg: Vec<u8> },
+    AudioOpus { data: Vec<u8> },
     CueTrigger { deck_index: usize, position: f32 },
     Heartbeat,
 }
@@ -340,6 +341,26 @@ pub fn copy_to_clipboard(text: &str) {
         }
         let _ = child.wait();
     }
+}
+
+/// Cria um codificador Opus otimizado para transmissão estéreo de ultrabaixa latência (LowDelay).
+pub fn create_opus_encoder(rate: u32) -> Option<opus::Encoder> {
+    let rate = match rate {
+        8000 | 12000 | 16000 | 24000 | 48000 => rate,
+        _ => 48000,
+    };
+    let mut enc = opus::Encoder::new(rate, opus::Channels::Stereo, opus::Application::LowDelay).ok()?;
+    let _ = enc.set_bitrate(opus::Bitrate::Bits(128_000));
+    Some(enc)
+}
+
+/// Cria um decodificador Opus estéreo de baixa latência.
+pub fn create_opus_decoder(rate: u32) -> Option<opus::Decoder> {
+    let rate = match rate {
+        8000 | 12000 | 16000 | 24000 | 48000 => rate,
+        _ => 48000,
+    };
+    opus::Decoder::new(rate, opus::Channels::Stereo).ok()
 }
 
 /// Applies Deck Ownership in Collaborative Mode to the `ControlRegistry`.

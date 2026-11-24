@@ -25,6 +25,7 @@ opendj-plugins = { path = "../plugins" }
 opendj-live = { path = "../live" }
 opendj-remote = { path = "../remote" }
 opendj-osc = { path = "../osc" }
+opus = "0.4"
 # Bonjour: tablets find the OSC port on the network.
 md5 = "0.8"
 mdns-sd = "0.21"

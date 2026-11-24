@@ -88,6 +88,9 @@ pub struct Live {
     b2b_discovery: Option<live_b2b::B2bDiscoveryHandle>,
     loaded_tracks: opendj_engine::LoadedTracks,
     last_sent_track: [Option<(usize, usize)>; NUM_DECKS],
+    opus_encoder: Option<opus::Encoder>,
+    opus_decoder: Option<opus::Decoder>,
+    audio_pending: Vec<f32>,
 }
 
 impl Live {
@@ -118,6 +121,9 @@ impl Live {
             b2b_discovery: None,
             loaded_tracks: engine.loaded_tracks(),
             last_sent_track: [None; NUM_DECKS],
+            opus_encoder: live_b2b::create_opus_encoder(engine.sample_rate().round() as u32),
+            opus_decoder: live_b2b::create_opus_decoder(engine.sample_rate().round() as u32),
+            audio_pending: Vec::new(),
         }));
 
         let ui = app.global::<LiveUi>();
@@ -702,6 +708,16 @@ impl Live {
                             }
                         }
                     }
+                    live_b2b::B2bMessage::AudioOpus { data } => {
+                        if let Some(dec) = &mut self.opus_decoder {
+                            let mut decoded = vec![0.0f32; 960 * 2];
+                            if let Ok(len) = dec.decode_float(&data, &mut decoded, false) {
+                                if let Some(s) = &self.session {
+                                    s.push_remote_audio(&decoded[..len * 2]);
+                                }
+                            }
+                        }
+                    }
                     live_b2b::B2bMessage::CueTrigger { deck_index, position } => {
                         let g = format!("[Channel{}]", deck_index + 1);
                         if let Some(c) = self.registry.get(&g, "playposition") {
@@ -736,6 +752,27 @@ impl Live {
 
                 let local_state = live_b2b::capture_local_deck(&self.registry, own_deck);
                 net.send(live_b2b::B2bMessage::DeckUpdate(local_state));
+
+                // Transmite áudio do master local codificado em Opus para o DJ parceiro
+                if let Some(m) = &mut self.master {
+                    m.set_active(true);
+                    let mut chunk = Vec::new();
+                    m.drain_into(&mut chunk);
+                    self.audio_pending.extend_from_slice(&chunk);
+
+                    let frame_samples = 960 * 2; // 20 ms @ 48 kHz stereo
+                    while self.audio_pending.len() >= frame_samples {
+                        let samples: Vec<f32> = self.audio_pending.drain(..frame_samples).collect();
+                        if let Some(enc) = &mut self.opus_encoder {
+                            let mut out_buf = [0u8; 1000];
+                            if let Ok(len) = enc.encode_float(&samples, &mut out_buf) {
+                                net.send(live_b2b::B2bMessage::AudioOpus {
+                                    data: out_buf[..len].to_vec(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         // ────────────────────────────────────────────────────────────────────

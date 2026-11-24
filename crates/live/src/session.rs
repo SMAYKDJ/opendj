@@ -69,6 +69,7 @@ struct Shared {
     settings: Mutex<Settings>,
     screen: Mutex<Option<Frame>>,
     remote_camera: Mutex<Option<Frame>>,
+    remote_audio: Mutex<Vec<f32>>,
     preview: Mutex<Option<Arc<Frame>>>,
     state: Mutex<State>,
     stop: AtomicBool,
@@ -106,6 +107,7 @@ impl Session {
             settings: Mutex::new(settings),
             screen: Mutex::new(None),
             remote_camera: Mutex::new(None),
+            remote_audio: Mutex::new(Vec::new()),
             preview: Mutex::new(None),
             state: Mutex::default(),
             stop: AtomicBool::new(false),
@@ -154,6 +156,14 @@ impl Session {
     /// Sets the picture of the remote DJ's camera (slot 1) received over B2B network.
     pub fn set_remote_camera(&self, frame: Option<Frame>) {
         *self.shared.remote_camera.lock().unwrap() = frame;
+    }
+
+    /// Alimenta o buffer de áudio da transmissão com amostras recebidas do DJ remoto.
+    pub fn push_remote_audio(&self, samples: &[f32]) {
+        let mut ra = self.shared.remote_audio.lock().unwrap();
+        if ra.len() < 48_000 * 2 {
+            ra.extend_from_slice(samples);
+        }
     }
 
     /// The picture as the audience sees it, a few times a second (or every frame when fast).
@@ -317,6 +327,17 @@ fn run(
             }
             samples.clear();
             audio.lock().unwrap().drain_into(&mut samples);
+            let mut remote = shared.remote_audio.lock().unwrap();
+            if !remote.is_empty() {
+                let n = samples.len().min(remote.len());
+                for i in 0..n {
+                    samples[i] = (samples[i] + remote[i]).clamp(-1.0, 1.0);
+                }
+                if remote.len() > samples.len() {
+                    samples.extend_from_slice(&remote[n..]);
+                }
+                remote.clear();
+            }
             o.write_audio(&samples);
         }
         n += 1;

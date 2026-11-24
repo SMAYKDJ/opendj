@@ -65,6 +65,7 @@ O modo **B2B Online** permite que dois DJs em computadores e locais diferentes d
    - [x] Pacote de estado de deck em 30 Hz (`DeckStateMessage`): Play, Cue, Posição da agulha, Faders, EQs e BPM.
    - [x] Espelhamento mútuo instantâneo de controles no `ControlRegistry`.
    - [x] Suporte à câmera do DJ remoto alimentando diretamente o slot 1 do compositor vertical 9:16.
+   - [x] Stream de áudio mútuo em tempo real via codec Opus (20 ms @ 128 kbps) integrado ao master mix da live e gravação.
 
 3. **Fase 3 — Modo Colaborativo e Waveforms Compartilhadas:**
    - [x] Modo colaborativo total (EQs, faders e jog wheel livres para ambos os DJs realizarem viradas).

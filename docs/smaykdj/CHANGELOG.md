@@ -6,6 +6,10 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-24 (tarde)
 
 ### Adicionado
+- **B2B Online Remoto (Transmissão de Áudio Estéreo com Codec Opus):**
+  - Implementado streaming de áudio contínuo de ultrabaixa latência (20 ms por pacote @ 128 kbps) utilizando o codec Opus (`B2bMessage::AudioOpus`).
+  - Cada instância extrai o áudio estéreo do master feed local em tempo real, comprime via `opus::Encoder` e transmite pela rede.
+  - O receptor descomprime via `opus::Decoder` e alimenta o buffer de áudio do compositor vertical (`Session::push_remote_audio`), que mescla perfeitamente os dois DJs tanto para a live no TikTok LIVE Studio quanto para as gravações em MP4.
 - **B2B Online Remoto (Waveforms e Metadados Compartilhados via Rede):**
   - Implementado `RemoteTrackMessage` e variantes `B2bMessage::TrackLoaded` e `B2bMessage::TrackUnloaded`.
   - Ao carregar uma faixa no deck próprio, o openDJ extrai os metadados (Título, Artista, BPM, Tom, Duração, Primeiro Beat) e os dados de waveform (nível 3 da pirâmide em ~125 bins/s e o resumo de 256 fatias de overview).

@@ -6716,6 +6716,7 @@ dependencies = [
  "opendj-remote",
  "opendj-script",
  "opendj-waveform",
+ "opus",
  "read-fonts",
  "rfd",
  "ring",
