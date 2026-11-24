@@ -64,9 +64,10 @@ O modo **B2B Online** permite que dois DJs em computadores e locais diferentes d
    - Entrada da câmera remota no motor `crates/live/src/composer.rs`.
 
 3. **Fase 3 — Deck Lock e Waveforms Compartilhadas:**
-   - Pacote de dados de waveform comprimido via DataChannel.
-   - Restrição de controles no `crates/control` para o deck do convidado.
-   - Sincronização visual em 30 Hz.
+   - [x] Restrição de controles locais no `crates/control` (`lock_group`) para o deck do convidado/anfitrião.
+   - [x] Badge visual "B2B ONLINE · <DJ>" sobre o deck controlado remotamente.
+   - [ ] Pacote de dados de waveform comprimido via DataChannel.
+   - [ ] Sincronização visual em 30 Hz.
 
 4. **Fase 4 — Validação em Live com TikTok LIVE Studio:**
    - Ajustes de estabilidade para conexões Wi-Fi residenciais.

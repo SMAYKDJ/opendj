@@ -297,6 +297,17 @@ impl ControlRegistry {
         keys
     }
 
+    /// Locks or unlocks all controls belonging to a given group prefix (e.g. `"[Channel2]"`).
+    /// Used for Deck Lock in B2B Online mode to freeze remote controls for local input.
+    pub fn lock_group(&self, group: &str, on: bool) {
+        let map = self.controls.read().unwrap();
+        for (key, handle) in map.iter() {
+            if key.group == group || key.group.starts_with(group) {
+                handle.lock(on);
+            }
+        }
+    }
+
     /// The names that resolve to another control, sorted; see [`Self::insert_alias`].
     pub fn alias_keys(&self) -> Vec<ConfigKey> {
         let mut keys: Vec<_> = self.aliases.read().unwrap().keys().cloned().collect();

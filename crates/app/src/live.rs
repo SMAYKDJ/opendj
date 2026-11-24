@@ -258,23 +258,30 @@ impl Live {
             }
         });
         ui.on_b2b_join_room({
+            let live = live.clone();
             let weak = weak.clone();
             move |code| {
                 let code = code.trim().to_string();
                 if code.len() < 4 {
                     return;
                 }
-                // Fase 1: simula conexão — Fase 2 fará o WebRTC P2P real.
+                // Fase 1/2: simula conexão — Fase 2 fará o WebRTC P2P real.
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
                     ui.set_b2b_online_state(3);
-                    ui.set_b2b_guest_name("Conectado (simulado)".into());
+                    ui.set_b2b_guest_name("DJ Convidado".into());
+                    let own_deck = ui.get_b2b_own_deck();
+                    let l = live.borrow();
+                    live_b2b::apply_deck_lock(&l.registry, true, own_deck);
                 }
             }
         });
         ui.on_b2b_cancel({
+            let live = live.clone();
             let weak = weak.clone();
             move || {
+                let l = live.borrow();
+                live_b2b::apply_deck_lock(&l.registry, false, 0);
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
                     ui.set_b2b_online_state(0);
@@ -285,10 +292,17 @@ impl Live {
             }
         });
         ui.on_b2b_set_own_deck({
+            let live = live.clone();
             let weak = weak.clone();
             move |deck| {
                 if let Some(app) = weak.upgrade() {
-                    app.global::<LiveUi>().set_b2b_own_deck(deck);
+                    let ui = app.global::<LiveUi>();
+                    ui.set_b2b_own_deck(deck);
+                    let connected = ui.get_b2b_online_state() == 3;
+                    if connected {
+                        let l = live.borrow();
+                        live_b2b::apply_deck_lock(&l.registry, true, deck);
+                    }
                 }
             }
         });

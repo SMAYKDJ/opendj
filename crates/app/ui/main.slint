@@ -2117,10 +2117,31 @@ export component AppWindow inherits Window {
                     // The decks share the room equally whatever they show: sized by
                     // their contents, a changing time or title would nudge the
                     // mixer sideways every frame.
-                    deck-a := Deck { deck: 0; info: decks[0]; spin: spin-1; overview: overview-1; horizontal-stretch: 1; min-width: 400px; preferred-width: 400px; }
+                    deck-a := Deck {
+                        deck: 0;
+                        info: decks[0];
+                        spin: spin-1;
+                        overview: overview-1;
+                        horizontal-stretch: 1;
+                        min-width: 400px;
+                        preferred-width: 400px;
+                        b2b-locked: LiveUi.b2b-online-state == 3 && LiveUi.b2b-own-deck != 0;
+                        b2b-guest-name: LiveUi.b2b-guest-name;
+                    }
                     if !external-mixer: Mixer { }
                     if external-mixer: ExternalMixer { }
-                    deck-b := Deck { deck: 1; info: decks[1]; spin: spin-2; overview: overview-2; mirrored: true; horizontal-stretch: 1; min-width: 400px; preferred-width: 400px; }
+                    deck-b := Deck {
+                        deck: 1;
+                        info: decks[1];
+                        spin: spin-2;
+                        overview: overview-2;
+                        mirrored: true;
+                        horizontal-stretch: 1;
+                        min-width: 400px;
+                        preferred-width: 400px;
+                        b2b-locked: LiveUi.b2b-online-state == 3 && LiveUi.b2b-own-deck != 1;
+                        b2b-guest-name: LiveUi.b2b-guest-name;
+                    }
                 }
 
                 // 2-Deck Basic: the lighter decks either side of the slim mixer, each
