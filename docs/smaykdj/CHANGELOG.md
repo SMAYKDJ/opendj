@@ -6,6 +6,11 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-24 (tarde)
 
 ### Adicionado
+- **B2B Online Remoto (Signaling e NAT Traversal via STUN RFC 5389):**
+  - Implementado cliente STUN nativo em `live_b2b::discover_public_endpoint`: descobre automaticamente o IP público e mapeamento de porta externa via servidores STUN do Google e Cloudflare sem bibliotecas externas.
+  - Ao criar a sala, o anfitrião consulta o STUN em segundo plano e exibe o IP público na UI para conexão remota através da internet.
+  - O botão "Copiar" gera uma mensagem completa contendo o código de sala e o IP público da internet para compartilhamento via WhatsApp/chat.
+  - O DJ convidado pode digitar ou colar diretamente o IP ou IP:Porta (ex: `201.86.12.34:7498`), conectando instantaneamente pela internet sem esperar o timeout de descoberta local.
 - **B2B Online Remoto (Transmissão de Áudio Estéreo com Codec Opus):**
   - Implementado streaming de áudio contínuo de ultrabaixa latência (20 ms por pacote @ 128 kbps) utilizando o codec Opus (`B2bMessage::AudioOpus`).
   - Cada instância extrai o áudio estéreo do master feed local em tempo real, comprime via `opus::Encoder` e transmite pela rede.

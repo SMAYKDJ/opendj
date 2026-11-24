@@ -363,6 +363,62 @@ pub fn create_opus_decoder(rate: u32) -> Option<opus::Decoder> {
     opus::Decoder::new(rate, opus::Channels::Stereo).ok()
 }
 
+/// Consulta um servidor STUN público (RFC 5389) para descobrir o IP público e porta externa da máquina.
+/// Permite conexão B2B direta através da internet sem necessidade de VPN.
+pub fn discover_public_endpoint() -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+
+    let servers = [
+        "stun.l.google.com:19302",
+        "stun1.l.google.com:19302",
+        "stun.cloudflare.com:3478",
+    ];
+
+    let mut tx_id = [0u8; 12];
+    getrandom::fill(&mut tx_id).ok()?;
+
+    let mut req = [0u8; 20];
+    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
+    req[2..4].copy_from_slice(&0x0000u16.to_be_bytes()); // Length: 0
+    req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes()); // Magic Cookie
+    req[8..20].copy_from_slice(&tx_id);
+
+    for s in servers {
+        if let Ok(mut addrs) = s.to_socket_addrs() {
+            if let Some(target) = addrs.next() {
+                if socket.send_to(&req, target).is_ok() {
+                    let mut buf = [0u8; 512];
+                    if let Ok((len, _)) = socket.recv_from(&mut buf) {
+                        if len >= 20 && buf[0..2] == 0x0101u16.to_be_bytes() && buf[8..20] == tx_id {
+                            // Parse STUN attributes for XOR-MAPPED-ADDRESS (0x0020)
+                            let mut pos = 20;
+                            while pos + 4 <= len {
+                                let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+                                let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+                                pos += 4;
+                                if pos + attr_len > len {
+                                    break;
+                                }
+                                if attr_type == 0x0020 && attr_len >= 8 && buf[pos + 1] == 0x01 {
+                                    // XOR-MAPPED-ADDRESS IPv4
+                                    let xport = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) ^ 0x2112;
+                                    let xip = u32::from_be_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) ^ 0x2112A442;
+                                    let ip = std::net::Ipv4Addr::from(xip);
+                                    return Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), xport));
+                                }
+                                pos += (attr_len + 3) & !3; // 4-byte aligned
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Applies Deck Ownership in Collaborative Mode to the `ControlRegistry`.
 ///
 /// In B2B Collaborative Mode:

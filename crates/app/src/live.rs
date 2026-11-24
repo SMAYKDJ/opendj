@@ -83,6 +83,7 @@ pub struct Live {
     key: String,
     projector: Option<LiveProjectorWindow>,
     b2b_room_code: String,
+    b2b_public_ip: String,
     b2b_net: Option<live_b2b::B2bNetworkSession>,
     b2b_broadcaster: Option<live_b2b::B2bBroadcaster>,
     b2b_discovery: Option<live_b2b::B2bDiscoveryHandle>,
@@ -91,6 +92,7 @@ pub struct Live {
     opus_encoder: Option<opus::Encoder>,
     opus_decoder: Option<opus::Decoder>,
     audio_pending: Vec<f32>,
+    stun_rx: Option<std::sync::mpsc::Receiver<std::net::SocketAddr>>,
 }
 
 impl Live {
@@ -116,6 +118,7 @@ impl Live {
             key: key.clone(),
             projector: None,
             b2b_room_code: String::new(),
+            b2b_public_ip: String::new(),
             b2b_net: None,
             b2b_broadcaster: None,
             b2b_discovery: None,
@@ -124,6 +127,7 @@ impl Live {
             opus_encoder: live_b2b::create_opus_encoder(engine.sample_rate().round() as u32),
             opus_decoder: live_b2b::create_opus_decoder(engine.sample_rate().round() as u32),
             audio_pending: Vec::new(),
+            stun_rx: None,
         }));
 
         let ui = app.global::<LiveUi>();
@@ -262,20 +266,36 @@ impl Live {
                 let broadcaster = live_b2b::B2bBroadcaster::start(code.clone(), live_b2b::DEFAULT_B2B_PORT);
                 let mut l = live.borrow_mut();
                 l.b2b_room_code = code.clone();
+                l.b2b_public_ip.clear();
                 l.b2b_net = Some(net);
                 l.b2b_broadcaster = Some(broadcaster);
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
                     ui.set_b2b_room_code(code.into());
+                    ui.set_b2b_public_ip("".into());
                     ui.set_b2b_online_state(1);
                 }
+
+                // Descobre o IP público via STUN em segundo plano
+                let (tx, rx) = std::sync::mpsc::channel();
+                l.stun_rx = Some(rx);
+                std::thread::spawn(move || {
+                    if let Some(endpoint) = live_b2b::discover_public_endpoint() {
+                        let _ = tx.send(endpoint);
+                    }
+                });
             }
         });
         ui.on_b2b_copy_code({
             let live = live.clone();
             move || {
-                let code = live.borrow().b2b_room_code.clone();
-                live_b2b::copy_to_clipboard(&code);
+                let l = live.borrow();
+                let text = if l.b2b_public_ip.is_empty() {
+                    l.b2b_room_code.clone()
+                } else {
+                    format!("Código: {} (IP internet: {})", l.b2b_room_code, l.b2b_public_ip)
+                };
+                live_b2b::copy_to_clipboard(&text);
             }
         });
         ui.on_b2b_join_room({
@@ -286,6 +306,31 @@ impl Live {
                 if code.len() < 4 {
                     return;
                 }
+
+                // Se o usuário digitou ou colou um IP/Host (contém '.' ou ':'), conecta diretamente pela Internet
+                if code.contains('.') || code.contains(':') {
+                    let (host, port) = if let Some((h, p)) = code.split_once(':') {
+                        (h.to_string(), p.parse::<u16>().unwrap_or(live_b2b::DEFAULT_B2B_PORT))
+                    } else {
+                        (code.clone(), live_b2b::DEFAULT_B2B_PORT)
+                    };
+                    let net = live_b2b::B2bNetworkSession::start_guest(&host, port);
+                    net.send(live_b2b::B2bMessage::Handshake {
+                        guest_name: "DJ Convidado".into(),
+                        code: code.clone(),
+                    });
+                    live.borrow_mut().b2b_net = Some(net);
+                    if let Some(app) = weak.upgrade() {
+                        let ui = app.global::<LiveUi>();
+                        ui.set_b2b_online_state(3);
+                        ui.set_b2b_guest_name("DJ Convidado".into());
+                        let own_deck = ui.get_b2b_own_deck();
+                        let l = live.borrow();
+                        live_b2b::apply_deck_lock(&l.registry, true, own_deck);
+                    }
+                    return;
+                }
+
                 let discovery = live_b2b::B2bDiscoveryHandle::start(
                     code.clone(),
                     Duration::from_secs(15),
@@ -323,6 +368,7 @@ impl Live {
                     let ui = app.global::<LiveUi>();
                     ui.set_b2b_online_state(0);
                     ui.set_b2b_room_code("".into());
+                    ui.set_b2b_public_ip("".into());
                     ui.set_b2b_join_code("".into());
                     ui.set_b2b_guest_name("".into());
                     ui.set_b2b_host_ip("".into());
@@ -643,6 +689,16 @@ impl Live {
         if let Some(shot) = st.shot {
             let names = [ui.get_dj_a().to_string(), ui.get_dj_b().to_string()];
             ui.set_shot(shot_text(&shot, &names).into());
+        }
+
+        // ── B2B Online: Resolução de IP Público (STUN) ──────────────────────
+        if let Some(rx) = &self.stun_rx {
+            if let Ok(endpoint) = rx.try_recv() {
+                let ip_str = format!("{endpoint}");
+                self.b2b_public_ip = ip_str.clone();
+                ui.set_b2b_public_ip(ip_str.into());
+                self.stun_rx = None;
+            }
         }
 
         // ── B2B Online: Auto-descoberta na rede local ───────────────────────

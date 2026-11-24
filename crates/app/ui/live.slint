@@ -48,6 +48,7 @@ export global LiveUi {
     // 0 = Local, 1 = Host (aguardando convidado), 2 = Guest (digitando código), 3 = Conectado, 4 = Procurando (auto-descoberta)
     in-out property <int> b2b-online-state: 0;
     in property <string> b2b-room-code;
+    in property <string> b2b-public-ip;
     in-out property <string> b2b-join-code;
     in property <string> b2b-guest-name;
     // 0 = Deck A, 1 = Deck B
@@ -309,6 +310,10 @@ export component LivePanel inherits PopupWindow {
                             clicked => { LiveUi.b2b-copy-code(); }
                         }
                     }
+                    if LiveUi.b2b-public-ip != "": Text {
+                        text: "Conexão pela Internet: " + LiveUi.b2b-public-ip;
+                        color: Theme.accent; font-size: 11px; wrap: word-wrap;
+                    }
                     HorizontalLayout {
                         spacing: 8px;
                         Label { text: "MEU DECK"; vertical-alignment: center; }
@@ -333,7 +338,7 @@ export component LivePanel inherits PopupWindow {
                     }
                     join-field := Field {
                         text: LiveUi.b2b-join-code;
-                        placeholder: "Ex: 7842";
+                        placeholder: "Código (ex: 7842) ou IP para internet";
                         edited(t) => { LiveUi.b2b-join-code = t; }
                     }
                     if LiveUi.b2b-discovery-failed: VerticalLayout {

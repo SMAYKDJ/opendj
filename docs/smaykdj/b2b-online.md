@@ -56,8 +56,8 @@ O modo **B2B Online** permite que dois DJs em computadores e locais diferentes d
 
 1. **Fase 1 — Interface e Código de Sala:**
    - Interface no painel LIVE com as abas *B2B Local* e *B2B Online*.
-   - Campo para gerar e digitar Código de Sala.
-   - Servidor leve de rendezvous (troca de chaves de sinalização).
+   - Campo para gerar e digitar Código de Sala ou IP público direto.
+   - Descoberta automática de IP público e travessia NAT via cliente STUN RFC 5389 (Google/Cloudflare).
 
 2. **Fase 2 — Conexão P2P, Câmera e Sincronização de Controles:**
    - [x] Motor TCP de baixa latência (`live_b2b::B2bNetworkSession`) com suporte a Host e Convidado.
