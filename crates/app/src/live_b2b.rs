@@ -10,9 +10,25 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use opendj_control::ControlRegistry;
+use opendj_engine::{BeatGrid, LoadedTracks, Source, Track, Waveform};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_B2B_PORT: u16 = 7498;
+
+/// Dados completos da faixa e da waveform transmitidos ao carregar uma música.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RemoteTrackMessage {
+    pub deck_index: usize,
+    pub title: String,
+    pub artist: String,
+    pub bpm: f64,
+    pub key: String,
+    pub duration: f64,
+    pub first_beat: f64,
+    pub bins_per_second: f64,
+    pub bins: Vec<[u8; 8]>,
+    pub overview: Vec<[u8; 4]>,
+}
 
 /// Estado instantâneo de um Deck transmitido pela rede (baixo consumo de banda, ~40 bytes).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -35,6 +51,8 @@ pub struct DeckStateMessage {
 pub enum B2bMessage {
     Handshake { guest_name: String, code: String },
     DeckUpdate(DeckStateMessage),
+    TrackLoaded(RemoteTrackMessage),
+    TrackUnloaded { deck_index: usize },
     CameraFrame { width: u32, height: u32, jpeg: Vec<u8> },
     CueTrigger { deck_index: usize, position: f32 },
     Heartbeat,
@@ -74,7 +92,7 @@ impl B2bNetworkSession {
                     let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
                     c.store(true, Ordering::Release);
 
-                    let mut buf = vec![0u8; 1024 * 512]; // 512 KB buffer para frames de vídeo/JPEG
+                    let mut buf = vec![0u8; 1024 * 1024]; // 1 MB buffer para frames de vídeo/JPEG e waveforms
                     while !s.load(Ordering::Relaxed) {
                         // Envio de mensagens pendentes
                         while let Ok(msg) = out_rx.try_recv() {
@@ -136,7 +154,7 @@ impl B2bNetworkSession {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
             c.store(true, Ordering::Release);
 
-            let mut buf = vec![0u8; 1024 * 512]; // 512 KB buffer
+            let mut buf = vec![0u8; 1024 * 1024]; // 1 MB buffer
             while !s.load(Ordering::Relaxed) {
                 // Envio
                 while let Ok(msg) = out_rx.try_recv() {
@@ -190,6 +208,69 @@ impl B2bNetworkSession {
     pub fn close(&self) {
         self.stop.store(true, Ordering::Release);
         self.connected.store(false, Ordering::Release);
+    }
+}
+
+/// Prepara os dados de uma faixa local (metadados e waveform) para envio pela rede.
+pub fn prepare_remote_track(deck_index: usize, t: &Track) -> RemoteTrackMessage {
+    // Seleciona o nível 3 da pirâmide (~125 bins/segundo) para equilíbrio perfeito
+    // entre resolução visual cristalina e transmissão ultraleve (~90-180 KB),
+    // ou o nível mais detalhado caso haja menos níveis.
+    let (bins_per_second, bins) = if t.waveform.levels.len() > 3 && !t.waveform.levels[3].is_empty() {
+        (t.waveform.bins_per_second / 8.0, t.waveform.levels[3].clone())
+    } else if let Some(finest) = t.waveform.levels.first().filter(|l| !l.is_empty()) {
+        (t.waveform.bins_per_second, finest.clone())
+    } else {
+        (100.0, Vec::new())
+    };
+    let overview = t.waveform.overview(opendj_engine::cache::OVERVIEW_SLICES);
+
+    RemoteTrackMessage {
+        deck_index,
+        title: t.title.clone(),
+        artist: t.artist.clone(),
+        bpm: t.bpm,
+        key: t.key.clone(),
+        duration: t.duration,
+        first_beat: t.first_beat,
+        bins_per_second,
+        bins,
+        overview,
+    }
+}
+
+/// Reconstrói uma Track sintética com Waveform completa e aplica no LoadedTracks local
+/// para que a GPU renderize o scrolling e overview waveform instantaneamente.
+pub fn apply_remote_track(loaded: &LoadedTracks, msg: &RemoteTrackMessage) {
+    let waveform = if !msg.bins.is_empty() {
+        Waveform::from_finest(msg.bins_per_second, msg.bins.clone())
+    } else {
+        Waveform::default()
+    };
+    let track = Track {
+        id: usize::MAX - msg.deck_index,
+        artist: msg.artist.clone(),
+        title: msg.title.clone(),
+        album: String::new(),
+        genre: String::new(),
+        rating: 0,
+        bpm: msg.bpm,
+        key: msg.key.clone(),
+        duration: msg.duration,
+        first_beat: msg.first_beat,
+        source: Source::Synth { seed: 0 },
+        waveform: Arc::new(waveform),
+        audio: None,
+        cover: None,
+        grid: if msg.bpm > 0.0 {
+            BeatGrid::constant(msg.bpm, msg.first_beat)
+        } else {
+            Default::default()
+        },
+        info: Default::default(),
+    };
+    if let Ok(mut l) = loaded.write() {
+        l[msg.deck_index] = Some(Arc::new(track));
     }
 }
 

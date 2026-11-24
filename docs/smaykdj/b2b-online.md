@@ -69,8 +69,8 @@ O modo **B2B Online** permite que dois DJs em computadores e locais diferentes d
 3. **Fase 3 — Modo Colaborativo e Waveforms Compartilhadas:**
    - [x] Modo colaborativo total (EQs, faders e jog wheel livres para ambos os DJs realizarem viradas).
    - [x] Badge visual "B2B · <DJ>" sobre cada deck identificando o responsável pela faixa.
-   - [ ] Pacote de dados de waveform comprimido via DataChannel.
-   - [ ] Sincronização visual em 30 Hz.
+   - [x] Pacote de dados de waveform e metadados transmitido via rede (`TrackLoaded` / `TrackUnloaded`).
+   - [x] Sincronização visual em 30 Hz das duas formas de onda correndo lado a lado no openDJ e projetor.
 
 4. **Fase 4 — Validação em Live com TikTok LIVE Studio:**
    - Ajustes de estabilidade para conexões Wi-Fi residenciais.

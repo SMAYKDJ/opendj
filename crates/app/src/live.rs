@@ -86,6 +86,8 @@ pub struct Live {
     b2b_net: Option<live_b2b::B2bNetworkSession>,
     b2b_broadcaster: Option<live_b2b::B2bBroadcaster>,
     b2b_discovery: Option<live_b2b::B2bDiscoveryHandle>,
+    loaded_tracks: opendj_engine::LoadedTracks,
+    last_sent_track: [Option<(usize, usize)>; NUM_DECKS],
 }
 
 impl Live {
@@ -114,6 +116,8 @@ impl Live {
             b2b_net: None,
             b2b_broadcaster: None,
             b2b_discovery: None,
+            loaded_tracks: engine.loaded_tracks(),
+            last_sent_track: [None; NUM_DECKS],
         }));
 
         let ui = app.global::<LiveUi>();
@@ -671,9 +675,20 @@ impl Live {
                     live_b2b::B2bMessage::Handshake { guest_name, .. } => {
                         ui.set_b2b_online_state(3);
                         ui.set_b2b_guest_name(guest_name.into());
+                        self.last_sent_track = [None; NUM_DECKS];
                     }
                     live_b2b::B2bMessage::DeckUpdate(remote_state) => {
                         live_b2b::apply_remote_deck(&self.registry, &remote_state);
+                    }
+                    live_b2b::B2bMessage::TrackLoaded(track_msg) => {
+                        live_b2b::apply_remote_track(&self.loaded_tracks, &track_msg);
+                    }
+                    live_b2b::B2bMessage::TrackUnloaded { deck_index } => {
+                        if let Ok(mut l) = self.loaded_tracks.write() {
+                            if deck_index < l.len() {
+                                l[deck_index] = None;
+                            }
+                        }
                     }
                     live_b2b::B2bMessage::CameraFrame { width, height, jpeg } => {
                         if let Some(s) = &self.session {
@@ -700,6 +715,25 @@ impl Live {
             // Transmite o estado do deck local para o DJ remoto
             if net.is_connected() {
                 let own_deck = ui.get_b2b_own_deck() as usize;
+
+                // Verifica se a faixa carregada no deck local mudou ou foi carregada
+                if let Ok(tracks) = self.loaded_tracks.read() {
+                    if own_deck < tracks.len() {
+                        let cur_id = tracks[own_deck].as_ref().map(|t| (t.id, t.waveform.levels.len()));
+                        if self.last_sent_track[own_deck] != cur_id {
+                            self.last_sent_track[own_deck] = cur_id;
+                            if let Some(t) = &tracks[own_deck] {
+                                if !t.waveform.is_empty() {
+                                    let track_msg = live_b2b::prepare_remote_track(own_deck, t);
+                                    net.send(live_b2b::B2bMessage::TrackLoaded(track_msg));
+                                }
+                            } else {
+                                net.send(live_b2b::B2bMessage::TrackUnloaded { deck_index: own_deck });
+                            }
+                        }
+                    }
+                }
+
                 let local_state = live_b2b::capture_local_deck(&self.registry, own_deck);
                 net.send(live_b2b::B2bMessage::DeckUpdate(local_state));
             }

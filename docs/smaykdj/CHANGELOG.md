@@ -6,6 +6,11 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-24 (tarde)
 
 ### Adicionado
+- **B2B Online Remoto (Waveforms e Metadados Compartilhados via Rede):**
+  - Implementado `RemoteTrackMessage` e variantes `B2bMessage::TrackLoaded` e `B2bMessage::TrackUnloaded`.
+  - Ao carregar uma faixa no deck próprio, o openDJ extrai os metadados (Título, Artista, BPM, Tom, Duração, Primeiro Beat) e os dados de waveform (nível 3 da pirâmide em ~125 bins/s e o resumo de 256 fatias de overview).
+  - O DJ remoto reconstrói a `Track` com `Waveform::from_finest` e insere no `LoadedTracks` do engine, permitindo que a GPU renderize tanto o overview completo quanto a forma de onda contínua rolante (*scrolling waveform*) sem necessidade do arquivo de áudio físico estar no disco.
+  - Buffer de rede expandido para 1 MB em `live_b2b.rs` para acomodar pacotes de waveform e frames de vídeo JPEG.
 - **B2B Online Remoto (Auto-Descoberta UDP na Rede Local):**
   - Implementado sistema de auto-descoberta via UDP broadcast na porta `7499` (`live_b2b::B2bBroadcaster` e `live_b2b::B2bDiscoveryHandle`): o anfitrião anuncia seu código de sala e o convidado localiza o IP do host automaticamente sem precisar digitá-lo manualmente.
   - Estado 4 adicionado na UI do Slint ("Procurando na rede…") com timeout de 15 segundos e cancelamento a qualquer momento.
