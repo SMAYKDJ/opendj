@@ -61,6 +61,7 @@ O modo **B2B Online** permite que dois DJs em computadores e locais diferentes d
 
 2. **Fase 2 — Conexão P2P, Câmera e Sincronização de Controles:**
    - [x] Motor TCP de baixa latência (`live_b2b::B2bNetworkSession`) com suporte a Host e Convidado.
+   - [x] Auto-descoberta local sem digitação de IP via UDP broadcast (porta `7499`) com fallback manual.
    - [x] Pacote de estado de deck em 30 Hz (`DeckStateMessage`): Play, Cue, Posição da agulha, Faders, EQs e BPM.
    - [x] Espelhamento mútuo instantâneo de controles no `ControlRegistry`.
    - [x] Suporte à câmera do DJ remoto alimentando diretamente o slot 1 do compositor vertical 9:16.

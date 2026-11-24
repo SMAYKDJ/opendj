@@ -84,6 +84,8 @@ pub struct Live {
     projector: Option<LiveProjectorWindow>,
     b2b_room_code: String,
     b2b_net: Option<live_b2b::B2bNetworkSession>,
+    b2b_broadcaster: Option<live_b2b::B2bBroadcaster>,
+    b2b_discovery: Option<live_b2b::B2bDiscoveryHandle>,
 }
 
 impl Live {
@@ -110,6 +112,8 @@ impl Live {
             projector: None,
             b2b_room_code: String::new(),
             b2b_net: None,
+            b2b_broadcaster: None,
+            b2b_discovery: None,
         }));
 
         let ui = app.global::<LiveUi>();
@@ -245,9 +249,11 @@ impl Live {
             move || {
                 let code = live_b2b::generate_room_code();
                 let net = live_b2b::B2bNetworkSession::start_host(live_b2b::DEFAULT_B2B_PORT);
+                let broadcaster = live_b2b::B2bBroadcaster::start(code.clone(), live_b2b::DEFAULT_B2B_PORT);
                 let mut l = live.borrow_mut();
                 l.b2b_room_code = code.clone();
                 l.b2b_net = Some(net);
+                l.b2b_broadcaster = Some(broadcaster);
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
                     ui.set_b2b_room_code(code.into());
@@ -270,19 +276,21 @@ impl Live {
                 if code.len() < 4 {
                     return;
                 }
-                let net = live_b2b::B2bNetworkSession::start_guest("127.0.0.1", live_b2b::DEFAULT_B2B_PORT);
-                net.send(live_b2b::B2bMessage::Handshake {
-                    guest_name: "DJ Convidado".into(),
-                    code: code.clone(),
-                });
-                live.borrow_mut().b2b_net = Some(net);
+                let discovery = live_b2b::B2bDiscoveryHandle::start(
+                    code.clone(),
+                    Duration::from_secs(15),
+                );
+                let mut l = live.borrow_mut();
+                if let Some(disc) = l.b2b_discovery.take() {
+                    disc.cancel();
+                }
+                l.b2b_room_code = code;
+                l.b2b_discovery = Some(discovery);
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
-                    ui.set_b2b_online_state(3);
-                    ui.set_b2b_guest_name("DJ Convidado".into());
-                    let own_deck = ui.get_b2b_own_deck();
-                    let l = live.borrow();
-                    live_b2b::apply_deck_lock(&l.registry, true, own_deck);
+                    ui.set_b2b_online_state(4);
+                    ui.set_b2b_discovery_failed(false);
+                    ui.set_error("".into());
                 }
             }
         });
@@ -294,6 +302,12 @@ impl Live {
                 if let Some(net) = l.b2b_net.take() {
                     net.close();
                 }
+                if let Some(bc) = l.b2b_broadcaster.take() {
+                    bc.stop();
+                }
+                if let Some(disc) = l.b2b_discovery.take() {
+                    disc.cancel();
+                }
                 live_b2b::apply_deck_lock(&l.registry, false, 0);
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
@@ -301,6 +315,33 @@ impl Live {
                     ui.set_b2b_room_code("".into());
                     ui.set_b2b_join_code("".into());
                     ui.set_b2b_guest_name("".into());
+                    ui.set_b2b_host_ip("".into());
+                    ui.set_b2b_discovery_failed(false);
+                    ui.set_error("".into());
+                }
+            }
+        });
+        ui.on_b2b_join_direct({
+            let live = live.clone();
+            let weak = weak.clone();
+            move |ip| {
+                let ip = ip.trim().to_string();
+                if ip.is_empty() {
+                    return;
+                }
+                let net = live_b2b::B2bNetworkSession::start_guest(&ip, live_b2b::DEFAULT_B2B_PORT);
+                net.send(live_b2b::B2bMessage::Handshake {
+                    guest_name: "DJ Convidado".into(),
+                    code: String::new(),
+                });
+                live.borrow_mut().b2b_net = Some(net);
+                if let Some(app) = weak.upgrade() {
+                    let ui = app.global::<LiveUi>();
+                    ui.set_b2b_online_state(3);
+                    ui.set_b2b_guest_name("DJ Convidado".into());
+                    let own_deck = ui.get_b2b_own_deck();
+                    let l = live.borrow();
+                    live_b2b::apply_deck_lock(&l.registry, true, own_deck);
                 }
             }
         });
@@ -592,6 +633,28 @@ impl Live {
         if let Some(shot) = st.shot {
             let names = [ui.get_dj_a().to_string(), ui.get_dj_b().to_string()];
             ui.set_shot(shot_text(&shot, &names).into());
+        }
+
+        // ── B2B Online: Auto-descoberta na rede local ───────────────────────
+        if let Some(result) = self.b2b_discovery.as_ref().and_then(|d| d.try_result()) {
+            self.b2b_discovery = None;
+            match result {
+                Some((host_ip, port)) => {
+                    let net = live_b2b::B2bNetworkSession::start_guest(&host_ip, port);
+                    net.send(live_b2b::B2bMessage::Handshake {
+                        guest_name: "DJ Convidado".into(),
+                        code: self.b2b_room_code.clone(),
+                    });
+                    self.b2b_net = Some(net);
+                    ui.set_b2b_online_state(3);
+                    ui.set_b2b_guest_name("DJ Convidado".into());
+                    live_b2b::apply_deck_lock(&self.registry, true, ui.get_b2b_own_deck());
+                }
+                None => {
+                    ui.set_b2b_online_state(2);
+                    ui.set_b2b_discovery_failed(true);
+                }
+            }
         }
 
         // ── B2B Online: Sincronização de Rede em 30 Hz ──────────────────────

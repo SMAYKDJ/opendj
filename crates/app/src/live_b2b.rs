@@ -2,12 +2,12 @@
 //! Fase 2 (real WebRTC P2P networking) will be built on top of this module.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opendj_control::ControlRegistry;
 use serde::{Deserialize, Serialize};
@@ -274,6 +274,102 @@ pub fn apply_deck_lock(registry: &Arc<ControlRegistry>, _connected: bool, _own_d
     registry.lock_group("[Channel2]", false);
     registry.lock_group("[EqualizerRack1_[Channel1]", false);
     registry.lock_group("[EqualizerRack1_[Channel2]", false);
+}
+
+// ── Auto-Descoberta na Rede Local (UDP Broadcast) ───────────────────────
+
+pub const DISCOVERY_PORT: u16 = 7499;
+
+/// Pacote de descoberta enviado pelo anfitrião via UDP broadcast.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DiscoveryPacket {
+    code: String,
+    port: u16,
+}
+
+/// Transmissor UDP: o anfitrião anuncia o código de sala na rede local a cada segundo.
+pub struct B2bBroadcaster {
+    stop: Arc<AtomicBool>,
+    _thread: Option<JoinHandle<()>>,
+}
+
+impl B2bBroadcaster {
+    pub fn start(code: String, tcp_port: u16) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+
+        let thread = std::thread::spawn(move || {
+            let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else { return };
+            let _ = socket.set_broadcast(true);
+            let packet = DiscoveryPacket { code, port: tcp_port };
+            let Ok(json) = serde_json::to_vec(&packet) else { return };
+
+            while !s.load(Ordering::Relaxed) {
+                let _ = socket.send_to(&json, ("255.255.255.255", DISCOVERY_PORT));
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+
+        Self {
+            stop,
+            _thread: Some(thread),
+        }
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+/// Escuta broadcasts UDP do anfitrião na rede local.
+/// Roda em background e envia o resultado pelo canal quando encontra ou expira.
+pub struct B2bDiscoveryHandle {
+    stop: Arc<AtomicBool>,
+    result: Receiver<Option<(String, u16)>>,
+}
+
+impl B2bDiscoveryHandle {
+    /// Inicia a descoberta: escuta broadcasts UDP com o código fornecido (timeout em segundos).
+    pub fn start(code: String, timeout: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        let s = stop.clone();
+
+        std::thread::spawn(move || {
+            let Ok(socket) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
+                let _ = tx.send(None);
+                return;
+            };
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+
+            let deadline = Instant::now() + timeout;
+            let mut buf = [0u8; 512];
+
+            while Instant::now() < deadline && !s.load(Ordering::Relaxed) {
+                if let Ok((len, src)) = socket.recv_from(&mut buf) {
+                    if let Ok(packet) = serde_json::from_slice::<DiscoveryPacket>(&buf[..len]) {
+                        if packet.code == code {
+                            let _ = tx.send(Some((src.ip().to_string(), packet.port)));
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(None);
+        });
+
+        Self { stop, result: rx }
+    }
+
+    /// Verifica se o resultado já chegou (não-bloqueante).
+    pub fn try_result(&self) -> Option<Option<(String, u16)>> {
+        self.result.try_recv().ok()
+    }
+
+    /// Cancela a busca em andamento.
+    pub fn cancel(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 

@@ -6,6 +6,10 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-24 (tarde)
 
 ### Adicionado
+- **B2B Online Remoto (Auto-Descoberta UDP na Rede Local):**
+  - Implementado sistema de auto-descoberta via UDP broadcast na porta `7499` (`live_b2b::B2bBroadcaster` e `live_b2b::B2bDiscoveryHandle`): o anfitrião anuncia seu código de sala e o convidado localiza o IP do host automaticamente sem precisar digitá-lo manualmente.
+  - Estado 4 adicionado na UI do Slint ("Procurando na rede…") com timeout de 15 segundos e cancelamento a qualquer momento.
+  - Fallback automático: caso a rede bloqueie UDP broadcast ou não encontre o anfitrião, a interface exibe o campo manual de IP para conexão direta (`b2b-join-direct`).
 - **B2B Online Remoto (Suporte a Câmera Remota no Compositor Vertical):**
   - Implementado `Session::set_remote_camera` em `crates/live/src/session.rs` para permitir alimentação direta do slot de câmera 1 (DJ B / convidado) a partir da rede.
   - Adicionado `B2bMessage::CameraFrame { width, height, jpeg }` em `live_b2b.rs` com buffer expandido (512 KB) para transmissão contínua de frames comprimidos da webcam do parceiro.

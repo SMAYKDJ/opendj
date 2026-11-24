@@ -45,7 +45,7 @@ export global LiveUi {
     in property <string> key;
     in property <string> record-folder;
     // B2B Online Remote
-    // 0 = Local, 1 = Host (aguardando convidado), 2 = Guest (digitando código), 3 = Conectado
+    // 0 = Local, 1 = Host (aguardando convidado), 2 = Guest (digitando código), 3 = Conectado, 4 = Procurando (auto-descoberta)
     in-out property <int> b2b-online-state: 0;
     in property <string> b2b-room-code;
     in-out property <string> b2b-join-code;
@@ -57,6 +57,9 @@ export global LiveUi {
     callback b2b-copy-code();
     callback b2b-cancel();
     callback b2b-set-own-deck(int);
+    callback b2b-join-direct(string);
+    in-out property <string> b2b-host-ip;
+    in property <bool> b2b-discovery-failed: false;
     callback opened();
     callback toggle-projector();
     callback set-b2b(bool);
@@ -251,7 +254,8 @@ export component LivePanel inherits PopupWindow {
                     Text {
                         text: LiveUi.b2b-online-state == 1 ? "Aguardando convidado…" :
                               LiveUi.b2b-online-state == 2 ? "Digitando código…" :
-                              LiveUi.b2b-online-state == 3 ? "Conectado · " + LiveUi.b2b-guest-name : "";
+                              LiveUi.b2b-online-state == 3 ? "Conectado · " + LiveUi.b2b-guest-name :
+                              LiveUi.b2b-online-state == 4 ? "Procurando na rede…" : "";
                         color: Theme.text-dim; font-size: 11px; vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
@@ -332,13 +336,31 @@ export component LivePanel inherits PopupWindow {
                         placeholder: "Ex: 7842";
                         edited(t) => { LiveUi.b2b-join-code = t; }
                     }
+                    if LiveUi.b2b-discovery-failed: VerticalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: "Não encontrou na rede local. Peça o IP ao anfitrião:";
+                            color: Theme.c-e5484d; font-size: 11px; wrap: word-wrap;
+                        }
+                        Field {
+                            text: LiveUi.b2b-host-ip;
+                            placeholder: "Ex: 192.168.1.42";
+                            edited(t) => { LiveUi.b2b-host-ip = t; }
+                        }
+                    }
                     HorizontalLayout {
                         spacing: 8px;
                         Action {
                             horizontal-stretch: 1;
-                            label: "Conectar";
+                            label: LiveUi.b2b-discovery-failed ? "Tentar de Novo" : "Conectar";
                             tint: Theme.automix;
                             clicked => { LiveUi.b2b-join-room(join-field.text); }
+                        }
+                        if LiveUi.b2b-discovery-failed: Action {
+                            horizontal-stretch: 1;
+                            label: "Conectar pelo IP";
+                            filled: false;
+                            clicked => { LiveUi.b2b-join-direct(LiveUi.b2b-host-ip); }
                         }
                         Action {
                             width: 80px;
@@ -346,6 +368,23 @@ export component LivePanel inherits PopupWindow {
                             filled: false;
                             clicked => { LiveUi.b2b-cancel(); }
                         }
+                    }
+                }
+                // ESTADO 4: procurando anfitrião na rede local
+                if LiveUi.b2b-online-state == 4: VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Procurando o anfitrião na rede local…";
+                        color: Theme.text; font-size: 12px; wrap: word-wrap;
+                    }
+                    Text {
+                        text: "Verifique se ambos estão na mesma rede Wi-Fi.";
+                        color: Theme.text-dim; font-size: 10px; wrap: word-wrap;
+                    }
+                    Action {
+                        label: "Cancelar";
+                        filled: false;
+                        clicked => { LiveUi.b2b-cancel(); }
                     }
                 }
                 // ESTADO 3: conectado
