@@ -6010,8 +6010,8 @@ export component Deck inherits Rectangle {
     in property <DeckInfo> info;
     in property <image> overview;
     in property <bool> mirrored: false;
-    in property <bool> b2b-locked: false;
-    in property <string> b2b-guest-name: "";
+    in property <bool> b2b-active: false;
+    in property <string> b2b-dj-name: "";
     // Set from the renderer each frame, so the jog marker turns smoothly.
     in property <angle> spin;
     out property <length> overview-width: header.overview-width;
@@ -6118,39 +6118,32 @@ export component Deck inherits Rectangle {
         background: drop.has-drag || files-here ? tint.transparentize(0.9) : transparent;
     }
 
-    // B2B Online: Deck Remoto Bloqueado para controle local
-    if b2b-locked: Rectangle {
-        background: #00000030;
-        border-radius: Theme.radius;
+    // B2B Online Colaborativo: Badge visual de posse de deck
+    if b2b-active: Rectangle {
+        x: mirrored ? parent.width - self.width - 8px : 8px;
+        y: 8px;
+        height: 22px;
+        border-radius: 11px;
+        background: #14101fe8;
         border-width: 1px;
-        border-color: Theme.accent.transparentize(0.7);
-        // Pill informando que o deck está sob controle do DJ parceiro
-        Rectangle {
-            x: 8px;
-            y: 8px;
-            height: 22px;
-            border-radius: 11px;
-            background: #14101fe8;
-            border-width: 1px;
-            border-color: Theme.accent;
-            HorizontalLayout {
-                padding-left: 8px;
-                padding-right: 8px;
-                spacing: 6px;
-                Rectangle {
-                    width: 6px; height: 6px;
-                    border-radius: 3px;
-                    background: Theme.accent;
-                    y: (parent.height - self.height) / 2;
-                }
-                Text {
-                    text: "B2B ONLINE · " + b2b-guest-name;
-                    color: Theme.accent;
-                    font-size: 10px;
-                    font-weight: 700;
-                    letter-spacing: 0.5px;
-                    vertical-alignment: center;
-                }
+        border-color: Theme.accent;
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 6px;
+            Rectangle {
+                width: 6px; height: 6px;
+                border-radius: 3px;
+                background: Theme.accent;
+                y: (parent.height - self.height) / 2;
+            }
+            Text {
+                text: "B2B · " + b2b-dj-name;
+                color: Theme.accent;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+                vertical-alignment: center;
             }
         }
     }

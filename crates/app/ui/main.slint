@@ -2125,8 +2125,8 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1;
                         min-width: 400px;
                         preferred-width: 400px;
-                        b2b-locked: LiveUi.b2b-online-state == 3 && LiveUi.b2b-own-deck != 0;
-                        b2b-guest-name: LiveUi.b2b-guest-name;
+                        b2b-active: LiveUi.b2b-online-state == 3;
+                        b2b-dj-name: LiveUi.b2b-own-deck == 0 ? LiveUi.dj-a : LiveUi.b2b-guest-name;
                     }
                     if !external-mixer: Mixer { }
                     if external-mixer: ExternalMixer { }
@@ -2139,8 +2139,8 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1;
                         min-width: 400px;
                         preferred-width: 400px;
-                        b2b-locked: LiveUi.b2b-online-state == 3 && LiveUi.b2b-own-deck != 1;
-                        b2b-guest-name: LiveUi.b2b-guest-name;
+                        b2b-active: LiveUi.b2b-online-state == 3;
+                        b2b-dj-name: LiveUi.b2b-own-deck == 1 ? LiveUi.dj-a : LiveUi.b2b-guest-name;
                     }
                 }
 

@@ -6,10 +6,9 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-24 (tarde)
 
 ### Adicionado
-- **B2B Online Remoto (Fase 2 - Deck Lock & Posse de Decks):**
-  - Implementado `lock_group` em `ControlRegistry` (`crates/control/src/lib.rs`) para travar recursivamente controles por grupo (`[Channel1]`, `[Channel2]`, equalizadores, etc.).
-  - Implementado `live_b2b::apply_deck_lock` para congelar os controles locais do deck remoto no estado conectado e liberá-los ao desconectar.
-  - Indicador visual no componente `Deck` (`deck.slint` + `main.slint`): exibe uma pílula informativa destacada ("B2B ONLINE · DJ Convidado") e bloqueio sutil sobre o deck que pertence ao outro DJ.
+- **B2B Online Remoto (Modo Colaborativo sem Trava Engessada):**
+  - Ambos os decks (controles de transporte, EQs, graves, médios, agudos, faders e jog/pitch bend) permanecem **100% liberados** para ambos os DJs, permitindo transições completas e ajustes finos de beatmatching durante o set/batalha.
+  - Indicador visual em cada deck (`deck.slint`): exibe uma pílula informativa no topo do deck identificando a posse de cada faixa ("B2B · <Nome do DJ>").
 - **B2B Online Remoto (Fase 1 - Interface e Código de Sala):**
   - Seção "B2B ONLINE" adicionada ao painel LIVE com indicador de status em tempo real.
   - Botões para "Criar Sala" (modo anfitrião) e "Entrar com Código" (modo convidado).
