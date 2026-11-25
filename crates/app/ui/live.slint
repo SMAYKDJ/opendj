@@ -240,8 +240,8 @@ export component LivePanel inherits PopupWindow {
                     }
                 }
                 Action {
-                    width: 76px;
-                    label: "Fechar ✕";
+                    width: 110px;
+                    label: "✕ Fechar painel";
                     filled: false;
                     clicked => { root.close(); }
                 }
@@ -616,11 +616,17 @@ export component LivePanel inherits PopupWindow {
                     clicked => { LiveUi.finish(); }
                 }
                 Action {
-                    width: 76px;
-                    label: "Fechar";
+                    width: 110px;
+                    label: "Ocultar painel";
                     filled: false;
                     clicked => { root.close(); }
                 }
+            }
+            Text {
+                text: "💡 Ao ocultar o painel, a janela do TikTok e as câmeras continuam rodando. Clique em LIVE no topo para reabrir.";
+                color: Theme.text-dim;
+                font-size: 10px;
+                wrap: word-wrap;
             }
         }
         // What the audience sees.
