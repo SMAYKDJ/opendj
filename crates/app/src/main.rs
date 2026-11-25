@@ -92,6 +92,8 @@ mod quality;
 mod quick_search;
 mod live;
 mod live_b2b;
+mod license;
+mod security;
 mod remote;
 mod sampler;
 mod scrobble;
@@ -558,8 +560,48 @@ fn fit_to_screen(app: &AppWindow) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().nth(1).as_deref() == Some("--list-controls") {
+    let arg1 = std::env::args().nth(1);
+    if arg1.as_deref() == Some("--list-controls") {
         list_controls();
+        return Ok(());
+    }
+    if arg1.as_deref() == Some("--machine-id") {
+        println!("{}", license::get_machine_id());
+        return Ok(());
+    }
+    if arg1.as_deref() == Some("--keygen") {
+        let (pkcs8, pubkey) = license::generate_keypair().map_err(|e| e.to_string())?;
+        use base64::Engine;
+        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pubkey);
+        let priv_b64 = base64::engine::general_purpose::STANDARD.encode(&pkcs8);
+        println!("=== NOVO PAR DE CHAVES ED25519 GERADO ===");
+        println!("Public Key (32 bytes): {pub_b64}");
+        println!("Private Key (PKCS#8): {priv_b64}");
+        return Ok(());
+    }
+    if arg1.as_deref() == Some("--create-license") {
+        let email = std::env::args().nth(2).unwrap_or_else(|| "dj@smayk.com".into());
+        let machine_id = std::env::args().nth(3).unwrap_or_else(license::get_machine_id);
+        let tier = std::env::args().nth(4).unwrap_or_else(|| "TIKTOK_PRO".into());
+        let (pkcs8, pubkey) = license::generate_keypair().map_err(|e| e.to_string())?;
+        let payload = license::LicensePayload {
+            email: email.clone(),
+            machine_id: machine_id.clone(),
+            tier: tier.clone(),
+            issued_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+            expires_at: None,
+        };
+        let key = license::create_signed_license(&payload, &pkcs8).map_err(|e| e.to_string())?;
+        use base64::Engine;
+        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pubkey);
+        println!("=== LICENÇA GERADA COM SUCESSO ===");
+        println!("Email: {email}");
+        println!("Machine ID: {machine_id}");
+        println!("Plano: {tier}");
+        println!("Chave de Licença:\n{key}");
+        println!("\nChave Pública correspondente (Base64):\n{pub_b64}");
         return Ok(());
     }
     diagnostics::install();

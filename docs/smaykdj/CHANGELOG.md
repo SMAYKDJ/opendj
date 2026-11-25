@@ -3,6 +3,32 @@
 Tudo o que mudou nesta edição em relação ao openDJ original, do mais novo
 para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 
+## 2026-11-24 (noite)
+
+### Adicionado
+- **Arquitetura Comercial, Anti-Pirataria e Licenciamento Criptográfico:**
+  - **Perfil de Compilação Blindado (`[profile.release]`):** ativado `strip = true` (elimina todos os símbolos e caminhos de debug do binário compilado), `lto = "fat"`, `codegen-units = 1` e `panic = "abort"` para máxima proteção contra engenharia reversa e desmontagem por IDA Pro / Ghidra.
+  - **Módulo de Segurança e Anti-Tampering (`crates/app/src/security.rs`):**
+    - Detecção de depuradores ativos (`is_debugger_present`): monitora processos pais e injeção de dylibs (`DYLD_INSERT_LIBRARIES`, Frida, Cycript).
+    - Proteção `PT_DENY_ATTACH` do kernel macOS para impedir a anexação de depuradores ao executável.
+    - Decodificador ofuscado de strings em memória (`ObfStr`) para evitar strings sensíveis em texto puro no binário (.rodata).
+  - **Hardware Fingerprint — Machine ID Único (`crates/app/src/license.rs`):**
+    - Identificador persistente baseado no serial do hardware (`IOPlatformSerialNumber` / UUID) com hash SHA-256 no formato `MACH-XXXX-XXXX-XXXX-XXXX`.
+    - Comando CLI embutido `./target/release/opendj --machine-id` para consulta rápida no terminal.
+  - **Validador Criptográfico de Licença com Curva Elíptica Ed25519:**
+    - Criptografia assimétrica padrão bancário (via crate `ring`): validação matemática offline de licenças digitais sem depender de conexão com internet.
+    - Suporte a licenças assinadas no formato `ODJ1.<PAYLOAD_B64>.<ASSINATURA_B64>`.
+    - Persistência automática em `~/Library/Application Support/openDJ/license.json`.
+    - Comandos administrativos embutidos: `--keygen` (geração de par de chaves) e `--create-license` (geração de licença para clientes).
+  - **Interface no Painel LIVE:**
+    - Seção "LICENÇA & PRODUTO" com exibição do Hardware ID e botão "Copiar ID".
+    - Campo de teste e ativação de licença com feedback em tempo real.
+  - **Modo Soft / Testes Livres (`ENFORCE_LICENSE = false`):**
+    - Todas as funcionalidades do openDJ (Battle Live vertical, projetor TikTok, B2B Online) permanecem 100% liberadas e operacionais durante a fase de testes, exibindo a pílula "TESTES LIBERADOS".
+    - A obrigatoriedade da licença fica pendente até a conclusão dos testes pelo usuário, bastando mudar a flag para iniciar a comercialização estrita.
+  - **Documentação e Webhook Serverless de Pagamento Automático:**
+    - Criado [licensing-commercial.md](licensing-commercial.md) com especificação completa e código de webhook pronto para Cloudflare Workers / Node.js integrando Mercado Pago (PIX instantâneo) e Stripe com envio automático de chave por e-mail em menos de 10 segundos.
+
 ## 2026-11-24 (tarde)
 
 ### Adicionado

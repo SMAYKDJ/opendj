@@ -93,6 +93,7 @@ pub struct Live {
     opus_decoder: Option<opus::Decoder>,
     audio_pending: Vec<f32>,
     stun_rx: Option<std::sync::mpsc::Receiver<std::net::SocketAddr>>,
+    license_mgr: crate::license::LicenseManager,
 }
 
 impl Live {
@@ -128,9 +129,20 @@ impl Live {
             opus_decoder: live_b2b::create_opus_decoder(engine.sample_rate().round() as u32),
             audio_pending: Vec::new(),
             stun_rx: None,
+            license_mgr: crate::license::LicenseManager::new(),
         }));
 
         let ui = app.global::<LiveUi>();
+        let machine_id = crate::license::get_machine_id();
+        let lic_init = crate::license::LicenseManager::new();
+        ui.set_license_machine_id(machine_id.clone().into());
+        ui.set_license_active(lic_init.is_unlocked());
+        ui.set_license_status_text(lic_init.status_text().into());
+        ui.set_license_feedback_msg(if crate::license::ENFORCE_LICENSE {
+            "".into()
+        } else {
+            "Modo de testes ativo: todas as funções liberadas sem bloqueio.".into()
+        });
         ui.set_b2b(settings::flag(MODE, true));
         ui.set_dj_a(name_or(DJ_A, "DJ A").into());
         ui.set_dj_b(name_or(DJ_B, "DJ B").into());
@@ -412,6 +424,33 @@ impl Live {
                     if connected {
                         let l = live.borrow();
                         live_b2b::apply_deck_lock(&l.registry, true, deck);
+                    }
+                }
+            }
+        });
+        ui.on_license_copy_machine_id({
+            let mid = machine_id.clone();
+            move || {
+                live_b2b::copy_to_clipboard(&mid);
+            }
+        });
+        ui.on_license_validate_key({
+            let live = live.clone();
+            let weak = weak.clone();
+            move |key| {
+                let mut l = live.borrow_mut();
+                let res = l.license_mgr.activate_key(&key);
+                if let Some(app) = weak.upgrade() {
+                    let ui = app.global::<LiveUi>();
+                    match res {
+                        Ok(payload) => {
+                            ui.set_license_active(true);
+                            ui.set_license_status_text(format!("Ativado para {} ({})", payload.email, payload.tier).into());
+                            ui.set_license_feedback_msg(format!("Sucesso! Licença comercial validada para {}", payload.email).into());
+                        }
+                        Err(err) => {
+                            ui.set_license_feedback_msg(format!("Erro ao ativar: {err}").into());
+                        }
                     }
                 }
             }

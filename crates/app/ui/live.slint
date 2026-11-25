@@ -61,6 +61,14 @@ export global LiveUi {
     callback b2b-join-direct(string);
     in-out property <string> b2b-host-ip;
     in property <bool> b2b-discovery-failed: false;
+    // Licença & Ativação Comercial
+    in property <string> license-machine-id: "";
+    in property <string> license-status-text: "";
+    in property <bool> license-active: false;
+    in-out property <string> license-input-key: "";
+    in property <string> license-feedback-msg: "";
+    callback license-copy-machine-id();
+    callback license-validate-key(string);
     callback opened();
     callback toggle-projector();
     callback set-b2b(bool);
@@ -500,6 +508,71 @@ export component LivePanel inherits PopupWindow {
                 spacing: 10px;
                 Switch { on: LiveUi.record; toggled(on) => { LiveUi.set-record(on); } }
                 Text { text: "Gravar em " + LiveUi.record-folder; color: Theme.text; font-size: 12px; vertical-alignment: center; overflow: elide; }
+            }
+            // ── LICENÇA & PRODUTO COMERCIAL (MODO TESTES / SOFT-MODE) ────
+            Rectangle {
+                background: Theme.panel-raised;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.border;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Label { text: "LICENÇA & PRODUTO"; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Rectangle {
+                            background: LiveUi.license-active ? Theme.c-30d158.with-alpha(0.18) : Theme.automix.with-alpha(0.18);
+                            border-radius: 4px;
+                            HorizontalLayout {
+                                padding-left: 6px; padding-right: 6px; padding-top: 2px; padding-bottom: 2px;
+                                Text {
+                                    text: LiveUi.license-active ? "PRO ATIVADO" : "TESTES LIBERADOS";
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    color: LiveUi.license-active ? Theme.c-30d158 : Theme.automix;
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            Text { text: "ID desta máquina (Hardware ID):"; color: Theme.text-dim; font-size: 10px; }
+                            Text { text: LiveUi.license-machine-id; color: Theme.text; font-size: 11px; font-weight: 600; }
+                        }
+                        Action {
+                            width: 80px;
+                            label: "Copiar ID";
+                            filled: false;
+                            clicked => { LiveUi.license-copy-machine-id(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        lic-field := Field {
+                            horizontal-stretch: 1;
+                            text: LiveUi.license-input-key;
+                            placeholder: "Colar chave de ativação para testar...";
+                            edited(t) => { LiveUi.license-input-key = t; }
+                        }
+                        Action {
+                            width: 110px;
+                            label: "Validar Chave";
+                            filled: false;
+                            clicked => { LiveUi.license-validate-key(lic-field.text); }
+                        }
+                    }
+                    if LiveUi.license-feedback-msg != "": Text {
+                        text: LiveUi.license-feedback-msg;
+                        color: LiveUi.license-active ? Theme.c-30d158 : Theme.text-dim;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
             }
             if LiveUi.ffmpeg-missing: Text {
                 text: "Falta o ffmpeg, que codifica o vídeo. No Terminal: brew install ffmpeg";

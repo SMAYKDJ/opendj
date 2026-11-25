@@ -13,6 +13,7 @@ continua igual; as mudanças ficam no branch `smaykdj` e estão listadas em
 | Progresso dos stems HQ | Mostra no deck quanto falta para a separação em alta qualidade (HTDemucs) terminar | Pronto, aguardando teste no Mac |
 | Battle Live (TikTok) | Botão LIVE na barra superior: transmissão vertical para a live do TikTok com câmeras de celular, projetor para TikTok LIVE Studio, diretor de cenas automático e gravação | Pronto, aguardando teste no Mac: [live-tiktok.md](live-tiktok.md) |
 | B2B Online Remoto | Sessão P2P com Código de Sala para 2 DJs tocarem juntos pela internet com waveforms ao vivo, áudio Opus, câmera remota e live conjunta no TikTok | Pronto: [manual](manual-b2b-online.md) · [tour rápido](tour-b2b-online.md) · [roadmap](b2b-online.md) |
+| Licenciamento & Proteção Comercial | Blindagem de binário (strip/LTO), anti-debug, hardware ID (macOS), chaves Ed25519 e webhook de pagamento automático | Pronto (Modo Soft/Testes Livres ativo): [documentação](licensing-commercial.md) |
 
 ## Base
 
