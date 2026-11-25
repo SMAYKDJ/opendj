@@ -14,6 +14,9 @@ continua igual; as mudanças ficam no branch `smaykdj` e estão listadas em
 | Battle Live (TikTok) | Botão LIVE na barra superior: transmissão vertical para a live do TikTok com câmeras de celular, projetor para TikTok LIVE Studio, diretor de cenas automático e gravação | Pronto, aguardando teste no Mac: [live-tiktok.md](live-tiktok.md) |
 | B2B Online Remoto | Sessão P2P com Código de Sala para 2 DJs tocarem juntos pela internet com waveforms ao vivo, áudio Opus, câmera remota e live conjunta no TikTok | Pronto: [manual](manual-b2b-online.md) · [tour rápido](tour-b2b-online.md) · [roadmap](b2b-online.md) |
 | Licenciamento & Proteção Comercial | Blindagem de binário (strip/LTO), anti-debug, hardware ID (macOS), chaves Ed25519 e webhook de pagamento automático | Pronto (Modo Soft/Testes Livres ativo): [documentação](licensing-commercial.md) |
+| RTMP Direto (sem LIVE Studio) | Transmissão H.264+AAC direto do openDJ para TikTok/YouTube/Twitch via ffmpeg, URL do TikTok pré-preenchida, chave no Keychain | Pronto: [guia RTMP](guia-transmissao-rtmp.md) |
+| Modo Solo documentado | Guia completo de câmeras iguais no modo Solo, posicionamento, cenas, transmissão | Pronto: [guia Solo](guia-solo-modo.md) |
+| Arquitetura Técnica | Referência completa: pipeline, crates, protocolos, diagramas, comandos dev | Pronto: [arquitetura](arquitetura-tecnica.md) |
 
 ## Base
 

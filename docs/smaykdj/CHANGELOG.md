@@ -3,6 +3,34 @@
 Tudo o que mudou nesta edição em relação ao openDJ original, do mais novo
 para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 
+## 2026-11-25
+
+### Adicionado
+- **Transmissão RTMP direta (sem TikTok LIVE Studio):**
+  - URL do servidor TikTok (`rtmp://push.tiktok.com/live/`) pré-preenchida
+    automaticamente ao abrir o painel LIVE pela primeira vez.
+  - Instrução simplificada na UI: "TikTok → + → Live → Stream de PC".
+  - Aviso de ffmpeg faltando mais claro: "⚠ ffmpeg não encontrado. Cole no Terminal: brew install ffmpeg".
+- **Documentação completa (3 novos documentos em `docs/smaykdj/`):**
+  - [`guia-transmissao-rtmp.md`](guia-transmissao-rtmp.md) — Guia de RTMP para
+    TikTok, YouTube, Instagram, configuração de qualidade, troubleshooting e
+    tabela de servidores de todas as plataformas.
+  - [`guia-solo-modo.md`](guia-solo-modo.md) — Modo Solo com câmeras de mesmo
+    tamanho: layout da tela 9:16 detalhado, como configurar celulares, cenas
+    disponíveis, diretor automático e transmissão ao vivo.
+  - [`arquitetura-tecnica.md`](arquitetura-tecnica.md) — Referência técnica
+    completa: crates, pipeline de codificação, sistema de câmeras, compositor
+    tiny-skia, B2B Online, licenciamento Ed25519, anti-tamper, perfis de
+    compilação, diagrama de dependências e comandos de desenvolvimento.
+- **README atualizado** com links para os novos documentos.
+
+### Verificado
+- `cargo check -p opendj` passou (exit 0) após todas as mudanças.
+  Apenas warnings pré-existentes do Slint (binding loop / `viewport-height`
+  deprecation) — nenhum erro novo introduzido.
+
+---
+
 ## 2026-11-24 (noite)
 
 ### Adicionado

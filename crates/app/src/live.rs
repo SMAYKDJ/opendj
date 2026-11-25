@@ -149,7 +149,14 @@ impl Live {
         ui.set_rotate_bars(settings::number(ROTATE, 16.0) as i32);
         ui.set_stream(settings::flag(STREAM, true));
         ui.set_record(settings::flag(RECORD, true));
-        ui.set_server(settings::string(SERVER).into());
+        // Pré-preenche com o servidor do TikTok se nunca foi configurado.
+        let saved_server = settings::string(SERVER);
+        let server_val = if saved_server.is_empty() {
+            "rtmp://push.tiktok.com/live/".to_string()
+        } else {
+            saved_server
+        };
+        ui.set_server(server_val.into());
         ui.set_key(key.into());
         ui.set_record_folder(recordings_dir().display().to_string().into());
 

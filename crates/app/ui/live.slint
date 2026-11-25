@@ -507,7 +507,7 @@ export component LivePanel inherits PopupWindow {
                     edited(t) => { LiveUi.set-key(t); }
                 }
                 Text {
-                    text: "No TikTok LIVE Studio ou em tiktok.com/live/producer: copie a URL do servidor e a chave.";
+                    text: "Como pegar a chave: TikTok → + → Live → Stream de PC  ou  acesse live.tiktok.com/studio";
                     color: Theme.text-dim;
                     font-size: 10px;
                     wrap: word-wrap;
@@ -584,7 +584,7 @@ export component LivePanel inherits PopupWindow {
                 }
             }
             if LiveUi.ffmpeg-missing: Text {
-                text: "Falta o ffmpeg, que codifica o vídeo. No Terminal: brew install ffmpeg";
+                text: "⚠ ffmpeg não encontrado. Cole no Terminal:  brew install ffmpeg";
                 color: Theme.c-e5484d;
                 font-size: 12px;
                 wrap: word-wrap;
