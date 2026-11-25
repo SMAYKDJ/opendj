@@ -179,7 +179,7 @@ Profissional (Criador de Conteúdo ou Empresa) **sem exigência de 1.000 seguido
 
 ## 6. Gravar localmente
 
-Desligue o switch **"Transmitir para o TikTok"** e ligue
+Desligue o switch **"Transmitir ao vivo"** e ligue
 **"Gravar em [pasta]"**.
 
 O arquivo é gravado como **MP4 fragmentado** — se o app fechar de repente,
