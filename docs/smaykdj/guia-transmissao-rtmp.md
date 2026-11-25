@@ -138,21 +138,42 @@ Campo **Chave de transmissão**: cole a chave gerada no YouTube Studio.
 
 ---
 
-## 5. Transmitir para o Instagram
+## 5. Transmitir para o Instagram (Sem limite de seguidores!)
 
-O Instagram **não aceita RTMP direto** de softwares externos sem parceria.
-Opções:
+O Instagram oferece suporte oficial a transmissões via software externo
+através do **Instagram Live Producer**, disponível para qualquer conta
+Profissional (Criador de Conteúdo ou Empresa) **sem exigência de 1.000 seguidores**.
 
-**A — via Restream.io (recomendado):**
-1. Crie conta em [restream.io](https://restream.io)
-2. Conecte o Instagram
-3. Pegue o RTMP do Restream e transmita o openDJ para lá
-4. O Restream encaminha para o Instagram simultaneamente
+### 5.1 Como pegar a chave do Instagram
 
-**B — via OBS + NDI (avançado):**
-1. Instale o OBS com plugin NDI
-2. Capture o openDJ no OBS
-3. Use o plugin OBS-Instagram ou Restream no OBS
+1. No computador, acesse no navegador:
+   ```
+   https://www.instagram.com/live/producer/
+   ```
+   *(ou entre no instagram.com pelo Mac → menu lateral Criar (+) → Transmissão ao vivo)*
+2. Dê um título para a sua live e selecione a audiência (**Público** ou **Prática** para testar primeiro).
+3. O Instagram exibirá:
+   - **URL do stream:** `rtmps://live-upload.instagram.com:443/rtmp/`
+   - **Chave do stream:** sua chave única
+4. Copie a chave gerada.
+
+> 💡 **Dica de ouro:** No seletor de audiência do Instagram, escolha **"Prática"**
+> nos primeiros testes. Só você verá a transmissão, perfeito para testar o som
+> e as câmeras do openDJ antes de entrar ao vivo para seus seguidores!
+
+### 5.2 Configurar no openDJ
+
+1. Clique em **LIVE** na barra superior do openDJ
+2. Ligue o switch **"Transmitir ao vivo"**
+3. Em **DESTINO**, clique em **Instagram**
+4. A **URL do servidor** já é pré-preenchida automaticamente:
+   ```
+   rtmps://live-upload.instagram.com:443/rtmp/
+   ```
+5. Cole sua **Chave de transmissão** no campo da chave
+6. Clique em **Entrar ao vivo** no openDJ
+7. Volte ao navegador no **Instagram Live Producer** — você verá a imagem do
+   openDJ na prévia. Clique em **Transmitir ao vivo** na página do Instagram.
 
 ---
 

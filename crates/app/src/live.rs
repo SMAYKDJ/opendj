@@ -33,10 +33,17 @@ const DJ_A: &str = "live_dj_a";
 const DJ_B: &str = "live_dj_b";
 const ROTATE: &str = "live_rotate_bars";
 const STREAM: &str = "live_stream";
+const PLATFORM: &str = "live_platform"; // 0 = TikTok, 1 = Instagram
 const RECORD: &str = "live_record";
 const SERVER: &str = "live_rtmp_server";
+const SERVER_TIKTOK: &str = "live_rtmp_server_tiktok";
+const SERVER_INSTAGRAM: &str = "live_rtmp_server_instagram";
+const DEFAULT_TIKTOK_SERVER: &str = "rtmp://push.tiktok.com/live/";
+const DEFAULT_INSTAGRAM_SERVER: &str = "rtmps://live-upload.instagram.com:443/rtmp/";
 const KEYCHAIN_SERVICE: &str = "openDJ live";
 const KEYCHAIN_ID: &str = "rtmp_key";
+const KEYCHAIN_TIKTOK: &str = "rtmp_key_tiktok";
+const KEYCHAIN_INSTAGRAM: &str = "rtmp_key_instagram";
 
 /// The picture sent: 720 × 1280 at 30 pictures a second, what TikTok asks
 /// of a vertical live.
@@ -105,7 +112,8 @@ impl Live {
         let master = engine
             .take_live_feed()
             .map(|f| Master(Arc::new(Mutex::new(f))));
-        let key = keychain()
+        let platform = settings::number(PLATFORM, 0.0) as i32;
+        let key = keychain_for(platform)
             .and_then(|e| e.get_password().ok())
             .unwrap_or_default();
         let live = Rc::new(RefCell::new(Self {
@@ -148,14 +156,9 @@ impl Live {
         ui.set_dj_b(name_or(DJ_B, "DJ B").into());
         ui.set_rotate_bars(settings::number(ROTATE, 16.0) as i32);
         ui.set_stream(settings::flag(STREAM, true));
+        ui.set_platform(platform);
         ui.set_record(settings::flag(RECORD, true));
-        // Pré-preenche com o servidor do TikTok se nunca foi configurado.
-        let saved_server = settings::string(SERVER);
-        let server_val = if saved_server.is_empty() {
-            "rtmp://push.tiktok.com/live/".to_string()
-        } else {
-            saved_server
-        };
+        let server_val = load_server_for(platform);
         ui.set_server(server_val.into());
         ui.set_key(key.into());
         ui.set_record_folder(recordings_dir().display().to_string().into());
@@ -224,12 +227,40 @@ impl Live {
                 }
             }
         });
-        ui.on_set_server(|s| settings::set(SERVER, json!(s.trim())));
+        ui.on_set_platform({
+            let live = live.clone();
+            let weak = weak.clone();
+            move |p| {
+                settings::set(PLATFORM, json!(p));
+                let server_val = load_server_for(p);
+                let key_val = keychain_for(p)
+                    .and_then(|e| e.get_password().ok())
+                    .unwrap_or_default();
+                live.borrow_mut().key = key_val.clone();
+                if let Some(app) = weak.upgrade() {
+                    let ui = app.global::<LiveUi>();
+                    ui.set_platform(p);
+                    ui.set_server(server_val.into());
+                    ui.set_key(key_val.into());
+                }
+            }
+        });
+        ui.on_set_server({
+            let weak = weak.clone();
+            move |s| {
+                let s = s.trim();
+                let p = weak.upgrade().map(|app| app.global::<LiveUi>().get_platform()).unwrap_or(0);
+                let key = if p == 1 { SERVER_INSTAGRAM } else { SERVER_TIKTOK };
+                settings::set(key, json!(s));
+            }
+        });
         ui.on_set_key({
             let live = live.clone();
+            let weak = weak.clone();
             move |k| {
                 let k = k.trim().to_string();
-                if let Some(e) = keychain() {
+                let p = weak.upgrade().map(|app| app.global::<LiveUi>().get_platform()).unwrap_or(0);
+                if let Some(e) = keychain_for(p) {
                     let _ = if k.is_empty() {
                         e.delete_credential()
                     } else {
@@ -641,9 +672,12 @@ impl Live {
             match output::rtmp_url(&ui.get_server(), &self.key) {
                 Some(u) => Some(u),
                 None => {
+                    let plat = if ui.get_platform() == 1 { "do Instagram" } else { "do TikTok" };
                     ui.set_error(
-                        "Cole a URL do servidor (rtmp://…) e a chave de transmissão do TikTok."
-                            .into(),
+                        format!(
+                            "Cole a URL do servidor (rtmp://… ou rtmps://…) e a chave de transmissão {plat}."
+                        )
+                        .into(),
                     );
                     return;
                 }
@@ -957,8 +991,48 @@ fn recordings_dir() -> PathBuf {
     settings::recording().dir
 }
 
-fn keychain() -> Option<keyring::Entry> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ID).ok()
+fn keychain_for(platform: i32) -> Option<keyring::Entry> {
+    let id = if platform == 1 {
+        KEYCHAIN_INSTAGRAM
+    } else {
+        KEYCHAIN_TIKTOK
+    };
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, id) {
+        if platform == 0 && entry.get_password().is_err() {
+            // Fallback para chave legada do TikTok salva anteriormente
+            if let Ok(legacy) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ID) {
+                if let Ok(pwd) = legacy.get_password() {
+                    let _ = entry.set_password(&pwd);
+                }
+            }
+        }
+        Some(entry)
+    } else {
+        None
+    }
+}
+
+fn load_server_for(platform: i32) -> String {
+    if platform == 1 {
+        let s = settings::string(SERVER_INSTAGRAM);
+        if s.trim().is_empty() {
+            DEFAULT_INSTAGRAM_SERVER.to_string()
+        } else {
+            s
+        }
+    } else {
+        let s = settings::string(SERVER_TIKTOK);
+        if s.trim().is_empty() {
+            let legacy = settings::string(SERVER);
+            if legacy.trim().is_empty() {
+                DEFAULT_TIKTOK_SERVER.to_string()
+            } else {
+                legacy
+            }
+        } else {
+            s
+        }
+    }
 }
 
 fn clock(seconds: f64) -> String {

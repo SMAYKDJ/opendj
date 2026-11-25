@@ -41,6 +41,8 @@ export global LiveUi {
     in property <bool> stream: true;
     in property <bool> record: true;
     in property <bool> projector-open: false;
+    // 0 = TikTok, 1 = Instagram
+    in-out property <int> platform: 0;
     in property <string> server;
     in property <string> key;
     in property <string> record-folder;
@@ -75,6 +77,7 @@ export global LiveUi {
     callback set-names(string, string);
     callback set-rotate(int);
     callback set-stream(bool);
+    callback set-platform(int);
     callback set-record(bool);
     callback set-server(string);
     callback set-key(string);
@@ -233,7 +236,7 @@ export component LivePanel inherits PopupWindow {
                     spacing: 2px;
                     Text { text: "Battle Live"; color: Theme.text; font-size: 17px; font-weight: 700; }
                     Text {
-                        text: "Live vertical no TikTok, com as câmeras dos celulares. A tela do openDJ não muda: só a transmissão recebe a imagem montada.";
+                        text: "Live vertical no " + (LiveUi.platform == 1 ? "Instagram" : "TikTok") + ", com as câmeras dos celulares. A tela do openDJ não muda: só a transmissão recebe a imagem montada.";
                         color: Theme.text-dim;
                         font-size: 11px;
                         wrap: word-wrap;
@@ -491,23 +494,34 @@ export component LivePanel inherits PopupWindow {
             HorizontalLayout {
                 spacing: 10px;
                 Switch { on: LiveUi.stream; toggled(on) => { LiveUi.set-stream(on); } }
-                Text { text: "Transmitir para o TikTok"; color: Theme.text; font-size: 12px; vertical-alignment: center; }
+                Text { text: "Transmitir ao vivo"; color: Theme.text; font-size: 12px; vertical-alignment: center; }
             }
             if LiveUi.stream: VerticalLayout {
                 spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Label { text: "DESTINO"; vertical-alignment: center; }
+                    Choice {
+                        choices: ["TikTok", "Instagram"];
+                        chosen: LiveUi.platform;
+                        picked(i) => { LiveUi.set-platform(i); }
+                    }
+                }
                 Field {
                     text: LiveUi.server;
-                    placeholder: "URL do servidor (rtmp://…)";
+                    placeholder: LiveUi.platform == 1 ? "rtmps://live-upload.instagram.com:443/rtmp/" : "rtmp://push.tiktok.com/live/";
                     edited(t) => { LiveUi.set-server(t); }
                 }
                 Field {
                     text: LiveUi.key;
                     secret: true;
-                    placeholder: "Chave de transmissão";
+                    placeholder: "Chave de transmissão (" + (LiveUi.platform == 1 ? "Instagram" : "TikTok") + ")";
                     edited(t) => { LiveUi.set-key(t); }
                 }
                 Text {
-                    text: "Como pegar a chave: TikTok → + → Live → Stream de PC  ou  acesse live.tiktok.com/studio";
+                    text: LiveUi.platform == 1 ?
+                        "Instagram: acesse instagram.com/live/producer no navegador (qualquer conta Criador/Profissional pode transmitir sem limite de seguidores!)" :
+                        "TikTok: no app TikTok → + → Live → Stream de PC  ou  acesse live.tiktok.com/studio";
                     color: Theme.text-dim;
                     font-size: 10px;
                     wrap: word-wrap;
@@ -648,7 +662,7 @@ export component LivePanel inherits PopupWindow {
                 }
             }
             Action {
-                label: LiveUi.projector-open ? "Fechar janela (TikTok)" : "Abrir janela (TikTok Studio)";
+                label: LiveUi.projector-open ? "Fechar janela (Projetor)" : "Abrir janela (Projetor / OBS)";
                 tint: LiveUi.projector-open ? Theme.accent : Theme.control;
                 filled: LiveUi.projector-open;
                 clicked => { LiveUi.toggle-projector(); }

@@ -6,6 +6,15 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-25
 
 ### Adicionado
+- **Suporte a Transmissão Direta para Instagram (Live Producer):**
+  - Seletor de plataforma `DESTINO: [TikTok, Instagram]` no painel Battle Live.
+  - Pré-preenchimento automático da URL oficial do Instagram (`rtmps://live-upload.instagram.com:443/rtmp/`).
+  - Armazenamento independente de servidores e chaves de transmissão no Keychain para cada plataforma (`rtmp_key_tiktok` e `rtmp_key_instagram`).
+  - Texto explicativo dinâmico orientando o uso do Instagram Live Producer (sem limite de 1.000 seguidores para contas Profissional/Criador).
+- **Melhorias de Usabilidade no Painel Battle Live:**
+  - Botão de fechar superior renomeado para "✕ Fechar painel".
+  - Botão inferior renomeado para "Ocultar painel" com nota explicativa de que a transmissão e as câmeras continuam rodando normalmente.
+  - Botão de abertura de janela renomeado para "Abrir janela (Projetor / OBS)".
 - **Transmissão RTMP direta (sem TikTok LIVE Studio):**
   - URL do servidor TikTok (`rtmp://push.tiktok.com/live/`) pré-preenchida
     automaticamente ao abrir o painel LIVE pela primeira vez.
