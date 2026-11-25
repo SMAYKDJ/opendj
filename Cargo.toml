@@ -64,9 +64,16 @@ femtovg = { path = "third_party/femtovg" }
 # third_party/signalsmith-stretch/OPENDJ.md.
 signalsmith-stretch = { path = "third_party/signalsmith-stretch" }
 
-# Commercial release profile with anti-reverse engineering protections:
-# full symbol stripping, fat LTO, single codegen unit, and abort on panic.
+# Release profile for development, testing, and daily builds:
+# Uses multi-core parallel compilation for fast builds.
 [profile.release]
+opt-level = 3
+strip = true
+
+# Commercial distribution profile with maximum anti-reverse engineering:
+# To use for official commercial release: cargo build --profile commercial -p opendj
+[profile.commercial]
+inherits = "release"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
