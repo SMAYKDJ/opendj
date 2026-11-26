@@ -6,6 +6,12 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-25
 
 ### Adicionado
+- **Design Compacto e Otimizado do Painel Battle Live (Correção de Altura de Janela):**
+  - Redução de mais de 300px na altura total do painel para caber perfeitamente na tela de MacBooks sem cortar botões na parte inferior.
+  - Seção "Licença & Produto" transformada em colapsável com visualização elegante de 1 linha por padrão (`LICENÇA: [PRO ATIVADO]`), expansível sob demanda para configurar chaves.
+  - QR codes redimensionados para 100×100px (tamanho ideal para leitura instantânea por câmeras de celular, economizando espaço vertical).
+  - Prévia de vídeo ajustada para proporção 9:16 compacta (200×355px).
+  - Espaçamentos verticais e botões compactados (30px), mantendo os botões vitais "Entrar ao vivo", "Desligar câmeras" e "Ocultar painel" 100% visíveis em qualquer resolução de tela.
 - **Detecção e Preenchimento Automático de Chaves de Transmissão (Clipboard Monitor):**
   - Monitor contínuo e inteligente da área de transferência (clipboard) em background rodando a cada 500ms no openDJ via `arboard`.
   - Ao entrar em `instagram.com/live/producer` ou TikTok e clicar em "Copiar" na chave de transmissão (ou na URL RTMP), o openDJ detecta o padrão automaticamente e preenche o campo na hora, sem necessidade de extensões no navegador ou comandos manuais.

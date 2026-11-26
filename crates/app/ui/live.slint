@@ -168,13 +168,14 @@ component Action inherits Rectangle {
     in property <string> label;
     in property <color> tint: Theme.accent;
     in property <bool> filled: true;
+    in property <length> font-size: 12px;
     callback clicked();
-    height: 34px;
-    border-radius: 10px;
+    height: 30px;
+    border-radius: 8px;
     background: filled ? (ata.pressed ? tint.darker(0.2) : ata.has-hover ? tint.brighter(0.1) : tint) : (ata.has-hover ? Theme.n-2e2e32 : Theme.control);
     border-width: filled ? 0px : 1px;
     border-color: Theme.border;
-    Text { text: label; color: filled ? #14101f : Theme.text; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+    Text { text: label; color: filled ? #14101f : Theme.text; font-size: root.font-size; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
     ata := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
 }
 
@@ -192,31 +193,32 @@ component CameraCard inherits VerticalLayout {
     in property <string> url;
     in property <bool> live;
     in property <string> status;
-    spacing: 6px;
+    spacing: 3px;
     HorizontalLayout {
-        spacing: 6px;
+        spacing: 5px;
         Rectangle {
-            width: 8px;
-            height: 8px;
+            width: 7px;
+            height: 7px;
             y: (parent.height - self.height) / 2;
-            border-radius: 4px;
+            border-radius: 3.5px;
             background: live ? Theme.automix : Theme.n-48484c;
         }
-        Text { text: title; color: Theme.text; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+        Text { text: title; color: Theme.text; font-size: 11px; font-weight: 700; vertical-alignment: center; }
     }
     Rectangle {
-        width: 132px;
-        height: 132px;
-        border-radius: 8px;
+        width: 100px;
+        height: 100px;
+        border-radius: 6px;
         background: Theme.n-ffffff;
         clip: true;
-        Image { source: qr; width: 132px; height: 132px; image-rendering: pixelated; }
+        Image { source: qr; width: 100px; height: 100px; image-rendering: pixelated; }
     }
-    Text { text: status; color: live ? Theme.automix : Theme.text-dim; font-size: 11px; width: 132px; wrap: word-wrap; }
+    Text { text: status; color: live ? Theme.automix : Theme.text-dim; font-size: 10px; width: 100px; wrap: word-wrap; }
 }
 
 export component LivePanel inherits PopupWindow {
-    width: 640px;
+    width: 630px;
+    property <bool> show-license: false;
     close-policy: close-on-click-outside;
     Rectangle {
         background: Theme.panel-raised;
@@ -227,25 +229,26 @@ export component LivePanel inherits PopupWindow {
         drop-shadow-color: Theme.s-000000b0;
     }
     HorizontalLayout {
-        padding: 16px;
-        spacing: 16px;
+        padding: 12px;
+        spacing: 12px;
         VerticalLayout {
             horizontal-stretch: 1;
-            spacing: 12px;
+            spacing: 6px;
             HorizontalLayout {
                 VerticalLayout {
                     horizontal-stretch: 1;
-                    spacing: 2px;
-                    Text { text: "Battle Live"; color: Theme.text; font-size: 17px; font-weight: 700; }
+                    spacing: 1px;
+                    Text { text: "Battle Live"; color: Theme.text; font-size: 15px; font-weight: 700; }
                     Text {
-                        text: "Live vertical no " + (LiveUi.platform == 1 ? "Instagram" : "TikTok") + ", com as câmeras dos celulares. A tela do openDJ não muda: só a transmissão recebe a imagem montada.";
+                        text: "Live vertical (" + (LiveUi.platform == 1 ? "Instagram" : "TikTok") + ") com celulares.";
                         color: Theme.text-dim;
-                        font-size: 11px;
-                        wrap: word-wrap;
+                        font-size: 10px;
                     }
                 }
                 Action {
-                    width: 110px;
+                    width: 100px;
+                    height: 26px;
+                    font-size: 11px;
                     label: "✕ Fechar painel";
                     filled: false;
                     clicked => { root.close(); }
@@ -451,13 +454,13 @@ export component LivePanel inherits PopupWindow {
                 }
             }
             Text {
-                text: "Leia o QR code com a câmera do celular (mesma rede Wi-Fi). Na primeira vez o celular avisa que a conexão não é particular: toque em Mostrar detalhes › Visitar o site.";
-                color: Theme.text;
-                font-size: 11px;
+                text: "Aponte a câmera dos celulares para os QR codes (mesma rede Wi-Fi). Toque em Mostrar detalhes › Visitar o site.";
+                color: Theme.text-dim;
+                font-size: 10px;
                 wrap: word-wrap;
             }
             HorizontalLayout {
-                spacing: 16px;
+                spacing: 12px;
                 alignment: start;
                 CameraCard {
                     title: LiveUi.b2b ? "Celular 1 · " + LiveUi.dj-a : "Celular 1 · rosto";
@@ -541,8 +544,8 @@ export component LivePanel inherits PopupWindow {
                 }
                 Text {
                     text: LiveUi.platform == 1 ?
-                        "Instagram: acesse instagram.com/live/producer no navegador. Ao clicar em 'Copiar' na chave, o openDJ detecta e preenche automaticamente!" :
-                        "TikTok: no app TikTok → + → Live → Stream de PC ou live.tiktok.com/studio. Ao copiar a chave, o openDJ preenche automaticamente!";
+                        "Instagram: acesse instagram.com/live/producer e copie a chave (openDJ detecta em automático!)." :
+                        "TikTok: no app TikTok → + → Live → Stream de PC ou live.tiktok.com/studio.";
                     color: Theme.text-dim;
                     font-size: 10px;
                     wrap: word-wrap;
@@ -551,26 +554,25 @@ export component LivePanel inherits PopupWindow {
             HorizontalLayout {
                 spacing: 10px;
                 Switch { on: LiveUi.record; toggled(on) => { LiveUi.set-record(on); } }
-                Text { text: "Gravar em " + LiveUi.record-folder; color: Theme.text; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                Text { text: "Gravar em " + LiveUi.record-folder; color: Theme.text; font-size: 11px; vertical-alignment: center; overflow: elide; }
             }
-            // ── LICENÇA & PRODUTO COMERCIAL (MODO TESTES / SOFT-MODE) ────
+            // ── LICENÇA & PRODUTO COMERCIAL (COLAPSÁVEL) ────
             Rectangle {
                 background: Theme.panel-raised;
                 border-radius: 8px;
                 border-width: 1px;
                 border-color: Theme.border;
                 VerticalLayout {
-                    padding: 10px;
-                    spacing: 8px;
+                    padding: 6px;
+                    spacing: 6px;
                     HorizontalLayout {
                         spacing: 8px;
-                        Label { text: "LICENÇA & PRODUTO"; vertical-alignment: center; }
-                        Rectangle { horizontal-stretch: 1; }
+                        Label { text: "LICENÇA"; vertical-alignment: center; }
                         Rectangle {
                             background: LiveUi.license-active ? Theme.c-30d158.with-alpha(0.18) : Theme.automix.with-alpha(0.18);
                             border-radius: 4px;
                             HorizontalLayout {
-                                padding-left: 6px; padding-right: 6px; padding-top: 2px; padding-bottom: 2px;
+                                padding-left: 6px; padding-right: 6px; padding-top: 1px; padding-bottom: 1px;
                                 Text {
                                     text: LiveUi.license-active ? "PRO ATIVADO" : "TESTES LIBERADOS";
                                     font-size: 10px;
@@ -579,86 +581,110 @@ export component LivePanel inherits PopupWindow {
                                 }
                             }
                         }
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            horizontal-stretch: 1;
-                            spacing: 2px;
-                            Text { text: "ID desta máquina (Hardware ID):"; color: Theme.text-dim; font-size: 10px; }
-                            Text { text: LiveUi.license-machine-id; color: Theme.text; font-size: 11px; font-weight: 600; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: show-license ? "Ocultar ▴" : "Configurar chave ▾";
+                            color: Theme.accent;
+                            font-size: 10px;
+                            vertical-alignment: center;
                         }
-                        Action {
-                            width: 80px;
-                            label: "Copiar ID";
-                            filled: false;
-                            clicked => { LiveUi.license-copy-machine-id(); }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { show-license = !show-license; }
                         }
                     }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        lic-field := Field {
-                            horizontal-stretch: 1;
-                            text: LiveUi.license-input-key;
-                            placeholder: "Colar chave de ativação para testar...";
-                            edited(t) => { LiveUi.license-input-key = t; }
+                    if show-license: VerticalLayout {
+                        spacing: 6px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 2px;
+                                Text { text: "ID desta máquina:"; color: Theme.text-dim; font-size: 10px; }
+                                Text { text: LiveUi.license-machine-id; color: Theme.text; font-size: 11px; font-weight: 600; }
+                            }
+                            Action {
+                                width: 80px;
+                                height: 26px;
+                                font-size: 11px;
+                                label: "Copiar ID";
+                                filled: false;
+                                clicked => { LiveUi.license-copy-machine-id(); }
+                            }
                         }
-                        Action {
-                            width: 110px;
-                            label: "Validar Chave";
-                            filled: false;
-                            clicked => { LiveUi.license-validate-key(lic-field.text); }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            lic-field := Field {
+                                horizontal-stretch: 1;
+                                text: LiveUi.license-input-key;
+                                placeholder: "Colar chave de ativação...";
+                                edited(t) => { LiveUi.license-input-key = t; }
+                            }
+                            Action {
+                                width: 90px;
+                                height: 26px;
+                                font-size: 11px;
+                                label: "Validar";
+                                filled: false;
+                                clicked => { LiveUi.license-validate-key(lic-field.text); }
+                            }
                         }
-                    }
-                    if LiveUi.license-feedback-msg != "": Text {
-                        text: LiveUi.license-feedback-msg;
-                        color: LiveUi.license-active ? Theme.c-30d158 : Theme.text-dim;
-                        font-size: 11px;
-                        wrap: word-wrap;
+                        if LiveUi.license-feedback-msg != "": Text {
+                            text: LiveUi.license-feedback-msg;
+                            color: LiveUi.license-active ? Theme.c-30d158 : Theme.text-dim;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }
             if LiveUi.ffmpeg-missing: Text {
                 text: "⚠ ffmpeg não encontrado. Cole no Terminal:  brew install ffmpeg";
                 color: Theme.c-e5484d;
-                font-size: 12px;
+                font-size: 11px;
                 wrap: word-wrap;
             }
             if LiveUi.error != "": Text {
                 text: LiveUi.error;
                 color: Theme.c-e5484d;
-                font-size: 12px;
+                font-size: 11px;
                 wrap: word-wrap;
             }
             HorizontalLayout {
                 spacing: 8px;
                 if !LiveUi.on-air: Action {
                     horizontal-stretch: 1;
+                    height: 32px;
                     label: LiveUi.stream ? "Entrar ao vivo" : "Começar a gravar";
                     tint: #fe2c55;
                     clicked => { LiveUi.go(); }
                 }
                 if LiveUi.on-air: Action {
                     horizontal-stretch: 1;
+                    height: 32px;
                     label: "Encerrar · " + LiveUi.time;
                     tint: #fe2c55;
                     clicked => { LiveUi.stop(); }
                 }
                 if !LiveUi.on-air: Action {
-                    width: 120px;
+                    width: 115px;
+                    height: 32px;
+                    font-size: 11px;
                     label: "Desligar câmeras";
                     filled: false;
                     clicked => { LiveUi.finish(); }
                 }
                 Action {
-                    width: 110px;
+                    width: 95px;
+                    height: 32px;
+                    font-size: 11px;
                     label: "Ocultar painel";
                     filled: false;
                     clicked => { root.close(); }
                 }
             }
             Text {
-                text: "💡 Ao ocultar o painel, a janela do TikTok e as câmeras continuam rodando. Clique em LIVE no topo para reabrir.";
+                text: "💡 Ao ocultar o painel, a transmissão e as câmeras continuam rodando normalmente.";
                 color: Theme.text-dim;
                 font-size: 10px;
                 wrap: word-wrap;
@@ -669,27 +695,30 @@ export component LivePanel inherits PopupWindow {
             spacing: 6px;
             Label { text: "O QUE O PÚBLICO VÊ"; }
             Rectangle {
-                width: 216px;
-                height: 384px;
+                width: 200px;
+                height: 355px;
                 border-radius: 10px;
                 background: #0b0b0e;
                 border-width: 1px;
                 border-color: Theme.border;
                 clip: true;
-                Image { source: LiveUi.preview; width: 216px; height: 384px; image-fit: contain; }
+                Image { source: LiveUi.preview; width: 200px; height: 355px; image-fit: contain; }
                 TouchArea {
                     mouse-cursor: pointer;
                     clicked => { LiveUi.toggle-projector(); }
                 }
             }
             Action {
+                width: 200px;
+                height: 28px;
+                font-size: 11px;
                 label: LiveUi.projector-open ? "Fechar janela (Projetor)" : "Abrir janela (Projetor / OBS)";
                 tint: LiveUi.projector-open ? Theme.accent : Theme.control;
                 filled: LiveUi.projector-open;
                 clicked => { LiveUi.toggle-projector(); }
             }
-            Text { text: LiveUi.shot; color: Theme.text-dim; font-size: 11px; width: 216px; wrap: word-wrap; }
-            if LiveUi.on-air: Text { text: LiveUi.health; color: Theme.text-dim; font-size: 11px; width: 216px; wrap: word-wrap; }
+            Text { text: LiveUi.shot; color: Theme.text-dim; font-size: 10px; width: 200px; wrap: word-wrap; }
+            if LiveUi.on-air: Text { text: LiveUi.health; color: Theme.text-dim; font-size: 10px; width: 200px; wrap: word-wrap; }
         }
     }
 }
