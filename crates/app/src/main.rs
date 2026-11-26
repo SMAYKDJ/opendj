@@ -3521,26 +3521,18 @@ impl PhaseMeter {
                 c.phase = 2;
                 c.phase_fine = p.fine as f32;
                 let ms = p.ms.round() as i64;
+                // Only whole beats off read as text; the marker and its
+                // color show the fine offset.
                 c.phase_text = if p.beats != 0 {
                     format!(
                         "{:+} {}",
                         p.beats,
                         if p.beats.abs() == 1 { "BEAT" } else { "BEATS" }
                     )
+                    .replace('-', "−")
                 } else {
-                    format!(
-                        "{}{} ms",
-                        if ms > 0 {
-                            "+"
-                        } else if ms < 0 {
-                            "−"
-                        } else {
-                            ""
-                        },
-                        ms.abs()
-                    )
+                    String::new()
                 }
-                .replace('-', "−")
                 .into();
                 c.phase_tone = if p.beats != 0 || ms.abs() >= 35 {
                     2
@@ -3605,6 +3597,11 @@ impl Gpu {
                     .map_or(slint::Color::from_rgb_u8(0x9e, 0x9e, 0xa3), |k| {
                         slint::Color::from_argb_encoded(0xff00_0000 | beat_counter::kind_color(k))
                     }),
+                kind_name: c.kind.map_or("BEAT", beat_counter::kind_name).into(),
+                has_kind: c.kind.is_some(),
+                kind_color: c.kind.map_or(slint::Color::default(), |k| {
+                    slint::Color::from_argb_encoded(0xff00_0000 | beat_counter::kind_color(k))
+                }),
                 ..Default::default()
             },
         };
