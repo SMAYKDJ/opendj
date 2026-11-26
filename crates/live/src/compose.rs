@@ -60,15 +60,40 @@ pub struct Composer {
 }
 
 impl Composer {
-    /// A picture `width` × `height`, for example 720 × 1280 or 1080 × 1920.
+    /// A picture `width` × `height`, for example 720 × 1280 (vertical) or 1280 × 720 (horizontal).
     pub fn new(width: u32, height: u32) -> Self {
+        let is_horiz = width > height;
+        let scale = if is_horiz {
+            width as f32 / 1280.0
+        } else {
+            width as f32 / DESIGN_W
+        };
         Self {
             canvas: Pixmap::new(width.max(2), height.max(2)).expect("picture size"),
-            scale: width as f32 / DESIGN_W,
+            scale,
             font: FontRef::try_from_slice(FONT).expect("bundled font"),
             cameras: [None, None],
             screen: None,
         }
+    }
+
+    /// Resizes the canvas dynamically if the dimensions changed.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if self.canvas.width() == width && self.canvas.height() == height {
+            return;
+        }
+        if let Some(new_canvas) = Pixmap::new(width.max(2), height.max(2)) {
+            self.canvas = new_canvas;
+            self.scale = if width > height {
+                width as f32 / 1280.0
+            } else {
+                width as f32 / DESIGN_W
+            };
+        }
+    }
+
+    pub fn is_horizontal(&self) -> bool {
+        self.canvas.width() > self.canvas.height()
     }
 
     pub fn width(&self) -> u32 {
@@ -89,7 +114,11 @@ impl Composer {
     /// The newest picture of openDJ's screen. A big window (a Retina
     /// screen) is first shrunk to about the size it is drawn at.
     pub fn set_screen(&mut self, frame: Option<Frame>) {
-        let want = self.canvas.width() * 3 / 2;
+        let want = if self.is_horizontal() {
+            self.canvas.width().max(1280)
+        } else {
+            self.canvas.width() * 3 / 2
+        };
         self.screen = frame.map(|f| shrink(f, want)).and_then(pixmap);
     }
 
@@ -99,6 +128,14 @@ impl Composer {
 
     /// Draws the picture for `shot` and returns it, RGBA.
     pub fn render(&mut self, look: &Look, shot: &Shot, votes: Option<Votes>) -> &[u8] {
+        if self.is_horizontal() {
+            return self.render_horizontal(look, shot, votes);
+        }
+        self.render_vertical(look, shot, votes)
+    }
+
+    /// Vertical 9:16 layout (TikTok / Instagram Live).
+    fn render_vertical(&mut self, look: &Look, shot: &Shot, votes: Option<Votes>) -> &[u8] {
         self.canvas.fill(color(BACKGROUND));
         let s = self.scale;
 
@@ -207,6 +244,117 @@ impl Composer {
                 10.0 * s,
                 MUTED,
             );
+        }
+
+        self.canvas.data()
+    }
+
+    /// Horizontal 16:9 layout (YouTube / Twitch / Widescreen).
+    /// Canvas is 1280 × 720 (scaled).
+    /// Top half: camera row with 16:9 smartphone feeds and VS badge.
+    /// Bottom half: openDJ decks and waveforms laptop view.
+    fn render_horizontal(&mut self, look: &Look, shot: &Shot, votes: Option<Votes>) -> &[u8] {
+        self.canvas.fill(color(BACKGROUND));
+        let s = self.scale;
+
+        // openDJ's screen, on the bottom half.
+        let screen_box = rect(12.0 * s, 360.0 * s, 1256.0 * s, 348.0 * s);
+        match self.screen.take() {
+            Some(p) => {
+                self.image(&p, screen_box, 10.0 * s);
+                self.screen = Some(p);
+            }
+            None => self.fill_round((12.0 * s, 360.0 * s, 1256.0 * s, 348.0 * s), 10.0 * s, PANEL),
+        }
+
+        // Camera row on top half.
+        let row = (12.0 * s, 12.0 * s, 1256.0 * s, 336.0 * s);
+        let gap = 12.0 * s;
+        let half = (row.2 - gap) / 2.0;
+        match shot.scene {
+            Scene::Both => {
+                self.camera(0, (row.0, row.1, half, row.3), look, Some(0));
+                self.camera(1, (row.0 + half + gap, row.1, half, row.3), look, Some(1));
+                let d = 56.0 * s;
+                let (cx, cy) = (row.0 + row.2 / 2.0, row.1 + row.3 / 2.0);
+                self.circle(cx, cy, d / 2.0 + 2.0 * s, TEXT);
+                self.circle(cx, cy, d / 2.0, BACKGROUND);
+                self.text_centered("VS", cx, cy + 7.0 * s, 20.0 * s, TEXT);
+            }
+            Scene::Only(dj) => {
+                let dj = dj.min(1);
+                self.camera(dj, row, look, Some(dj));
+            }
+            Scene::Solo { main } => {
+                let main = main.min(1);
+                let other = 1 - main;
+                self.camera(main, row, look, (main == 0).then_some(0));
+                if self.has_camera(other) {
+                    let (w, h) = (240.0 * s, 135.0 * s);
+                    let pip = (
+                        row.0 + row.2 - w - 12.0 * s,
+                        row.1 + row.3 - h - 12.0 * s,
+                        w,
+                        h,
+                    );
+                    self.fill_round(grow(pip, 2.0 * s), 12.0 * s, TEXT);
+                    let p = self.cameras[other].take().expect("checked");
+                    self.image(&p, rect(pip.0, pip.1, pip.2, pip.3), 10.0 * s);
+                    self.cameras[other] = Some(p);
+                }
+            }
+        }
+
+        // Who comes in next (centered between camera and screen).
+        if let Some(next) = shot.next {
+            let dj = next.dj.min(1);
+            let label = format!("PRÓXIMO: {}", look.names[dj].to_uppercase());
+            let left = format!("faixa atual acaba em {}", clock(next.remaining));
+            let (l1, l2) = (12.0 * s, 12.0 * s);
+            let w1 = self.text_width(&label, l1);
+            let w2 = self.text_width(&left, l2);
+            let pad = 16.0 * s;
+            let w = pad * 2.0 + w1 + 10.0 * s + w2;
+            let h = 28.0 * s;
+            let x = (1280.0 * s - w) / 2.0;
+            let y = 334.0 * s;
+            self.fill_round((x, y, w, h), h / 2.0, look.colors[dj]);
+            self.fill_round(grow((x, y, w, h), -s), h / 2.0, BACKGROUND);
+            let base = y + h / 2.0 + 4.5 * s;
+            self.text(&label, x + pad, base, l1, look.colors[dj]);
+            self.text(&left, x + pad + w1 + 10.0 * s, base, l2, MUTED);
+        }
+
+        // The vote bar for horizontal live.
+        if let Some(v) = votes {
+            let total = v.a + v.b;
+            let share = if total == 0 {
+                0.5
+            } else {
+                v.a as f32 / total as f32
+            };
+            let size = 12.0 * s;
+            let a = format!("♥ {} #A", v.a);
+            let b = format!("#B {} ♥", v.b);
+            let wa = self.text_width(&a, size);
+            let wb = self.text_width(&b, size);
+            let y = 692.0 * s;
+            let base = y + 10.0 * s;
+            self.text(&a, 20.0 * s, base, size, look.colors[0]);
+            self.text(&b, 1260.0 * s - wb, base, size, look.colors[1]);
+            let bx = 20.0 * s + wa + 12.0 * s;
+            let bw = (1260.0 * s - wb - 12.0 * s) - bx;
+            if bw > 0.0 {
+                let bar = (bx, y + 2.0 * s, bw, 8.0 * s);
+                self.fill_round(bar, 4.0 * s, look.colors[1]);
+                if share > 0.0 {
+                    self.fill_round(
+                        (bar.0, bar.1, (bw * share).max(bar.3), bar.3),
+                        4.0 * s,
+                        look.colors[0],
+                    );
+                }
+            }
         }
 
         self.canvas.data()
@@ -500,6 +648,21 @@ mod tests {
         assert_eq!(px(&c, 640, 200), [0, 0, 255]);
         assert_eq!(px(&c, 360, 600), [0, 255, 0]);
         assert_eq!(px(&c, 100, 1200), [0x0b, 0x0b, 0x0e]);
+    }
+
+    #[test]
+    fn horizontal_16_9_rendering() {
+        let mut c = Composer::new(1280, 720);
+        assert!(c.is_horizontal());
+        c.set_camera(0, Some(solid(640, 360, [255, 0, 0])));
+        c.set_camera(1, Some(solid(640, 360, [0, 0, 255])));
+        c.set_screen(Some(solid(1440, 900, [0, 255, 0])));
+        let out = c.render(&Look::default(), &shot(Scene::Both), None);
+        assert_eq!(out.len(), 1280 * 720 * 4);
+        // Top camera row has cameras, bottom half has screen
+        assert_eq!(px(&c, 200, 150), [255, 0, 0]);
+        assert_eq!(px(&c, 1000, 150), [0, 0, 255]);
+        assert_eq!(px(&c, 640, 500), [0, 255, 0]);
     }
 
     #[test]

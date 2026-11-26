@@ -33,21 +33,25 @@ const DJ_A: &str = "live_dj_a";
 const DJ_B: &str = "live_dj_b";
 const ROTATE: &str = "live_rotate_bars";
 const STREAM: &str = "live_stream";
-const PLATFORM: &str = "live_platform"; // 0 = TikTok, 1 = Instagram
+const PLATFORM: &str = "live_platform"; // 0 = TikTok, 1 = Instagram, 2 = YouTube
+const ORIENTATION: &str = "live_orientation"; // 0 = 9:16 (Vertical), 1 = 16:9 (Horizontal)
 const RECORD: &str = "live_record";
 const SERVER: &str = "live_rtmp_server";
 const SERVER_TIKTOK: &str = "live_rtmp_server_tiktok";
 const SERVER_INSTAGRAM: &str = "live_rtmp_server_instagram";
+const SERVER_YOUTUBE: &str = "live_rtmp_server_youtube";
 const DEFAULT_TIKTOK_SERVER: &str = "rtmp://push.tiktok.com/live/";
 const DEFAULT_INSTAGRAM_SERVER: &str = "rtmps://live-upload.instagram.com:443/rtmp/";
+const DEFAULT_YOUTUBE_SERVER: &str = "rtmp://a.rtmp.youtube.com/live2/";
 const KEYCHAIN_SERVICE: &str = "openDJ live";
 const KEYCHAIN_ID: &str = "rtmp_key";
 const KEYCHAIN_TIKTOK: &str = "rtmp_key_tiktok";
 const KEYCHAIN_INSTAGRAM: &str = "rtmp_key_instagram";
+const KEYCHAIN_YOUTUBE: &str = "rtmp_key_youtube";
 
-/// The picture sent: 720 × 1280 at 30 pictures a second, what TikTok asks
-/// of a vertical live.
-const SIZE: (u32, u32) = (720, 1280);
+/// Picture resolutions: 720 × 1280 (vertical) and 1280 × 720 (horizontal) at 30 fps.
+const SIZE_VERTICAL: (u32, u32) = (720, 1280);
+const SIZE_HORIZONTAL: (u32, u32) = (1280, 720);
 const FPS: u32 = 30;
 /// How often the window is copied for the stream, and for the preview only.
 const SCREEN_ON_AIR: Duration = Duration::from_millis(100);
@@ -177,6 +181,8 @@ impl Live {
         ui.set_rotate_bars(settings::number(ROTATE, 16.0) as i32);
         ui.set_stream(settings::flag(STREAM, true));
         ui.set_platform(platform);
+        let orient = settings::number(ORIENTATION, 0.0) as i32;
+        ui.set_orientation(orient);
         ui.set_record(settings::flag(RECORD, true));
         let server_val = load_server_for(platform);
         ui.set_server(server_val.into());
@@ -264,6 +270,29 @@ impl Live {
                     ui.set_server(server_val.into());
                     ui.set_key(key_val.into());
                     ui.set_key_status("".into());
+
+                    // Ao selecionar YouTube, se ainda estava em vertical, ajusta para horizontal automaticamente
+                    if p == 2 && ui.get_orientation() == 0 {
+                        ui.set_orientation(1);
+                        settings::set(ORIENTATION, json!(1));
+                        if let Some(session) = &live.borrow().session {
+                            session.set_size(SIZE_HORIZONTAL);
+                        }
+                    }
+                }
+            }
+        });
+        ui.on_set_orientation({
+            let live = live.clone();
+            let weak = weak.clone();
+            move |orient| {
+                settings::set(ORIENTATION, json!(orient));
+                if let Some(app) = weak.upgrade() {
+                    app.global::<LiveUi>().set_orientation(orient);
+                }
+                let size = if orient == 1 { SIZE_HORIZONTAL } else { SIZE_VERTICAL };
+                if let Some(session) = &live.borrow().session {
+                    session.set_size(size);
                 }
             }
         });
@@ -272,7 +301,11 @@ impl Live {
             move |s| {
                 let s = s.trim();
                 let p = weak.upgrade().map(|app| app.global::<LiveUi>().get_platform()).unwrap_or(0);
-                let key = if p == 1 { SERVER_INSTAGRAM } else { SERVER_TIKTOK };
+                let key = match p {
+                    2 => SERVER_YOUTUBE,
+                    1 => SERVER_INSTAGRAM,
+                    _ => SERVER_TIKTOK,
+                };
                 settings::set(key, json!(s));
             }
         });
@@ -564,7 +597,12 @@ impl Live {
                 let dir = settings::config_dir()
                     .unwrap_or_else(std::env::temp_dir)
                     .join("live");
-                Session::start(&dir, SIZE, FPS, l.rate, decks, audio, settings_from(&ui))
+                let size = if ui.get_orientation() == 1 {
+                    SIZE_HORIZONTAL
+                } else {
+                    SIZE_VERTICAL
+                };
+                Session::start(&dir, size, FPS, l.rate, decks, audio, settings_from(&ui))
             };
             match started {
                 Ok(session) => {
@@ -986,7 +1024,11 @@ impl Live {
             if text != current_server {
                 ui.set_server(text.clone().into());
                 let p = ui.get_platform();
-                let key = if p == 1 { SERVER_INSTAGRAM } else { SERVER_TIKTOK };
+                let key = match p {
+                    2 => SERVER_YOUTUBE,
+                    1 => SERVER_INSTAGRAM,
+                    _ => SERVER_TIKTOK,
+                };
                 settings::set(key, json!(text));
                 self.clipboard_status_time = Some(Instant::now());
                 ui.set_key_status("✅ URL do servidor detectada e preenchida!".into());
@@ -994,7 +1036,7 @@ impl Live {
             return;
         }
 
-        // 2. Detecção automática de chave de transmissão (Instagram / TikTok)
+        // 2. Detecção automática de chave de transmissão (Instagram / TikTok / YouTube)
         // Chaves de stream nunca contêm espaços, não começam com http/rtmp, têm comprimento >= 16 e <= 350
         if !text.contains(' ')
             && !text.contains('\n')
@@ -1014,7 +1056,11 @@ impl Live {
                     let _ = e.set_password(&text);
                 }
                 ui.set_key(text.into());
-                let platform_name = if p == 1 { "Instagram" } else { "TikTok" };
+                let platform_name = match p {
+                    2 => "YouTube",
+                    1 => "Instagram",
+                    _ => "TikTok",
+                };
                 self.clipboard_status_time = Some(Instant::now());
                 ui.set_key_status(format!("✅ Chave do {platform_name} detectada automaticamente!").into());
             }
@@ -1148,10 +1194,10 @@ fn recordings_dir() -> PathBuf {
 }
 
 fn keychain_for(platform: i32) -> Option<keyring::Entry> {
-    let id = if platform == 1 {
-        KEYCHAIN_INSTAGRAM
-    } else {
-        KEYCHAIN_TIKTOK
+    let id = match platform {
+        2 => KEYCHAIN_YOUTUBE,
+        1 => KEYCHAIN_INSTAGRAM,
+        _ => KEYCHAIN_TIKTOK,
     };
     if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, id) {
         if platform == 0 && entry.get_password().is_err() {
@@ -1169,24 +1215,35 @@ fn keychain_for(platform: i32) -> Option<keyring::Entry> {
 }
 
 fn load_server_for(platform: i32) -> String {
-    if platform == 1 {
-        let s = settings::string(SERVER_INSTAGRAM);
-        if s.trim().is_empty() {
-            DEFAULT_INSTAGRAM_SERVER.to_string()
-        } else {
-            s
-        }
-    } else {
-        let s = settings::string(SERVER_TIKTOK);
-        if s.trim().is_empty() {
-            let legacy = settings::string(SERVER);
-            if legacy.trim().is_empty() {
-                DEFAULT_TIKTOK_SERVER.to_string()
+    match platform {
+        2 => {
+            let s = settings::string(SERVER_YOUTUBE);
+            if s.trim().is_empty() {
+                DEFAULT_YOUTUBE_SERVER.to_string()
             } else {
-                legacy
+                s
             }
-        } else {
-            s
+        }
+        1 => {
+            let s = settings::string(SERVER_INSTAGRAM);
+            if s.trim().is_empty() {
+                DEFAULT_INSTAGRAM_SERVER.to_string()
+            } else {
+                s
+            }
+        }
+        _ => {
+            let s = settings::string(SERVER_TIKTOK);
+            if s.trim().is_empty() {
+                let legacy = settings::string(SERVER);
+                if legacy.trim().is_empty() {
+                    DEFAULT_TIKTOK_SERVER.to_string()
+                } else {
+                    legacy
+                }
+            } else {
+                s
+            }
         }
     }
 }

@@ -5,6 +5,24 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 
 ## 2026-11-26
 
+### Adicionado
+- **Seletor de Formato de Transmissão (📱 9:16 Vertical vs 🖥 16:9 Horizontal):**
+  - Seletor simples e intuitivo `FORMATO: [📱 9:16 (Vertical), 🖥 16:9 (Horizontal)]` no painel Battle Live.
+  - Suporte completo a filmagem do DJ com celular na horizontal (landscape).
+  - Composição 16:9 dedicada (`crates/live/src/compose.rs`):
+    - Metade superior: câmeras dos smartphones em proporção 16:9 widescreen lado a lado com badge "VS" no centro (ou câmera solo com picture-in-picture).
+    - Metade inferior: captura da tela do openDJ em widescreen com decks, formas de onda e biblioteca.
+    - Indicador de "PRÓXIMO: DJ X" perfeitamente posicionado e dimensionado na transição central.
+    - Barra de votação da audiência adaptada para a largura do formato 16:9.
+  - Redimensionamento e troca dinâmica de resolução em tempo real no compositor sem interrupção do servidor de câmeras.
+  - Prévia de vídeo na interface ajustada dinamicamente: 200×355px em 9:16 e 200×112px em 16:9.
+- **Suporte Nativo ao YouTube no DESTINO:**
+  - Opção **YouTube** adicionada ao seletor de destinos (`[TikTok, Instagram, YouTube]`).
+  - Preenchimento automático do servidor oficial do YouTube: `rtmp://a.rtmp.youtube.com/live2/`.
+  - Ao selecionar YouTube, a interface ajusta automaticamente o formato para 16:9 Horizontal para máxima conveniência.
+  - Chave de transmissão do YouTube salva com segurança no Keychain do macOS (`rtmp_key_youtube`).
+  - Detecção e preenchimento automático de chave de transmissão do YouTube via monitor de clipboard.
+
 ### Alterado
 - **Remoção de Marca D'água/Texto na Base do Vídeo:**
   - Removido o texto "openDJ" e o subtítulo "B2B BATTLE" / "LIVE SET" renderizados na base da imagem da transmissão (`crates/live/src/compose.rs`), deixando a tela 100% limpa para a audiência.

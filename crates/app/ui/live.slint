@@ -41,8 +41,10 @@ export global LiveUi {
     in property <bool> stream: true;
     in property <bool> record: true;
     in property <bool> projector-open: false;
-    // 0 = TikTok, 1 = Instagram
+    // 0 = TikTok, 1 = Instagram, 2 = YouTube
     in-out property <int> platform: 0;
+    // 0 = 9:16 (Vertical), 1 = 16:9 (Horizontal)
+    in-out property <int> orientation: 0;
     in property <string> server;
     in property <string> key;
     in property <string> key-status: "";
@@ -80,6 +82,7 @@ export global LiveUi {
     callback set-rotate(int);
     callback set-stream(bool);
     callback set-platform(int);
+    callback set-orientation(int);
     callback set-record(bool);
     callback set-server(string);
     callback set-key(string);
@@ -240,7 +243,7 @@ export component LivePanel inherits PopupWindow {
                     spacing: 1px;
                     Text { text: "Battle Live"; color: Theme.text; font-size: 15px; font-weight: 700; }
                     Text {
-                        text: "Live vertical (" + (LiveUi.platform == 1 ? "Instagram" : "TikTok") + ") com celulares.";
+                        text: (LiveUi.orientation == 1 ? "Live horizontal (16:9)" : "Live vertical (9:16)") + " no " + (LiveUi.platform == 2 ? "YouTube" : LiveUi.platform == 1 ? "Instagram" : "TikTok") + " com celulares.";
                         color: Theme.text-dim;
                         font-size: 10px;
                     }
@@ -507,14 +510,23 @@ export component LivePanel inherits PopupWindow {
                     spacing: 8px;
                     Label { text: "DESTINO"; vertical-alignment: center; }
                     Choice {
-                        choices: ["TikTok", "Instagram"];
+                        choices: ["TikTok", "Instagram", "YouTube"];
                         chosen: LiveUi.platform;
                         picked(i) => { LiveUi.set-platform(i); }
                     }
                 }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Label { text: "FORMATO"; vertical-alignment: center; }
+                    Choice {
+                        choices: ["📱 9:16 (Vertical)", "🖥 16:9 (Horizontal)"];
+                        chosen: LiveUi.orientation;
+                        picked(i) => { LiveUi.set-orientation(i); }
+                    }
+                }
                 Field {
                     text: LiveUi.server;
-                    placeholder: LiveUi.platform == 1 ? "rtmps://live-upload.instagram.com:443/rtmp/" : "rtmp://push.tiktok.com/live/";
+                    placeholder: LiveUi.platform == 2 ? "rtmp://a.rtmp.youtube.com/live2/" : LiveUi.platform == 1 ? "rtmps://live-upload.instagram.com:443/rtmp/" : "rtmp://push.tiktok.com/live/";
                     edited(t) => { LiveUi.set-server(t); }
                 }
                 HorizontalLayout {
@@ -523,7 +535,7 @@ export component LivePanel inherits PopupWindow {
                         horizontal-stretch: 1;
                         text: LiveUi.key;
                         secret: true;
-                        placeholder: "Chave de transmissão (" + (LiveUi.platform == 1 ? "Instagram" : "TikTok") + ")";
+                        placeholder: "Chave de transmissão (" + (LiveUi.platform == 2 ? "YouTube" : LiveUi.platform == 1 ? "Instagram" : "TikTok") + ")";
                         edited(t) => { LiveUi.set-key(t); }
                     }
                     Action {
@@ -543,7 +555,9 @@ export component LivePanel inherits PopupWindow {
                     wrap: word-wrap;
                 }
                 Text {
-                    text: LiveUi.platform == 1 ?
+                    text: LiveUi.platform == 2 ?
+                        "YouTube: no YouTube Studio → Criar → Transmitir ao vivo → copie a Chave (openDJ detecta ao copiar!)." :
+                        LiveUi.platform == 1 ?
                         "Instagram: acesse instagram.com/live/producer e copie a chave (openDJ detecta em automático!)." :
                         "TikTok: no app TikTok → + → Live → Stream de PC ou live.tiktok.com/studio.";
                     color: Theme.text-dim;
@@ -696,13 +710,13 @@ export component LivePanel inherits PopupWindow {
             Label { text: "O QUE O PÚBLICO VÊ"; }
             Rectangle {
                 width: 200px;
-                height: 355px;
+                height: LiveUi.orientation == 1 ? 112px : 355px;
                 border-radius: 10px;
                 background: #0b0b0e;
                 border-width: 1px;
                 border-color: Theme.border;
                 clip: true;
-                Image { source: LiveUi.preview; width: 200px; height: 355px; image-fit: contain; }
+                Image { source: LiveUi.preview; width: 200px; height: LiveUi.orientation == 1 ? 112px : 355px; image-fit: contain; }
                 TouchArea {
                     mouse-cursor: pointer;
                     clicked => { LiveUi.toggle-projector(); }

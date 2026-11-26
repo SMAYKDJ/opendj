@@ -77,14 +77,14 @@ struct Shared {
     go: Mutex<Option<output::Settings>>,
     halt: AtomicBool,
     fast_preview: AtomicBool,
+    current_size: Mutex<(u32, u32)>,
+    target_size: Mutex<Option<(u32, u32)>>,
 }
 
 pub struct Session {
     shared: Arc<Shared>,
     phones: Arc<Phones>,
     thread: Option<JoinHandle<()>>,
-    width: u32,
-    height: u32,
     fps: u32,
     sample_rate: u32,
     ffmpeg: Option<PathBuf>,
@@ -114,6 +114,8 @@ impl Session {
             go: Mutex::new(None),
             halt: AtomicBool::new(false),
             fast_preview: AtomicBool::new(false),
+            current_size: Mutex::new(size),
+            target_size: Mutex::new(None),
         });
         let (s, p) = (shared.clone(), phones.clone());
         let fps = fps.clamp(10, 60);
@@ -124,8 +126,6 @@ impl Session {
             shared,
             phones,
             thread: Some(thread),
-            width: size.0,
-            height: size.1,
             fps,
             sample_rate,
             ffmpeg: output::find_ffmpeg(),
@@ -180,6 +180,12 @@ impl Session {
         self.shared.state.lock().unwrap().clone()
     }
 
+    /// Sets the output resolution (e.g. 720x1280 vertical or 1280x720 horizontal).
+    pub fn set_size(&self, size: (u32, u32)) {
+        *self.shared.current_size.lock().unwrap() = size;
+        *self.shared.target_size.lock().unwrap() = Some(size);
+    }
+
     /// Starts sending to `destinations`. Errors at once when there is no
     /// ffmpeg or nowhere to send; later errors show in [`State::error`].
     pub fn go_live(&self, destinations: output::Destinations) -> Result<(), String> {
@@ -191,10 +197,11 @@ impl Session {
         if destinations.is_empty() {
             return Err("Escolha a transmissão, a gravação ou as duas.".into());
         }
+        let (width, height) = *self.shared.current_size.lock().unwrap();
         self.shared.halt.store(false, Ordering::Release);
         *self.shared.go.lock().unwrap() = Some(output::Settings {
-            width: self.width,
-            height: self.height,
+            width,
+            height,
             fps: self.fps,
             sample_rate: self.sample_rate,
             destinations,
@@ -231,6 +238,7 @@ fn run(
     audio: Box<dyn AudioSource>,
 ) {
     let mut composer = Composer::new(w, h);
+    let (mut cur_w, mut cur_h) = (w, h);
     let first = shared.settings.lock().unwrap().clone();
     let mut director = Director::new(first.mode, first.director.clone());
     let started = Instant::now();
@@ -246,6 +254,15 @@ fn run(
     let mut written = 0u64;
 
     while !shared.stop.load(Ordering::Acquire) {
+        // Dynamic orientation/size change
+        if let Some((nw, nh)) = shared.target_size.lock().unwrap().take() {
+            if (nw, nh) != (cur_w, cur_h) {
+                cur_w = nw;
+                cur_h = nh;
+                composer.resize(nw, nh);
+            }
+        }
+
         // Going on air, or off.
         if let Some(settings) = shared.go.lock().unwrap().take() {
             out = None;
@@ -347,7 +364,7 @@ fn run(
             PREVIEW_EVERY
         };
         if n.is_multiple_of(preview_every) {
-            if let Some(f) = Frame::new(w, h, picture.to_vec()) {
+            if let Some(f) = Frame::new(cur_w, cur_h, picture.to_vec()) {
                 *shared.preview.lock().unwrap() = Some(Arc::new(f));
             }
         }

@@ -28,13 +28,13 @@ O openDJ inclui um sistema completo de codificação e transmissão integrado:
 │                        openDJ                               │
 │                                                             │
 │  📷 Celular 1 ──┐                                           │
-│  📷 Celular 2 ──┼──► Compositor 720×1280 ──► ffmpeg ──────► RTMP
-│  🖥  Tela      ──┘      (tiny-skia)       H.264+AAC   ou ──► .mp4
+│  📷 Celular 2 ──┼──► Compositor 720×1280 (9:16) ou ──► ffmpeg ──► RTMP
+│  🖥  Tela      ──┘       1280×720 (16:9)  (tiny-skia) H.264+AAC ou ──► .mp4
 │  🎵 Áudio Master ───────────────────────────────────────────┘
 │
-│  Codec de vídeo: H.264 VideoToolbox (GPU do Mac) → qualidade máxima
+│  Codec de vídeo: H.264 VideoToolbox (GPU do Mac) → baixíssima latência (-bf 0)
 │  Codec de áudio: AAC 160 kbps estéreo 48 kHz
-│  Resolução: 720 × 1280 (vertical 9:16, padrão TikTok)
+│  Resolução: 720 × 1280 (9:16 Vertical) ou 1280 × 720 (16:9 Horizontal)
 │  FPS: 30 quadros por segundo
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -115,26 +115,29 @@ ficou ao vivo.
 
 ---
 
-## 4. Transmitir para o YouTube
+## 4. Transmitir para o YouTube (Horizontal 16:9 ou Vertical Shorts)
+
+O openDJ agora conta com suporte nativo e seletor de formato dedicado para o YouTube!
 
 ### 4.1 Pegar a chave do YouTube
 
 1. Acesse [studio.youtube.com](https://studio.youtube.com)
-2. Clique em **Ir ao vivo** (canto superior direito)
-3. Escolha **Transmissão por software**
-4. Copie o **URL do servidor** e a **Chave de transmissão**
+2. Clique em **Criar** → **Transmitir ao vivo** (canto superior direito)
+3. Escolha **Fazer transmissão** (Transmissão por software externo)
+4. Copie a **Chave de transmissão** (o openDJ detectará na hora!).
 
 ### 4.2 Configurar no openDJ
 
-No painel LIVE, campo **URL do servidor**:
-```
-rtmp://a.rtmp.youtube.com/live2/
-```
-Campo **Chave de transmissão**: cole a chave gerada no YouTube Studio.
-
-> **Observação:** O YouTube exige resolução 1920×1080 (horizontal) para
-> transmissões padrão. Para o formato vertical 9:16 do openDJ, use o YouTube
-> Shorts Live — verifique se sua conta tem acesso.
+1. No painel LIVE, em **DESTINO**, selecione **YouTube**.
+2. Em **FORMATO**, escolha:
+   - **🖥 16:9 (Horizontal):** Formato padrão para YouTube tradicional, ideal para filmar o DJ com celular na horizontal (landscape). A imagem compõe as câmeras na metade superior e a tela do openDJ na metade inferior em widescreen (1280×720).
+   - **📱 9:16 (Vertical):** Para transmissões do YouTube Shorts Live com celular na vertical.
+3. A **URL do servidor** é preenchida automaticamente:
+   ```
+   rtmp://a.rtmp.youtube.com/live2/
+   ```
+4. **Preenchimento automático da chave:** ao copiar a chave no YouTube Studio, o openDJ detecta automaticamente na área de transferência e salva com segurança no Keychain do macOS.
+5. Clique em **Entrar ao vivo**!
 
 ---
 
