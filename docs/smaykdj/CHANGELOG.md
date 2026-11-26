@@ -3,6 +3,19 @@
 Tudo o que mudou nesta edição em relação ao openDJ original, do mais novo
 para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 
+## 2026-11-26
+
+### Alterado
+- **Remoção de Marca D'água/Texto na Base do Vídeo:**
+  - Removido o texto "openDJ" e o subtítulo "B2B BATTLE" / "LIVE SET" renderizados na base da imagem da transmissão (`crates/live/src/compose.rs`), deixando a tela 100% limpa para a audiência.
+- **Otimização de Fluidez e Ultrabaixa Latência (Instagram / TikTok):**
+  - Desativação completa de B-frames (`-bf 0`) no codificador H.264 VideoToolbox e libx264, eliminando o atraso de reordenação de quadros no player e nos servidores do Instagram.
+  - Ativação de prioridade máxima de velocidade em tempo real (`-prio_speed 1`).
+  - Redução do intervalo de keyframes para 1 segundo (`-g 30`) para sincronização e recuperação imediata no Instagram Live Producer.
+  - Buffer de vídeo VBV reduzido para 1 segundo (`-bufsize {kbps}k`), evitando acúmulo de atraso e oscilações de bitrate.
+  - Ativação de descarte de buffer de entrada (`-fflags +nobuffer+flush_packets`) e envio imediato de pacotes RTMP (`-flush_packets 1`) sem reter dados em buffer local.
+  - Alinhamento da taxa de captura dos celulares para 30 FPS cravados em `camera.html` (era 24 FPS), eliminando engasgos (judder) decorrentes da conversão 24→30 FPS.
+
 ## 2026-11-25
 
 ### Adicionado

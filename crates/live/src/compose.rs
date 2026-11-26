@@ -20,7 +20,6 @@ const BACKGROUND: u32 = 0x0b0b0e;
 const PANEL: u32 = 0x17151d;
 const TEXT: u32 = 0xf2f0f7;
 const MUTED: u32 = 0xa59fb5;
-const BRAND: u32 = 0xc9b8ff;
 
 /// How the picture looks: the DJs' names and colours.
 #[derive(Clone, Debug, PartialEq)]
@@ -209,13 +208,6 @@ impl Composer {
                 MUTED,
             );
         }
-
-        // The brand, clear of TikTok's comments.
-        let right = 526.0 * s;
-        let w = self.text_width("openDJ", 13.0 * s);
-        self.text("openDJ", right - w, 717.0 * s, 13.0 * s, BRAND);
-        let w = self.text_width(&look.tagline, 11.0 * s);
-        self.text(&look.tagline, right - w, 733.0 * s, 11.0 * s, MUTED);
 
         self.canvas.data()
     }

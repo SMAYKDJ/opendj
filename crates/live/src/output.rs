@@ -104,14 +104,14 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
 
 /// The H.264 encoder: the Mac's hardware one, else x264.
 fn video_encoder(kbps: u32, fps: u32) -> Vec<String> {
-    let gop = (fps * 2).to_string();
+    let gop = fps.to_string(); // Keyframe a cada 1s (30 quadros) para sincronização e baixa latência no Instagram/TikTok
     let rate = [
         "-b:v".into(),
         format!("{kbps}k"),
         "-maxrate".into(),
         format!("{kbps}k"),
         "-bufsize".into(),
-        format!("{}k", kbps * 2),
+        format!("{}k", kbps), // Buffer VBV de 1s para controle estrito sem acúmulo de atraso
         "-g".into(),
         gop,
         "-pix_fmt".into(),
@@ -123,6 +123,10 @@ fn video_encoder(kbps: u32, fps: u32) -> Vec<String> {
             "h264_videotoolbox",
             "-realtime",
             "1",
+            "-prio_speed",
+            "1",
+            "-bf",
+            "0", // Sem B-frames: elimina o buffer de reordenação do decoder (reduz delay brutalmente)
             "-allow_sw",
             "1",
             "-profile:v",
@@ -138,6 +142,8 @@ fn video_encoder(kbps: u32, fps: u32) -> Vec<String> {
             "veryfast",
             "-tune",
             "zerolatency",
+            "-bf",
+            "0",
             "-profile:v",
             "high",
         ]
@@ -158,6 +164,8 @@ pub fn arguments(s: &Settings, audio_port: u16) -> Vec<String> {
         "-stats_period",
         "2",
         "-stats",
+        "-fflags",
+        "+nobuffer+flush_packets",
     ]
     .map(String::from)
     .to_vec();
@@ -202,7 +210,11 @@ pub fn arguments(s: &Settings, audio_port: u16) -> Vec<String> {
     let d = &s.destinations;
     match (&d.rtmp, &d.record) {
         (Some(url), None) => {
-            a.extend(["-f", "flv", "-flvflags", "no_duration_filesize"].map(String::from));
+            a.extend([
+                "-f", "flv",
+                "-flvflags", "no_duration_filesize",
+                "-flush_packets", "1",
+            ].map(String::from));
             a.push(url.clone());
         }
         (None, Some(file)) => {
@@ -221,7 +233,7 @@ pub fn arguments(s: &Settings, audio_port: u16) -> Vec<String> {
         (Some(url), Some(file)) => {
             a.extend(["-flags", "+global_header", "-f", "tee"].map(String::from));
             a.push(format!(
-                "[f=flv:flvflags=no_duration_filesize:onfail=abort]{}|[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof:onfail=ignore]{}",
+                "[f=flv:flvflags=no_duration_filesize:flush_packets=1:onfail=abort]{}|[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof:onfail=ignore]{}",
                 tee_escape(url),
                 tee_escape(&file.to_string_lossy())
             ));

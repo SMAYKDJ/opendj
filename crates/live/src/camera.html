@@ -44,7 +44,7 @@
 "use strict";
 const q = new URLSearchParams(location.search);
 const slot = q.get("s"), key = q.get("k");
-const FPS = 24, LONG_SIDE = 960, QUALITY = 0.7, MAX_BUFFERED = 256 * 1024;
+const FPS = 30, LONG_SIDE = 960, QUALITY = 0.7, MAX_BUFFERED = 256 * 1024;
 const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
 $("title").textContent = "Câmera " + slot;
