@@ -10,8 +10,8 @@
 1. [Como funciona](#1-como-funciona)
 2. [Pré-requisito: instalar o ffmpeg](#2-pré-requisito-instalar-o-ffmpeg)
 3. [Transmitir para o TikTok](#3-transmitir-para-o-tiktok)
-4. [Transmitir para o YouTube](#4-transmitir-para-o-youtube)
-5. [Transmitir para o Instagram (via OBS ou Restream)](#5-transmitir-para-o-instagram)
+4. [Transmitir para o YouTube (Horizontal 16:9 ou Vertical Shorts)](#4-transmitir-para-o-youtube-horizontal-169-ou-vertical-shorts)
+5. [Transmitir para o Instagram (Live Producer Direto)](#5-transmitir-para-o-instagram-sem-limite-de-seguidores)
 6. [Gravar localmente (sem transmitir)](#6-gravar-localmente)
 7. [Transmitir e Gravar ao mesmo tempo](#7-transmitir-e-gravar-ao-mesmo-tempo)
 8. [Configurações de qualidade](#8-configurações-de-qualidade)
@@ -214,19 +214,20 @@ ffmpeg → tee → [f=flv]rtmp://push.tiktok.com/live/CHAVE
 
 ## 8. Configurações de qualidade
 
-As configurações estão em `crates/live/src/output.rs`. Padrões atuais:
+As configurações otimizadas estão em `crates/live/src/output.rs`. Padrões atuais:
 
-| Parâmetro | Valor padrão | Recomendação TikTok |
-|-----------|-------------|---------------------|
-| Resolução | 720 × 1280 | ✅ Exato |
-| FPS | 30 | ✅ Exato |
-| Vídeo (kbps) | 3.000 | ✅ Mínimo 2.500 |
-| Áudio (kbps) | 160 | ✅ Exato |
-| Codec vídeo | H.264 (VideoToolbox) | ✅ Requerido |
-| Codec áudio | AAC | ✅ Requerido |
-| Perfil H.264 | High | ✅ Recomendado |
-| Formato de saída | FLV (RTMP) | ✅ Padrão |
-| GOP (keyframes) | 60 (2 s) | ✅ Padrão |
+| Parâmetro | Formato Vertical | Formato Horizontal | Padrão / Recomendação |
+|-----------|-----------------|-------------------|------------------------|
+| Resolução | 720 × 1280 (9:16) | 1280 × 720 (16:9) | ✅ TikTok / Instagram (9:16) ou YouTube (16:9) |
+| FPS | 30 | 30 | ✅ 30 quadros/s sincronizados (sem judder) |
+| Vídeo (kbps) | 3.000 | 3.500 | ✅ Qualidade HD nítida |
+| Áudio (kbps) | 160 | 160 | ✅ AAC estéreo 48 kHz cristalino |
+| Codec vídeo | H.264 (VideoToolbox) | H.264 (VideoToolbox) | ✅ Aceleração por hardware na GPU do Mac |
+| B-Frames | 0 (`-bf 0`) | 0 (`-bf 0`) | ⚡ Latência ultrabaixa em tempo real |
+| GOP (keyframes) | 30 (1 s) | 30 (1 s) | ⚡ Recuperação imediata na rede |
+| Buffer (VBV) | 1 segundo | 1 segundo | ⚡ Sem acúmulo de atraso na transmissão |
+| Codec áudio | AAC | AAC | ✅ Universal para todas as plataformas |
+| Formato de saída | FLV (RTMP) | FLV (RTMP) | ✅ Padrão RTMP / RTMPS |
 
 ---
 
@@ -276,4 +277,4 @@ aprovação). **Use o RTMP direto pelo openDJ** — não precisa do LIVE Studio.
 
 ---
 
-*Documentação SMAYKDJ — openDJ edição DJ para lives no TikTok*
+*Documentação SMAYKDJ — openDJ edição DJ para lives no TikTok, Instagram e YouTube*
