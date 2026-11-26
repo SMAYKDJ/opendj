@@ -6,6 +6,12 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-25
 
 ### Adicionado
+- **Detecção e Preenchimento Automático de Chaves de Transmissão (Clipboard Monitor):**
+  - Monitor contínuo e inteligente da área de transferência (clipboard) em background rodando a cada 500ms no openDJ via `arboard`.
+  - Ao entrar em `instagram.com/live/producer` ou TikTok e clicar em "Copiar" na chave de transmissão (ou na URL RTMP), o openDJ detecta o padrão automaticamente e preenche o campo na hora, sem necessidade de extensões no navegador ou comandos manuais.
+  - Armazenamento automático e seguro no Keychain do macOS para a plataforma ativa (`rtmp_key_instagram` ou `rtmp_key_tiktok`).
+  - Feedback visual imediato com banner verde de status (`✅ Chave do Instagram/TikTok detectada automaticamente!`), com auto-ocultação após 6 segundos.
+  - Botão de conveniência `📋 Colar` ao lado do campo de chave para colar com 1 clique se desejado.
 - **Suporte a Transmissão Direta para Instagram (Live Producer):**
   - Seletor de plataforma `DESTINO: [TikTok, Instagram]` no painel Battle Live.
   - Pré-preenchimento automático da URL oficial do Instagram (`rtmps://live-upload.instagram.com:443/rtmp/`).

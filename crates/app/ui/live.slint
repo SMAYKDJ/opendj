@@ -45,6 +45,7 @@ export global LiveUi {
     in-out property <int> platform: 0;
     in property <string> server;
     in property <string> key;
+    in property <string> key-status: "";
     in property <string> record-folder;
     // B2B Online Remote
     // 0 = Local, 1 = Host (aguardando convidado), 2 = Guest (digitando código), 3 = Conectado, 4 = Procurando (auto-descoberta)
@@ -73,6 +74,7 @@ export global LiveUi {
     callback license-validate-key(string);
     callback opened();
     callback toggle-projector();
+    callback paste-key();
     callback set-b2b(bool);
     callback set-names(string, string);
     callback set-rotate(int);
@@ -512,16 +514,35 @@ export component LivePanel inherits PopupWindow {
                     placeholder: LiveUi.platform == 1 ? "rtmps://live-upload.instagram.com:443/rtmp/" : "rtmp://push.tiktok.com/live/";
                     edited(t) => { LiveUi.set-server(t); }
                 }
-                Field {
-                    text: LiveUi.key;
-                    secret: true;
-                    placeholder: "Chave de transmissão (" + (LiveUi.platform == 1 ? "Instagram" : "TikTok") + ")";
-                    edited(t) => { LiveUi.set-key(t); }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Field {
+                        horizontal-stretch: 1;
+                        text: LiveUi.key;
+                        secret: true;
+                        placeholder: "Chave de transmissão (" + (LiveUi.platform == 1 ? "Instagram" : "TikTok") + ")";
+                        edited(t) => { LiveUi.set-key(t); }
+                    }
+                    Action {
+                        width: 75px;
+                        height: 26px;
+                        border-radius: Theme.radius;
+                        label: "📋 Colar";
+                        filled: false;
+                        clicked => { LiveUi.paste-key(); }
+                    }
+                }
+                if LiveUi.key-status != "": Text {
+                    text: LiveUi.key-status;
+                    color: Theme.c-30d158;
+                    font-size: 11px;
+                    font-weight: 600;
+                    wrap: word-wrap;
                 }
                 Text {
                     text: LiveUi.platform == 1 ?
-                        "Instagram: acesse instagram.com/live/producer no navegador (qualquer conta Criador/Profissional pode transmitir sem limite de seguidores!)" :
-                        "TikTok: no app TikTok → + → Live → Stream de PC  ou  acesse live.tiktok.com/studio";
+                        "Instagram: acesse instagram.com/live/producer no navegador. Ao clicar em 'Copiar' na chave, o openDJ detecta e preenche automaticamente!" :
+                        "TikTok: no app TikTok → + → Live → Stream de PC ou live.tiktok.com/studio. Ao copiar a chave, o openDJ preenche automaticamente!";
                     color: Theme.text-dim;
                     font-size: 10px;
                     wrap: word-wrap;

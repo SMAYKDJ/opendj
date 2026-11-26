@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arboard = "3"
 base64 = "0.22"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 getrandom = "0.4"

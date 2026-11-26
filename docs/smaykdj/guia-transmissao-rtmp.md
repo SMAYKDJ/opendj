@@ -98,15 +98,15 @@ O openDJ procura o ffmpeg automaticamente em:
 ### 3.2 Configurar no openDJ
 
 1. Clique em **LIVE** na barra superior do openDJ
-2. Configure os celulares e clique em **Iniciar câmeras**
-3. Na seção de transmissão, ligue o switch **"Transmitir para o TikTok"**
-4. **URL do servidor** já vem preenchida:
+2. Em **DESTINO**, certifique-se de que **TikTok** está selecionado
+3. A **URL do servidor** já vem pré-preenchida automaticamente:
    ```
    rtmp://push.tiktok.com/live/
    ```
-   (mantenha como está)
-5. Cole sua **Chave de transmissão** no campo abaixo
-6. Clique em **Entrar ao vivo**
+4. **Preenchimento automático da chave:** ao copiar a chave no TikTok (ou pelo navegador), o openDJ detecta automaticamente na área de transferência e preenche o campo sozinho!
+   - Uma mensagem verde `✅ Chave do TikTok detectada automaticamente!` aparecerá.
+   - Se preferir, você também pode clicar no botão **📋 Colar** ou digitar manualmente.
+5. Clique em **Entrar ao vivo**
 
 ### 3.3 Encerrar
 
@@ -170,7 +170,11 @@ Profissional (Criador de Conteúdo ou Empresa) **sem exigência de 1.000 seguido
    ```
    rtmps://live-upload.instagram.com:443/rtmp/
    ```
-5. Cole sua **Chave de transmissão** no campo da chave
+5. **Detecção e preenchimento 100% automático da chave:**
+   - Na página do **Instagram Live Producer**, basta clicar no botão **"Copiar"** ao lado da Chave do stream.
+   - O openDJ monitora a área de transferência em tempo real e **preenche a chave instantaneamente em automático**, exibindo a confirmação `✅ Chave do Instagram detectada automaticamente!`.
+   - Você não precisa colar manualmente nem alternar janelas para dar Cmd+V — basta copiar no navegador!
+   - *(Opcional)* Se preferir colar manualmente, há também o botão **📋 Colar** direto ao lado do campo.
 6. Clique em **Entrar ao vivo** no openDJ
 7. Volte ao navegador no **Instagram Live Producer** — você verá a imagem do
    openDJ na prévia. Clique em **Transmitir ao vivo** na página do Instagram.

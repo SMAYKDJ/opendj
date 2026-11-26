@@ -101,6 +101,9 @@ pub struct Live {
     audio_pending: Vec<f32>,
     stun_rx: Option<std::sync::mpsc::Receiver<std::net::SocketAddr>>,
     license_mgr: crate::license::LicenseManager,
+    clipboard_timer: Timer,
+    last_clipboard_text: String,
+    clipboard_status_time: Option<Instant>,
 }
 
 impl Live {
@@ -138,7 +141,24 @@ impl Live {
             audio_pending: Vec::new(),
             stun_rx: None,
             license_mgr: crate::license::LicenseManager::new(),
+            clipboard_timer: Timer::default(),
+            last_clipboard_text: String::new(),
+            clipboard_status_time: None,
         }));
+
+        {
+            let weak = app.as_weak();
+            let live_cb = live.clone();
+            live.borrow().clipboard_timer.start(
+                TimerMode::Repeated,
+                Duration::from_millis(500),
+                move || {
+                    if let Some(app) = weak.upgrade() {
+                        live_cb.borrow_mut().check_clipboard(&app);
+                    }
+                },
+            );
+        }
 
         let ui = app.global::<LiveUi>();
         let machine_id = crate::license::get_machine_id();
@@ -237,11 +257,13 @@ impl Live {
                     .and_then(|e| e.get_password().ok())
                     .unwrap_or_default();
                 live.borrow_mut().key = key_val.clone();
+                live.borrow_mut().last_clipboard_text = String::new();
                 if let Some(app) = weak.upgrade() {
                     let ui = app.global::<LiveUi>();
                     ui.set_platform(p);
                     ui.set_server(server_val.into());
                     ui.set_key(key_val.into());
+                    ui.set_key_status("".into());
                 }
             }
         });
@@ -268,6 +290,15 @@ impl Live {
                     };
                 }
                 live.borrow_mut().key = k;
+            }
+        });
+        ui.on_paste_key({
+            let live = live.clone();
+            let weak = weak.clone();
+            move || {
+                if let Some(app) = weak.upgrade() {
+                    live.borrow_mut().paste_key_manual(&app);
+                }
             }
         });
         ui.on_pick({
@@ -912,6 +943,131 @@ impl Live {
             }
         }
         // ────────────────────────────────────────────────────────────────────
+    }
+
+    /// Verifica a área de transferência do sistema em busca de chaves de transmissão ou URLs RTMP.
+    /// Chamado periodicamente a cada ~500ms pelo timer do openDJ.
+    fn check_clipboard(&mut self, app: &AppWindow) {
+        let ui = app.global::<LiveUi>();
+
+        // Limpa a mensagem temporária de status após 6 segundos
+        if let Some(time) = self.clipboard_status_time {
+            if time.elapsed() >= Duration::from_secs(6) {
+                self.clipboard_status_time = None;
+                ui.set_key_status("".into());
+            }
+        }
+
+        if !ui.get_stream() {
+            return;
+        }
+
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let text = match clipboard.get_text() {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => return,
+        };
+
+        if text.is_empty() || text == self.last_clipboard_text {
+            return;
+        }
+
+        // 1. Detecção automática de URL de servidor RTMP / RTMPS
+        if (text.starts_with("rtmp://") || text.starts_with("rtmps://"))
+            && !text.contains(' ')
+            && text.len() >= 15
+            && text.len() <= 250
+        {
+            self.last_clipboard_text = text.clone();
+            let current_server = ui.get_server().to_string();
+            if text != current_server {
+                ui.set_server(text.clone().into());
+                let p = ui.get_platform();
+                let key = if p == 1 { SERVER_INSTAGRAM } else { SERVER_TIKTOK };
+                settings::set(key, json!(text));
+                self.clipboard_status_time = Some(Instant::now());
+                ui.set_key_status("✅ URL do servidor detectada e preenchida!".into());
+            }
+            return;
+        }
+
+        // 2. Detecção automática de chave de transmissão (Instagram / TikTok)
+        // Chaves de stream nunca contêm espaços, não começam com http/rtmp, têm comprimento >= 16 e <= 350
+        if !text.contains(' ')
+            && !text.contains('\n')
+            && !text.contains('\r')
+            && !text.starts_with("http://")
+            && !text.starts_with("https://")
+            && !text.starts_with("rtmp://")
+            && !text.starts_with("rtmps://")
+            && text.len() >= 16
+            && text.len() <= 350
+        {
+            self.last_clipboard_text = text.clone();
+            if text != self.key {
+                self.key = text.clone();
+                let p = ui.get_platform();
+                if let Some(e) = keychain_for(p) {
+                    let _ = e.set_password(&text);
+                }
+                ui.set_key(text.into());
+                let platform_name = if p == 1 { "Instagram" } else { "TikTok" };
+                self.clipboard_status_time = Some(Instant::now());
+                ui.set_key_status(format!("✅ Chave do {platform_name} detectada automaticamente!").into());
+            }
+        }
+    }
+
+    /// Cola manualmente a chave ou URL da área de transferência ao clicar no botão "Colar".
+    fn paste_key_manual(&mut self, app: &AppWindow) {
+        let ui = app.global::<LiveUi>();
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                ui.set_key_status(format!("❌ Erro ao acessar área de transferência: {e}").into());
+                self.clipboard_status_time = Some(Instant::now());
+                return;
+            }
+        };
+        let text = match clipboard.get_text() {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => {
+                ui.set_key_status("❌ Nenhum texto na área de transferência.".into());
+                self.clipboard_status_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        if text.is_empty() {
+            ui.set_key_status("❌ A área de transferência está vazia.".into());
+            self.clipboard_status_time = Some(Instant::now());
+            return;
+        }
+
+        if text.starts_with("rtmp://") || text.starts_with("rtmps://") {
+            ui.set_server(text.clone().into());
+            let p = ui.get_platform();
+            let key = if p == 1 { SERVER_INSTAGRAM } else { SERVER_TIKTOK };
+            settings::set(key, json!(text));
+            self.last_clipboard_text = text.clone();
+            self.clipboard_status_time = Some(Instant::now());
+            ui.set_key_status("✅ URL RTMP colada com sucesso!".into());
+            return;
+        }
+
+        self.key = text.clone();
+        self.last_clipboard_text = text.clone();
+        let p = ui.get_platform();
+        if let Some(e) = keychain_for(p) {
+            let _ = e.set_password(&text);
+        }
+        ui.set_key(text.into());
+        let platform_name = if p == 1 { "Instagram" } else { "TikTok" };
+        self.clipboard_status_time = Some(Instant::now());
+        ui.set_key_status(format!("✅ Chave do {platform_name} colada com sucesso!").into());
     }
 }
 
