@@ -11,7 +11,7 @@ use opendj_engine::{phrases, Source, Track, NUM_DECKS};
 use slint::{ComponentHandle, Model};
 
 use super::{is_browsed, Browser, Contents};
-use crate::LibraryEdit;
+use crate::{AppWindow, LibraryEdit};
 
 /// Where the queue's progress was last shown: rows with a dot and their
 /// state (1 waiting, 2 being analysed), and the footer's text.
@@ -75,6 +75,28 @@ impl Browser {
                     .node_tracks(node)
                     .into_iter()
                     .filter(|&t| !b.is_mixed_set(&b.library[t]))
+                    .collect();
+                b.analyze(&tracks);
+            })
+        });
+        let w = with.clone();
+        edit.on_analyze_next(move |count| {
+            w(&|b| {
+                let tracks: Vec<usize> = b
+                    .rows
+                    .iter()
+                    .filter_map(|&opt_i| opt_i)
+                    .filter(|&i| {
+                        b.library
+                            .get(i)
+                            .map(|t| {
+                                t.bpm <= 0.0
+                                    && !t.info.missing
+                                    && matches!(t.source, Source::File(_))
+                            })
+                            .unwrap_or(false)
+                    })
+                    .take(count as usize)
                     .collect();
                 b.analyze(&tracks);
             })
@@ -206,13 +228,40 @@ impl Browser {
             Some((n, total)) => format!("Analyzing {n} of {total}"),
             None => String::new(),
         };
-        if footer != self.analysis_shown.footer {
-            if let Some(app) = self.app.upgrade() {
-                app.global::<LibraryEdit>()
-                    .set_analysis_status(footer.as_str().into());
+        if let Some(app) = self.app.upgrade() {
+            let edit = app.global::<LibraryEdit>();
+            if footer != self.analysis_shown.footer {
+                edit.set_analysis_status(footer.as_str().into());
+                self.analysis_shown.footer = footer;
             }
-            self.analysis_shown.footer = footer;
+            // Keep unanalyzed-count in sync so the context menu shows
+            // the right quick-analyze options.
+            self.update_unanalyzed_count(&app);
         }
+    }
+
+    /// Updates `unanalyzed-count` in the UI: the number of tracks in the
+    /// current list that have no BPM/key analysis. Called from `fill_rows`
+    /// (when the list changes) and from `show_analysis` (when the queue
+    /// changes) so the context-menu options 50/100/150 stay accurate.
+    pub(super) fn update_unanalyzed_count(&self, app: &AppWindow) {
+        let unanalyzed = self
+            .rows
+            .iter()
+            .filter_map(|&opt| opt)
+            .filter(|&i| {
+                self.library
+                    .get(i)
+                    .map(|t| {
+                        t.bpm <= 0.0
+                            && !t.info.missing
+                            && matches!(t.source, Source::File(_))
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        app.global::<LibraryEdit>()
+            .set_unanalyzed_count(unanalyzed as i32);
     }
 
     /// Sets each row's dot from the queue, touching only rows that change.

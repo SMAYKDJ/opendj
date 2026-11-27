@@ -5682,6 +5682,7 @@ impl Browser {
             self.fill_waves();
             self.analysis_shown.marks.clear();
             self.mark_analysis_rows();
+            self.update_unanalyzed_count(&app);
             app.set_tracks(ModelRc::from(self.list.clone()));
             // Copies are listed in their groups, whatever the sort.
             app.set_sort_column(if dupes.is_some() {

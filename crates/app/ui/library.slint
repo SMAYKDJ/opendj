@@ -416,6 +416,10 @@ export global LibraryEdit {
     callback analyze(first: int, last: int);
     // Analyses every track of the tree's row `row`.
     callback analyze-all(row: int);
+    // Analyses the first `count` unanalysed tracks of the current list.
+    callback analyze-next(count: int);
+    // How many tracks in the current list have no BPM/key analysis yet.
+    in property <int> unanalyzed-count;
     // Opens Export to USB for the tree's row `row` (a list or folder).
     callback export-usb(row: int);
     // Sends the tree's row `row` (a list or history session) to Spotify as
@@ -1683,9 +1687,41 @@ component TrackMenu inherits PopupWindow {
             MenuLine {
                 icon: "analyze";
                 text: count > 1 ? "Analisar " + count + " Faixas" : "Analisar Faixa";
+                hint: "BPM · Chave · Waveform";
                 entered => { panel = 0; }
                 clicked => {
                     LibraryEdit.analyze(track-row, track-last);
+                    root.close();
+                }
+            }
+            // Quick analyze-next options (unanalysed tracks in the current list)
+            if LibraryEdit.unanalyzed-count >= 50: MenuLine {
+                icon: "analyze";
+                text: "Analisar próximas 50";
+                hint: "BPM · Chave · Waveform";
+                entered => { panel = 0; }
+                clicked => {
+                    LibraryEdit.analyze-next(50);
+                    root.close();
+                }
+            }
+            if LibraryEdit.unanalyzed-count >= 100: MenuLine {
+                icon: "analyze";
+                text: "Analisar próximas 100";
+                hint: "BPM · Chave · Waveform";
+                entered => { panel = 0; }
+                clicked => {
+                    LibraryEdit.analyze-next(100);
+                    root.close();
+                }
+            }
+            if LibraryEdit.unanalyzed-count >= 150: MenuLine {
+                icon: "analyze";
+                text: "Analisar próximas 150";
+                hint: "BPM · Chave · Waveform";
+                entered => { panel = 0; }
+                clicked => {
+                    LibraryEdit.analyze-next(150);
                     root.close();
                 }
             }
@@ -5128,13 +5164,31 @@ component TrackList inherits Rectangle {
                     }
                     Rectangle {
                         width: w-deck;
-                        // Queued for analysis: a dim dot, pulsing lilac while being analysed.
+                        // Queued for analysis: a progress bar.
+                        // Waiting (1): dim stub at left. Active (2): lilac scanner sweeping right.
                         if r.analysing > 0 && r.deck < 0 && !r.missing: Rectangle {
-                            width: 7px;
-                            height: 7px;
-                            border-radius: 3.5px;
-                            background: r.analysing == 2 ? (selected ? Theme.on-row-selection : Theme.lilac) : Theme.text-dim;
-                            opacity: r.analysing == 2 ? 0.35 + 0.65 * abs(sin(animation-tick() / 1ms * 0.25deg)) : 0.6;
+                            x: 0;
+                            y: (parent.height - 3px) / 2;
+                            width: parent.width;
+                            height: 3px;
+                            border-radius: 1.5px;
+                            background: Theme.text-dim.with-alpha(0.15);
+                            // Waiting in queue: small static stub
+                            if r.analysing == 1: Rectangle {
+                                width: parent.width * 0.18;
+                                height: parent.height;
+                                border-radius: 1.5px;
+                                background: Theme.text-dim.with-alpha(0.45);
+                            }
+                            // Being analysed now: sweeping scanner bar
+                            if r.analysing == 2: Rectangle {
+                                x: mod(animation-tick() / 1ms * 0.12 * 1px, parent.width + 28px) - 14px;
+                                width: 28px;
+                                height: parent.height;
+                                border-radius: 1.5px;
+                                background: selected ? Theme.on-row-selection : Theme.lilac;
+                                opacity: 0.55 + 0.45 * abs(sin(animation-tick() / 1ms * 0.18deg));
+                            }
                         }
                         // A Spotify track that isn't in the collection: a hollow green ring.
                         if r.missing: Text {

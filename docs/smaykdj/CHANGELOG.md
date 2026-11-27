@@ -3,6 +3,22 @@
 Tudo o que mudou nesta edição em relação ao openDJ original, do mais novo
 para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 
+## 2026-11-27
+
+### Adicionado
+- **Barra de Progresso por Faixa e Menu Rápido de Análise (50, 100, 150 faixas) estilo Traktor:**
+  - **Barra de Progresso Animada por Linha da Lista:**
+    - Enquanto uma faixa está na fila de análise (`analysing == 1`), exibe uma barra de progresso suave indicando o aguardo.
+    - Quando a faixa está sendo analisada ativamente no momento (`analysing == 2`), exibe um scanner iluminado animado em lilás/destaque varrendo a barra em tempo real, informando visualmente o processamento de cada música diretamente na linha da biblioteca.
+  - **Menu de Contexto com Opções de Quantidade Rápida (50, 100, 150 faixas):**
+    - Ao clicar com o botão direito em qualquer faixa, se houver faixas não analisadas na visualização atual, são exibidas opções rápidas para:
+      - "Analisar próximas 50"
+      - "Analisar próximas 100"
+      - "Analisar próximas 150"
+    - Seleciona e enfileira automaticamente as primeiras 50, 100 ou 150 faixas sem BPM/tom da lista atual para análise em segundo plano.
+  - **Detalhamento dos Metadados Analisados Estilo Traktor:**
+    - Exibe dica clara no menu de contexto especificando exatamente o que está sendo computado: `BPM · Chave · Waveform`.
+
 ## 2026-11-26
 
 ### Adicionado
