@@ -1682,7 +1682,7 @@ component TrackMenu inherits PopupWindow {
             // Analysis, and the stores.
             MenuLine {
                 icon: "analyze";
-                text: count > 1 ? "Analyze " + count + " Tracks" : "Analyze Track";
+                text: count > 1 ? "Analisar " + count + " Faixas" : "Analisar Faixa";
                 entered => { panel = 0; }
                 clicked => {
                     LibraryEdit.analyze(track-row, track-last);
@@ -4514,11 +4514,13 @@ component TrackList inherits Rectangle {
     // last through a re-sort; `current` is the row the keyboard and
     // controllers move from.
     property <int> anchor: -1;
-    out property <int> first-picked: current;
-    out property <int> last-picked: current;
+    out property <int> first-picked: anchor >= 0 && current >= 0 ? min(anchor, current) : current;
+    out property <int> last-picked: anchor >= 0 && current >= 0 ? max(anchor, current) : current;
     property <bool> shift-held;
     property <bool> cmd-held;
+    property <bool> extending: false;
     function pick(i: int) {
+        extending = false;
         anchor = i;
         LibraryEdit.pick-rows(i, i, false);
         current = i;
@@ -4526,17 +4528,71 @@ component TrackList inherits Rectangle {
     }
     function extend(i: int, add: bool) {
         if anchor < 0 {
-            anchor = current;
+            anchor = current >= 0 ? current : i;
         }
+        extending = true;
         LibraryEdit.pick-rows(anchor, i, add);
         current = i;
         took-focus();
     }
     function toggle(i: int) {
+        extending = false;
         anchor = i;
         LibraryEdit.toggle-row(i);
         current = i;
         took-focus();
+    }
+    public function key-step(down: bool, shift: bool, cmd: bool) -> bool {
+        if rows.length == 0 {
+            return false;
+        }
+        if current < 0 {
+            let target = down ? 0 : rows.length - 1;
+            pick(target);
+            return true;
+        }
+        if down {
+            if current < rows.length - 1 {
+                let next = current + 1;
+                if shift {
+                    extend(next, cmd);
+                } else {
+                    pick(next);
+                }
+                return true;
+            }
+        } else {
+            if current > 0 {
+                let next = current - 1;
+                if shift {
+                    extend(next, cmd);
+                } else {
+                    pick(next);
+                }
+                return true;
+            }
+        }
+        true
+    }
+    public function key-page(down: bool, shift: bool, cmd: bool) -> bool {
+        if rows.length == 0 {
+            return false;
+        }
+        let step = max(1, shown-count - 2);
+        let target = down ? min(rows.length - 1, (current < 0 ? 0 : current) + step) : max(0, (current < 0 ? 0 : current) - step);
+        if shift {
+            extend(target, cmd);
+        } else {
+            pick(target);
+        }
+        return true;
+    }
+    public function key-activate() -> bool {
+        if current >= 0 && current < rows.length {
+            activate(current);
+            return true;
+        }
+        false
     }
     // ⌘F (Ctrl+F on Linux and Windows): into the search box, its text
     // picked so typing replaces it.
@@ -4547,6 +4603,7 @@ component TrackList inherits Rectangle {
     // ⌘A (Ctrl+A on Linux and Windows): every row, the first one current.
     public function select-all() {
         if rows.length > 0 {
+            extending = false;
             anchor = 0;
             LibraryEdit.pick-rows(0, rows.length - 1, false);
             current = 0;
@@ -4568,7 +4625,7 @@ component TrackList inherits Rectangle {
         // Moved some other way than a click (arrows, a controller, a new
         // list) to a row not picked: just that row is picked. A click has
         // made `current` the anchor or picked it already.
-        if current < 0 || (current != anchor && !LibraryEdit.picks[current]) {
+        if !extending && (current < 0 || (current != anchor && !LibraryEdit.picks[current])) {
             anchor = current;
             LibraryEdit.pick-rows(current, current, false);
         }
@@ -4694,6 +4751,38 @@ component TrackList inherits Rectangle {
                         color: Theme.lilac-text;
                         font-size: 14px;
                         vertical-alignment: center;
+                    }
+                    if LibraryEdit.picked-count > 0 && empty-title == "" && !AlbumsUi.grid: Rectangle {
+                        height: 24px;
+                        border-radius: 4px;
+                        background: ab-ta.has-hover ? Theme.accent.with-alpha(0.35) : Theme.accent.with-alpha(0.18);
+                        border-width: 1px;
+                        border-color: Theme.accent.with-alpha(0.5);
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 5px;
+                            alignment: center;
+                            Path {
+                                width: 12px;
+                                height: 12px;
+                                fill: Theme.lilac-text;
+                                commands: "M 2 7 L 2 9 M 5 4 L 5 12 M 8 6 L 8 10 M 11 2.5 L 11 13.5 M 14 6.5 L 14 9.5";
+                            }
+                            Text {
+                                text: LibraryEdit.picked-count > 1 ? "Analisar " + LibraryEdit.picked-count + " faixas" : "Analisar faixa";
+                                color: Theme.lilac-text;
+                                font-size: 12px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        ab-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                LibraryEdit.analyze(current >= 0 ? current : 0, current >= 0 ? current : 0);
+                            }
+                        }
                     }
                     // A smart list's search, so it's clear why these tracks are here.
                     Text {
@@ -4972,7 +5061,7 @@ component TrackList inherits Rectangle {
                         pointer-event(e) => {
                             if e.button == PointerEventButton.left && e.kind == PointerEventKind.down {
                                 shift-held = e.modifiers.shift;
-                                cmd-held = e.modifiers.control;
+                                cmd-held = e.modifiers.control || e.modifiers.meta;
                             }
                             // A Spotify track the collection doesn't have: pick which it is.
                             if !r.available && r.streamed && e.button == PointerEventButton.right && e.kind == PointerEventKind.down {
@@ -6447,6 +6536,29 @@ export component Browser inherits HorizontalLayout {
         if !folders-focused && list.visible {
             list.select-all();
         }
+    }
+    public function key-step(down: bool, shift: bool, cmd: bool) -> bool {
+        if !folders-focused && list.visible {
+            return list.key-step(down, shift, cmd);
+        }
+        if folders-focused && folders.length > 0 {
+            let next = down ? min(folders.length - 1, current-folder + 1) : max(0, current-folder - 1);
+            select-folder(next);
+            return true;
+        }
+        false
+    }
+    public function key-page(down: bool, shift: bool, cmd: bool) -> bool {
+        if !folders-focused && list.visible {
+            return list.key-page(down, shift, cmd);
+        }
+        false
+    }
+    public function key-activate() -> bool {
+        if !folders-focused && list.visible {
+            return list.key-activate();
+        }
+        false
     }
     in property <[SideRow]> side-rows;
     in property <string> side-total;

@@ -958,7 +958,7 @@ impl Browser {
     /// Library tracks (indices into `library`) on rows `first` to `last`
     /// (every picked row when `first` is one of several picked), or on
     /// every row when `first` is negative.
-    pub(super) fn picked_rows(&self, first: i32, last: i32) -> Vec<usize> {
+    pub(crate) fn picked_rows(&self, first: i32, last: i32) -> Vec<usize> {
         if first < 0 {
             return self.rows.iter().copied().flatten().collect();
         }

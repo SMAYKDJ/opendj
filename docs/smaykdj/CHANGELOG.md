@@ -6,6 +6,22 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-26
 
 ### Adicionado
+- **Seleção Múltipla de Músicas na Biblioteca (Teclado Shift+Seta e Mouse) e Análise em Lote:**
+  - **Navegação e Seleção por Teclado:**
+    - `Shift + ↓` e `Shift + ↑`: estendem a seleção contínua de faixas a partir de um ponto âncora (tanto para baixo quanto para cima).
+    - `↓` e `↑` (sem Shift): movem o cursor selecionando apenas a faixa atual e mantendo-a visível com rolagem automática.
+    - `PageDown` e `PageUp` (com e sem Shift): avanço rápido de página de faixas.
+    - `Enter` / `Return`: carrega a faixa selecionada no deck ativo.
+  - **Seleção por Mouse (compatível com macOS e Windows):**
+    - Clique simples: seleciona a faixa individual.
+    - `Shift + Clique`: seleciona instantaneamente todo o intervalo de faixas entre o clique anterior e a faixa clicada.
+    - `⌘ + Clique` (macOS) / `Ctrl + Clique` (Windows/Linux): adiciona ou remove faixas avulsas da seleção.
+    - `⌘ + Shift + Clique`: combina seleção por intervalo mantendo faixas previamente selecionadas.
+  - **Análise em Lote de Faixas Selecionadas (Agrupadas por BPM):**
+    - Ao ordenar por BPM na biblioteca para agrupar as faixas sem análise (BPM vazio/0), o usuário pode selecionar todas usando `Shift + ↓` ou mouse.
+    - **Botão Direto no Cabeçalho:** ao selecionar faixas, surge imediatamente o botão `[⚡ Analisar X faixas]` ao lado do contador de faixas selecionadas no topo da lista.
+    - **Menu de Contexto (Botão Direito):** clicar com o botão direito em qualquer faixa da seleção abre o menu com a opção `Analisar X Faixas` em português.
+    - **Comando openDJscript / Atalho de Teclado:** adicionado o verbo `analyze` executável via atalho de teclado ou script para analisar em lote todas as faixas selecionadas no navegador.
 - **Armazenamento Portátil de Análise em Pendrives e Dispositivos Externos (Padrão Virtual DJ / Serato):**
   - Implementado suporte inteligente no motor de cache (`crates/engine/src/cache.rs`) para detectar se a música está em um volume removível ou pendrive (ex: `/Volumes/...` no Mac ou `D:\`, `E:\` no Windows).
   - Ao analisar uma faixa em dispositivo externo, a análise completa (waveform detalhada, BPM, beatgrid, tonalidade, loudness) e overviews são gravados diretamente na raiz do dispositivo em `openDJ/analysis/` e `openDJ/overviews/` usando hashes relativos universais.

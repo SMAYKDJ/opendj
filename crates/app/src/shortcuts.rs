@@ -503,6 +503,15 @@ impl Host for AppHost<'_> {
                 self.browser.show_info(first);
                 Ok(())
             }
+            "analyze" => {
+                let (first, last) = self.picked;
+                if first < 0 {
+                    return Err(Error::new("Pick a track in the browser first"));
+                }
+                let picked = self.browser.picked_rows(first, last);
+                self.browser.analyze(&picked);
+                Ok(())
+            }
             other => Err(Error::new(format!("'{other}' isn't available here"))),
         }
     }
