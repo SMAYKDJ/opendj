@@ -6,6 +6,11 @@ para o mais antigo. As datas seguem o horário de Belém (UTC−3).
 ## 2026-11-26
 
 ### Adicionado
+- **Armazenamento Portátil de Análise em Pendrives e Dispositivos Externos (Padrão Virtual DJ / Serato):**
+  - Implementado suporte inteligente no motor de cache (`crates/engine/src/cache.rs`) para detectar se a música está em um volume removível ou pendrive (ex: `/Volumes/...` no Mac ou `D:\`, `E:\` no Windows).
+  - Ao analisar uma faixa em dispositivo externo, a análise completa (waveform detalhada, BPM, beatgrid, tonalidade, loudness) e overviews são gravados diretamente na raiz do dispositivo em `openDJ/analysis/` e `openDJ/overviews/` usando hashes relativos universais.
+  - O pendrive se torna 100% plug-and-play: ao conectar o pendrive em outro Mac, PC Windows ou notebook de backup com openDJ, as faixas carregam instantaneamente com todas as formas de onda e grids pré-calculados, sem necessidade de reanálise.
+  - Gravação espelhada automática no cache local do computador e fallback seguro caso o pendrive seja somente leitura.
 - **Seletor de Formato de Transmissão (📱 9:16 Vertical vs 🖥 16:9 Horizontal):**
   - Seletor simples e intuitivo `FORMATO: [📱 9:16 (Vertical), 🖥 16:9 (Horizontal)]` no painel Battle Live.
   - Suporte completo a filmagem do DJ com celular na horizontal (landscape).

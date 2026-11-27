@@ -35,6 +35,11 @@ pub const OVERVIEW_SLICES: usize = 256;
 #[cfg(test)]
 pub(crate) static TEST_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// Where tests keep a mock external volume root, instead of the real system volumes.
+#[cfg(test)]
+pub(crate) static TEST_VOLUME_ROOT: std::sync::RwLock<Option<PathBuf>> =
+    std::sync::RwLock::new(None);
+
 /// openDJ's cache folder (`OPENDJ_CACHE` overrides it).
 pub fn cache_dir() -> Option<PathBuf> {
     #[cfg(test)]
@@ -100,6 +105,100 @@ pub fn clear_analysis() -> usize {
         .count()
 }
 
+/// If `path` is located on an external / removable volume, returns `(volume_root, relative_path)`.
+///
+/// Follows the market standard (Virtual DJ / Serato / Rekordbox) where analysis files
+/// are stored directly on the removable media so tracks never need re-analysis when
+/// taken to another computer or setup.
+pub fn external_volume(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    #[cfg(test)]
+    if let Ok(guard) = TEST_VOLUME_ROOT.read() {
+        if let Some(root) = guard.as_ref() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                return Some((root.clone(), rel.to_path_buf()));
+            }
+        }
+    }
+
+    if cfg!(windows) {
+        let mut components = path.components();
+        if let Some(std::path::Component::Prefix(prefix)) = components.next() {
+            let disk_str = prefix.as_os_str().to_string_lossy();
+            let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+            if !disk_str.to_uppercase().starts_with(&sys.to_uppercase()) {
+                let vol_root = PathBuf::from(format!("{}\\", prefix.as_os_str().to_string_lossy()));
+                let rel = path.strip_prefix(&vol_root).ok()?;
+                return Some((vol_root, rel.to_path_buf()));
+            }
+        }
+        return None;
+    }
+
+    if cfg!(target_os = "macos") {
+        if let Ok(rel) = path.strip_prefix("/Volumes") {
+            let mut it = rel.iter();
+            if let Some(vol_name) = it.next() {
+                let vol_root = Path::new("/Volumes").join(vol_name);
+                // The startup disk is usually a symlink to / or named Macintosh HD
+                if std::fs::read_link(&vol_root).is_ok_and(|target| target == Path::new("/")) {
+                    return None;
+                }
+                if let Ok(canon) = vol_root.canonicalize() {
+                    if canon == Path::new("/") {
+                        return None;
+                    }
+                }
+                let track_rel = path.strip_prefix(&vol_root).ok()?;
+                return Some((vol_root, track_rel.to_path_buf()));
+            }
+        }
+        return None;
+    }
+
+    // Linux mounts
+    for prefix in &["/media", "/run/media", "/mnt"] {
+        if let Ok(rel) = path.strip_prefix(prefix) {
+            let mut it = rel.iter();
+            if let Some(first) = it.next() {
+                let first_path = Path::new(prefix).join(first);
+                let (vol_root, track_rel) = if let Some(user) = std::env::var_os("USER") {
+                    if first == user.as_os_str() {
+                        if let Some(second) = it.next() {
+                            let r = first_path.join(second);
+                            let tr = path.strip_prefix(&r).ok()?;
+                            (r, tr.to_path_buf())
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        let tr = path.strip_prefix(&first_path).ok()?;
+                        (first_path, tr.to_path_buf())
+                    }
+                } else {
+                    let tr = path.strip_prefix(&first_path).ok()?;
+                    (first_path, tr.to_path_buf())
+                };
+                return Some((vol_root, track_rel));
+            }
+        }
+    }
+
+    None
+}
+
+fn hash_bytes(path_bytes: &[u8], len: u64, modified_nanos: u128) -> String {
+    // FNV-1a: stable across Rust versions, unlike the standard hasher.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path_bytes
+        .iter()
+        .chain(&len.to_le_bytes())
+        .chain(&modified_nanos.to_le_bytes())
+    {
+        h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 /// Where `path`'s analysis is kept, or None if the file can't be read.
 /// Where the analysis of `path` is kept, named for the file as it is now.
 pub(crate) fn entry_path(path: &Path) -> Option<PathBuf> {
@@ -113,17 +212,26 @@ fn entry(path: &Path) -> Option<PathBuf> {
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
-    // FNV-1a: stable across Rust versions, unlike the standard hasher.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    for b in path_bytes
-        .iter()
-        .chain(&meta.len().to_le_bytes())
-        .chain(&modified.to_le_bytes())
-    {
-        h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
-    }
-    Some(analysis_dir()?.join(format!("{h:016x}")))
+    let h = hash_bytes(path_bytes, meta.len(), modified);
+    Some(analysis_dir()?.join(h))
+}
+
+/// Where `path`'s analysis is kept on an external volume, if it is on one.
+/// Uses a normalized relative path so the file can be moved or opened on
+/// another computer (macOS, Windows, Linux) without re-analysis.
+pub(crate) fn external_entry(path: &Path) -> Option<PathBuf> {
+    let (vol_root, rel_path) = external_volume(path)?;
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let norm_rel = rel_path.to_string_lossy().replace('\\', "/");
+    let h = hash_bytes(norm_rel.as_bytes(), meta.len(), modified);
+    let app_folder = crate::paths::app_folder_name();
+    Some(vol_root.join(app_folder).join("analysis").join(h))
 }
 
 /// Where `path`'s analysis is kept now, to hand to [`tags_rewritten`]
@@ -289,13 +397,33 @@ fn overview_file(entry: &Path) -> Option<PathBuf> {
 /// The overview of `path` (see [`Waveform::overview`]), if it has been
 /// analysed as the file is now. Made from the stored analysis and kept
 /// the first time it is asked for, so this may take a moment once.
+/// Checks the external drive's overviews first, falling back to the local computer cache.
 pub fn overview(path: &Path) -> Option<Vec<OverviewSlice>> {
-    let file = overview_file(&entry(path)?)?;
-    if let Some(o) = fs::read(&file).ok().and_then(|d| decode_overview(&d)) {
-        return Some(o);
+    if let Some(ext) = external_entry(path) {
+        if let Some(file) = overview_file(&ext) {
+            if let Some(o) = fs::read(&file).ok().and_then(|d| decode_overview(&d)) {
+                return Some(o);
+            }
+        }
+    }
+    if let Some(local_entry) = entry(path) {
+        if let Some(file) = overview_file(&local_entry) {
+            if let Some(o) = fs::read(&file).ok().and_then(|d| decode_overview(&d)) {
+                return Some(o);
+            }
+        }
     }
     let o = load(path)?.waveform.overview(OVERVIEW_SLICES);
-    store_overview(&file, &o);
+    if let Some(ext) = external_entry(path) {
+        if let Some(file) = overview_file(&ext) {
+            store_overview(&file, &o);
+        }
+    }
+    if let Some(local_entry) = entry(path) {
+        if let Some(file) = overview_file(&local_entry) {
+            store_overview(&file, &o);
+        }
+    }
     Some(o)
 }
 
@@ -325,7 +453,19 @@ fn decode_overview(data: &[u8]) -> Option<Vec<OverviewSlice>> {
 }
 
 /// The stored analysis of `path`, if it has one for the file as it is now.
+/// Checks the removable volume first (market standard for portability),
+/// falling back to the local computer cache.
 pub fn load(path: &Path) -> Option<Analysis> {
+    if let Some(ext) = external_entry(path) {
+        if let Ok(file) = fs::File::open(&ext) {
+            let mut data = Vec::new();
+            if ZlibDecoder::new(file).read_to_end(&mut data).is_ok() {
+                if let Some(a) = decode(&data) {
+                    return Some(a);
+                }
+            }
+        }
+    }
     let file = fs::File::open(entry(path)?).ok()?;
     let mut data = Vec::new();
     ZlibDecoder::new(file).read_to_end(&mut data).ok()?;
@@ -333,14 +473,35 @@ pub fn load(path: &Path) -> Option<Analysis> {
 }
 
 /// Stores `analysis` of `path`. Failures are ignored: the cache only saves time.
+/// If the track is on an external drive, saves both to the drive's `openDJ/analysis`
+/// folder (market standard for portability) and the local system cache.
 pub fn store(path: &Path, analysis: &Analysis) {
+    let encoded = encode(analysis);
+    let overview_slices = analysis.waveform.overview(OVERVIEW_SLICES);
+
+    if let Some(ext) = external_entry(path) {
+        let write_ext = || -> std::io::Result<()> {
+            fs::create_dir_all(ext.parent().unwrap())?;
+            let tmp = ext.with_extension(format!("tmp{}", std::process::id()));
+            let mut z = ZlibEncoder::new(fs::File::create(&tmp)?, Compression::fast());
+            z.write_all(&encoded)?;
+            z.finish()?;
+            fs::rename(&tmp, &ext)
+        };
+        if let Ok(()) = write_ext() {
+            if let Some(file) = overview_file(&ext) {
+                store_overview(&file, &overview_slices);
+            }
+        }
+    }
+
     let Some(entry) = entry(path) else { return };
     let write = || -> std::io::Result<()> {
         fs::create_dir_all(entry.parent().unwrap())?;
         // Write aside and rename, so a reader never sees half an entry.
         let tmp = entry.with_extension(format!("tmp{}", std::process::id()));
         let mut z = ZlibEncoder::new(fs::File::create(&tmp)?, Compression::fast());
-        z.write_all(&encode(analysis))?;
+        z.write_all(&encoded)?;
         z.finish()?;
         fs::rename(&tmp, &entry)
     };
@@ -349,7 +510,7 @@ pub fn store(path: &Path, analysis: &Analysis) {
         return;
     }
     if let Some(file) = overview_file(&entry) {
-        store_overview(&file, &analysis.waveform.overview(OVERVIEW_SLICES));
+        store_overview(&file, &overview_slices);
     }
 }
 
@@ -548,5 +709,50 @@ mod tests {
         fs::write(&track, b"second, longer version").unwrap();
         assert_ne!(entry(&track).unwrap(), first);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn external_volume_analysis_stored_on_drive() {
+        let vol_root = std::env::temp_dir().join(format!("opendj-test-usb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&vol_root);
+        fs::create_dir_all(&vol_root).unwrap();
+
+        // Configure TEST_VOLUME_ROOT
+        *TEST_VOLUME_ROOT.write().unwrap() = Some(vol_root.clone());
+
+        let track = vol_root.join("Music").join("afro_house.wav");
+        fs::create_dir_all(track.parent().unwrap()).unwrap();
+        fs::write(&track, b"mock audio content for external volume test").unwrap();
+
+        let a = analyse(&synth::render_with(126.0, 0.2, 10.0, 1), None);
+        store(&track, &a);
+
+        // Verify that analysis file was created in vol_root/openDJ/analysis
+        let ext_entry = external_entry(&track).expect("should have external entry");
+        assert!(
+            ext_entry.is_file(),
+            "analysis must be saved on external volume: {}",
+            ext_entry.display()
+        );
+        assert!(ext_entry.starts_with(&vol_root));
+
+        // Verify overview file was created in vol_root/openDJ/overviews
+        let ovw = overview_file(&ext_entry).expect("overview path");
+        assert!(
+            ovw.is_file(),
+            "overview must be saved on external volume: {}",
+            ovw.display()
+        );
+
+        // Verify load reads it from the external volume
+        let loaded = load(&track).expect("must load from external volume");
+        assert_eq!(loaded.bpm, a.bpm);
+
+        let ovw_slices = overview(&track).expect("must get overview");
+        assert_eq!(ovw_slices.len(), OVERVIEW_SLICES);
+
+        // Reset TEST_VOLUME_ROOT and cleanup
+        *TEST_VOLUME_ROOT.write().unwrap() = None;
+        let _ = fs::remove_dir_all(&vol_root);
     }
 }
