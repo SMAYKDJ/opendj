@@ -111,9 +111,11 @@ pub(crate) struct DeckControls {
     /// Stems in the loaded track (0 without stems).
     pub(crate) stem_count: ControlHandle,
     pub(crate) stems: [StemControls; crate::stems::MAX_STEMS],
-    /// The effect sent stems go into: 1 Echo, 2 Reverb (see
-    /// [`crate::effects::STEM_FX`]).
+    /// The effect sent stems go into: 1 Echo, 2 Reverb, 3 Roll, 4 Trans
+    /// (see [`crate::effects::STEM_FX`]).
     pub(crate) stem_fx: ControlHandle,
+    /// Beats Roll and Trans repeat or chop, 1/16 to 1.
+    pub(crate) stem_fx_beats: ControlHandle,
     pub(crate) play: ControlHandle,
     /// Gapless playback: the deck (1 to 4) that starts on the very sample
     /// this deck's track ends, or 0. Cleared once it has started.
@@ -208,6 +210,9 @@ pub(crate) struct DeckControls {
     /// Jog rim ticks since the engine last looked, 720 to a turn: a pitch
     /// bend that follows how fast the rim turns. The engine zeroes it.
     pub(crate) jog_bend: ControlHandle,
+    /// Fast search steps (SHIFT + jog on openDJ's own Pioneer mappings):
+    /// each unit moves the play position by 10 ms, whether playing or not.
+    pub(crate) jog_search: ControlHandle,
     /// Fast seek speed while non-zero, in multiples of normal speed.
     pub(crate) rate_search: ControlHandle,
     /// rate_temp_up, rate_temp_down, rate_temp_up_small, rate_temp_down_small.
@@ -230,6 +235,9 @@ pub(crate) struct DeckControls {
     pub(crate) beatjump: ControlHandle,
     /// Set to N to multiply the loop length by N; the engine zeroes it.
     pub(crate) loop_scale: ControlHandle,
+    /// Not in Mixxx: a saved loop to play next, its start and end in
+    /// seconds, for `saved_loop_activate` (Prep's Loops pads).
+    pub(crate) saved_loop: [ControlHandle; 2],
     /// Moves the loop by that many beats (Mixxx's loop_move), or by that many
     /// of its own lengths (openDJ's loop_move_loops, VirtualDJ's loop_move).
     pub(crate) loop_move: [ControlHandle; 2],
@@ -255,6 +263,10 @@ pub(crate) struct DeckControls {
     /// The loaded track's beat grid is locked (Mixxx's `bpmlock`): turning
     /// it on or off locks or unlocks the grid.
     pub(crate) bpmlock: ControlHandle,
+    /// The loaded track's grid mode (openDJ's own; see
+    /// [`crate::gridfit::GridMode::id`]): setting it fits the grid again in
+    /// that mode.
+    pub(crate) beats_mode: ControlHandle,
     /// Clicks on each beat of the grid, louder on bar 1 (openDJ's own), to
     /// check the grid by ear.
     pub(crate) metronome: ControlHandle,
@@ -295,7 +307,7 @@ impl DeckControls {
         // A pad panel a controller's pad mode buttons ask the deck to show
         // (0 hot cues, 1 pad FX 1, 2 beat jump, 3 sampler, 4 stems, 5 beat
         // loop, 6 pad FX 2, 7 keyboard, 8 key shift, 9 loop roll, 10 slicer,
-        // 11 freeze); the skin shows it and sets this back to -1.
+        // 11 freeze); the skin shows it and the app sets this back to -1.
         reg.create(g, "pad_panel", -1.0, -1.0, 16.0, Behavior::Free);
         // Touching the jog's top scratches (on, as on vinyl) or only bends
         // like the rim (off, CDJ mode). Only controller mappings read it;
@@ -303,7 +315,7 @@ impl DeckControls {
         reg.create(g, "vinyl_mode", 1.0, 0.0, 1.0, Behavior::Toggle);
         // Asks the skin to open pad tab 0-7 by its place (a controller's pad
         // mode buttons: 0-3 plain, 4-7 with Shift), whatever panel it shows;
-        // the skin sets this back to -1.
+        // the app sets this back to -1 once the skin has seen it.
         reg.create(g, "pad_tab", -1.0, -1.0, 7.0, Behavior::Free);
         // The pad panel in each of the eight pad tabs (numbers as for
         // `pad_panel`), in the DDJ-FLX4's pad mode order. The skin changes
@@ -392,6 +404,7 @@ impl DeckControls {
                 crate::effects::STEM_FX.len() as f64,
                 Behavior::Free,
             ),
+            stem_fx_beats: reg.create(g, "stem_fx_beats", 0.5, 0.0625, 1.0, Behavior::Free),
             play: reg.toggle(g, "play"),
             play_next: reg.create(g, "play_next", 0.0, 0.0, 4.0, Behavior::Free),
             pfl: reg.toggle(g, "pfl"),
@@ -490,8 +503,9 @@ impl DeckControls {
             scrub_enable: reg.toggle(g, "scrub_enable"),
             scrub_position: reg.create(g, "scrub_position", 0.0, 0.0, 1.0, Behavior::Linear),
             seek_hold: reg.toggle(g, "seek_hold"),
-            jog: reg.create(g, "jog", 0.0, -1000.0, 1000.0, Behavior::Free),
-            jog_bend: reg.create(g, "jog_bend", 0.0, -1000.0, 1000.0, Behavior::Free),
+            jog: reg.create(g, "jog", 0.0, -1e6, 1e6, Behavior::Free),
+            jog_bend: reg.create(g, "jog_bend", 0.0, -1e6, 1e6, Behavior::Free),
+            jog_search: reg.create(g, "jog_search", 0.0, -1e6, 1e6, Behavior::Free),
             rate_search: reg.create(g, "rateSearch", 0.0, -300.0, 300.0, Behavior::Free),
             rate_temp: ["up", "down", "up_small", "down_small"]
                 .map(|k| reg.push(g, &format!("rate_temp_{k}"))),
@@ -513,6 +527,8 @@ impl DeckControls {
             beatjump_size: reg.create(g, "beatjump_size", 4.0, 1.0 / 32.0, 512.0, Behavior::Linear),
             beatjump: reg.create(g, "beatjump", 0.0, -512.0, 512.0, Behavior::Free),
             loop_scale: reg.create(g, "loop_scale", 0.0, 0.0, 64.0, Behavior::Free),
+            saved_loop: ["saved_loop_start", "saved_loop_end"]
+                .map(|k| reg.create(g, k, -1.0, -1.0, 36000.0, Behavior::Free)),
             loop_move: ["loop_move", "loop_move_loops"]
                 .map(|k| reg.create(g, k, 0.0, -512.0, 512.0, Behavior::Free)),
             grid_move: reg.create(g, "beats_translate_by", 0.0, -60.0, 60.0, Behavior::Free),
@@ -537,6 +553,7 @@ impl DeckControls {
             }),
             keylock: reg.toggle(g, "keylock"),
             bpmlock: reg.toggle(g, "bpmlock"),
+            beats_mode: reg.create(g, "beats_mode", 0.0, 0.0, 2.0, Behavior::Free),
             metronome: reg.toggle(g, "metronome"),
             beats_edit: reg.toggle(g, "beats_edit"),
             live_input: reg.create(
@@ -589,6 +606,8 @@ pub(crate) enum Action {
     LoopIn,
     LoopOut,
     Reloop,
+    /// Loops the saved loop in `saved_loop` and plays it.
+    SavedLoop,
     /// A tap of the deck's tempo: taps in time set the track's BPM.
     BpmTap,
     BeatJump(f64),
@@ -626,6 +645,8 @@ pub(crate) fn deck_pushes(reg: &ControlRegistry, g: &str) -> Vec<Push> {
         ("loop_in".into(), Action::LoopIn),
         ("loop_out".into(), Action::LoopOut),
         ("reloop_toggle".into(), Action::Reloop),
+        // Not in Mixxx: loops saved_loop_start to saved_loop_end and plays.
+        ("saved_loop_activate".into(), Action::SavedLoop),
         ("bpm_tap".into(), Action::BpmTap),
         ("rate_perm_up_small".into(), Action::RateStep(0.001)),
         ("rate_perm_down_small".into(), Action::RateStep(-0.001)),
@@ -669,6 +690,26 @@ pub(crate) fn deck_pushes(reg: &ControlRegistry, g: &str) -> Vec<Push> {
             Action::Grid(GridEdit::BarHere),
         ),
         ("beats_reset".into(), Action::Grid(GridEdit::Reset)),
+        // Not in Mixxx: no grid at all, for a track with no steady beat.
+        ("beats_clear".into(), Action::Grid(GridEdit::Clear)),
+        // Not in Mixxx: bar 1 a beat either way, and moving a tempo
+        // change (anchor) a little either way.
+        (
+            "beats_downbeat_earlier".into(),
+            Action::Grid(GridEdit::ShiftBar(-1)),
+        ),
+        (
+            "beats_downbeat_later".into(),
+            Action::Grid(GridEdit::ShiftBar(1)),
+        ),
+        (
+            "beats_anchor_earlier".into(),
+            Action::Grid(GridEdit::MoveAnchor(-0.005)),
+        ),
+        (
+            "beats_anchor_later".into(),
+            Action::Grid(GridEdit::MoveAnchor(0.005)),
+        ),
         // Not in Mixxx: tempo sections and halving or doubling.
         (
             "beats_section_add".into(),
@@ -769,6 +810,13 @@ pub(crate) struct MasterControls {
     /// headphones and takes the other decks out of the cue. On to start;
     /// automix loads leave the cue alone.
     pub(crate) pfl_on_load: ControlHandle,
+    /// `[Controls] bpm_match_on_load`: a track loaded while another deck
+    /// plays takes that deck's tempo (or half or double it), as sync would,
+    /// without syncing. Off to start.
+    pub(crate) bpm_match_on_load: ControlHandle,
+    /// `[Controls] sync_on_play`: pressing PLAY on a deck that isn't synced
+    /// lines it up with the deck it would sync to, once. Off to start.
+    pub(crate) sync_on_play: ControlHandle,
     /// `[Master] test_tone`: beeps for checking the outputs, 1 in the
     /// master mix, 2 in the headphones, 0 off. The guided tour plays it.
     pub(crate) test_tone: ControlHandle,
@@ -910,6 +958,8 @@ pub(crate) fn create_global_controls(reg: &ControlRegistry) -> MasterControls {
             c.set_bool(true);
             c
         },
+        bpm_match_on_load: reg.toggle("[Controls]", "bpm_match_on_load"),
+        sync_on_play: reg.toggle("[Controls]", "sync_on_play"),
     }
 }
 
@@ -933,7 +983,9 @@ pub(crate) fn alias(
 }
 
 /// Detects presses of a momentary control. Also catches a press and release that
-/// both happened between two ticks, which a plain "was it down" check would miss.
+/// both happened between two ticks, which a plain "was it down" check would miss,
+/// and a press while still down (a write of 1 over 1, which counts as a release
+/// and a press).
 #[derive(Default, Clone, Copy)]
 pub(crate) struct Edge {
     down: bool,
@@ -944,9 +996,35 @@ impl Edge {
     pub(crate) fn pressed(&mut self, c: &ControlHandle) -> bool {
         let (down, version) = (c.get_bool(), c.version());
         let changes = version.wrapping_sub(self.version);
-        let pressed = (down && !self.down) || (!down && changes >= 2);
+        let pressed = (down && !self.down) || changes >= 2;
         self.down = down;
         self.version = version;
         pressed
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    #[test]
+    fn edge_sees_a_press_while_still_down() {
+        let reg = ControlRegistry::new();
+        let c = reg.push("[Channel1]", "beatsync");
+        let mut edge = Edge::default();
+        assert!(!edge.pressed(&c));
+        c.set(1.0);
+        assert!(edge.pressed(&c));
+        assert!(!edge.pressed(&c), "held is one press");
+        // Released and pressed again between two ticks.
+        c.set(0.0);
+        c.set(1.0);
+        assert!(edge.pressed(&c));
+        // Pressed and released between two ticks.
+        c.set(0.0);
+        assert!(!edge.pressed(&c));
+        c.set(1.0);
+        c.set(0.0);
+        assert!(edge.pressed(&c));
     }
 }

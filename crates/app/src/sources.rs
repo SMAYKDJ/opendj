@@ -64,6 +64,18 @@ pub fn source_plugins() -> Vec<(Box<dyn Plugin>, SourceInfo)> {
         .collect()
 }
 
+/// The names of add-on sources that stay out of the rail (see
+/// [`SearchSource::in_rail`]).
+pub fn off_rail_sources() -> Vec<String> {
+    source_plugins()
+        .into_iter()
+        .filter_map(|(mut p, info)| {
+            let off = p.source().is_some_and(|s| !s.in_rail());
+            off.then(|| info.name.to_string())
+        })
+        .collect()
+}
+
 enum Request {
     Start(u64, SourceQuery),
     Stop(u64),
@@ -82,6 +94,70 @@ enum Request {
     StopPreview,
     /// The DJ changed the plugin's settings.
     Configure(PluginConfig),
+    /// A question for the add-on browsing a service's catalog for the
+    /// app's own source (see [`SearchSource::browse`]), and where to answer.
+    Browse(serde_json::Value, Sender<Result<serde_json::Value, String>>),
+}
+
+/// A streamed track to fetch through the add-on that plays its service's
+/// tracks: where it stands, what it is, and the deck it loads onto (none to
+/// only download it).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StreamPlay {
+    pub link: String,
+    pub title: String,
+    pub artist: String,
+    /// The service ("tidal") and its id for the track, to put the file in
+    /// place of the track in lists it stands in.
+    pub service: String,
+    pub stream_id: String,
+    pub deck: Option<usize>,
+}
+
+/// How fetching a [`StreamPlay`] goes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FetchState {
+    /// What's happening, and from 0 to 1 how far along.
+    Fetching(String, f32),
+    /// The file, in the collection.
+    Done(PathBuf),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayUpdate {
+    pub play: StreamPlay,
+    pub state: FetchState,
+}
+
+/// A streamed track being fetched: its search, and once found the file's
+/// key.
+struct Fetching {
+    play: StreamPlay,
+    s: usize,
+    local: u64,
+    key: Option<String>,
+    told: Option<FetchState>,
+}
+
+/// The way to an add-on that browses a streaming service's catalog for the
+/// app's own source of that service (see [`SearchSource::catalog`]).
+#[derive(Clone)]
+pub struct Catalog {
+    requests: Sender<Request>,
+}
+
+impl Catalog {
+    /// Asks the add-on, waiting for its answer (see
+    /// [`SearchSource::browse`] for the questions).
+    pub fn ask(&self, ask: serde_json::Value) -> Result<serde_json::Value, String> {
+        let (tx, rx) = channel();
+        self.requests
+            .send(Request::Browse(ask, tx))
+            .map_err(|_| "The add-on stopped.".to_string())?;
+        rx.recv_timeout(Duration::from_secs(120))
+            .map_err(|_| "The add-on didn't answer.".to_string())?
+    }
 }
 
 enum Event {
@@ -137,6 +213,13 @@ fn run(
         };
         match rx.recv_timeout(wait) {
             Ok(Request::Configure(config)) => plugin.configure(&config),
+            Ok(Request::Browse(ask, reply)) => {
+                let answer = match plugin.source() {
+                    Some(source) => source.browse(&ask).map_err(|e| e.to_string()),
+                    None => Err("Not a source.".into()),
+                };
+                let _ = reply.send(answer);
+            }
             Ok(Request::Keep(key, from, to)) => {
                 let progress = match keep(&from, &to) {
                     Ok(()) => {
@@ -348,7 +431,7 @@ fn handle(
                 }
             }
         }
-        Request::Configure(_) | Request::Keep(..) => None,
+        Request::Configure(_) | Request::Keep(..) | Request::Browse(..) => None,
         Request::Preview(..) | Request::StopPreview => None,
         Request::Cancel(key) => {
             if let Err(e) = source.cancel(&key) {
@@ -472,6 +555,8 @@ struct Source {
     /// Its files can be heard before they're downloaded (see
     /// [`SearchSource::previews`]).
     previews: bool,
+    /// The service whose catalog it browses (see [`SearchSource::catalog`]).
+    catalog: Option<&'static str>,
 }
 
 impl Source {
@@ -633,6 +718,9 @@ pub struct Sources {
     loads: Vec<PathBuf>,
     /// Files to load once they're in the cache, by source and key.
     play_after: HashSet<(usize, String)>,
+    /// Streamed tracks being fetched to play (see [`Self::play_link`]).
+    fetching: Vec<Fetching>,
+    play_updates: Vec<PlayUpdate>,
     /// The file being heard before it's downloaded, if any.
     preview: Option<Preview>,
     /// What the frame loop should tell the preview player.
@@ -675,6 +763,7 @@ impl Sources {
                 let sites = plugin.source().map(|s| s.sites()).unwrap_or_default();
                 let plays = plugin.source().is_some_and(|s| s.plays());
                 let previews = plugin.source().is_some_and(|s| s.previews());
+                let catalog = plugin.source().and_then(|s| s.catalog());
                 let cache = plays.then(|| cache_dir(info.name)).flatten();
                 let settings = plugin.settings();
                 let (requests, rx) = channel();
@@ -694,6 +783,7 @@ impl Sources {
                     settings,
                     status: None,
                     previews,
+                    catalog,
                 }
             })
             .collect();
@@ -734,6 +824,8 @@ impl Sources {
             setup_status: String::new(),
             loads: Vec::new(),
             play_after: HashSet::new(),
+            fetching: Vec::new(),
+            play_updates: Vec::new(),
             preview: None,
             preview_actions: Vec::new(),
         };
@@ -1008,6 +1100,7 @@ impl Sources {
         for s in finished {
             self.sources[s].save_results();
         }
+        self.follow_fetches();
         if changed {
             for s in 0..self.sources.len() {
                 for i in 0..self.sources[s].searches.len() {
@@ -1101,6 +1194,152 @@ impl Sources {
         let Some(Row::Item(key)) = self.rows.get(row).cloned() else {
             return;
         };
+        self.play(s, i, key);
+    }
+
+    /// The add-on that browses `service`'s catalog, if one does.
+    pub fn catalog(&self, service: &str) -> Option<Catalog> {
+        self.sources
+            .iter()
+            .find(|s| s.catalog == Some(service))
+            .map(|s| Catalog {
+                requests: s.requests.clone(),
+            })
+    }
+
+    /// The sites whose links a source that plays takes: a streamed track
+    /// from one of them can load onto a deck through it.
+    pub fn playing_sites(&self) -> Vec<&'static str> {
+        self.sources
+            .iter()
+            .filter(|s| s.cache.is_some())
+            .flat_map(|s| s.sites.iter().copied())
+            .collect()
+    }
+
+    /// Fetches a streamed track through the source that plays links from
+    /// its site, into the collection (it lands in the Inbox): searches the
+    /// link (once), then downloads the first file found. How it goes comes
+    /// back from [`Self::take_play_updates`]. Returns the source's name, if
+    /// one takes it.
+    pub fn play_link(&mut self, play: StreamPlay) -> Option<&'static str> {
+        let host = link_host(&play.link)?;
+        let s = self
+            .sources
+            .iter()
+            .position(|x| x.cache.is_some() && x.sites.contains(&host))?;
+        let name = self.sources[s].info.name;
+        let earlier = self.sources[s]
+            .searches
+            .iter()
+            .position(|x| x.query.text == play.link && x.error.is_none());
+        let i = match earlier {
+            Some(i) => i,
+            None => {
+                let query = SourceQuery {
+                    text: play.link.clone(),
+                    kind: QueryKind::Track,
+                    ..Default::default()
+                };
+                let i = self.start(s, query, now(), false);
+                self.sources[s].save();
+                i
+            }
+        };
+        let local = self.sources[s].searches[i].local;
+        self.fetching.push(Fetching {
+            play,
+            s,
+            local,
+            key: None,
+            told: None,
+        });
+        self.follow_fetches();
+        self.refresh();
+        Some(name)
+    }
+
+    /// How fetches of streamed tracks went since last asked.
+    pub fn take_play_updates(&mut self) -> Vec<PlayUpdate> {
+        std::mem::take(&mut self.play_updates)
+    }
+
+    /// Moves each streamed track being fetched along: downloads the first
+    /// file its search found, and tells how the download is going.
+    fn follow_fetches(&mut self) {
+        let mut keep = Vec::new();
+        for mut f in std::mem::take(&mut self.fetching) {
+            let Some(i) = self.sources[f.s]
+                .searches
+                .iter()
+                .position(|x| x.local == f.local)
+            else {
+                self.tell(&f, FetchState::Failed("The search went away.".into()));
+                continue;
+            };
+            if f.key.is_none() {
+                let search = &self.sources[f.s].searches[i];
+                match search.items.iter().find(|x| !x.folder) {
+                    Some(found) => {
+                        let key = found.key.clone();
+                        f.key = Some(key.clone());
+                        self.download_in(f.s, i, vec![key]);
+                    }
+                    None if search.done => {
+                        let why = search
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Couldn't find it to download.".into());
+                        self.tell(&f, FetchState::Failed(why));
+                        continue;
+                    }
+                    None => {
+                        self.tell_once(&mut f, FetchState::Fetching("Finding it…".into(), 0.0));
+                        keep.push(f);
+                        continue;
+                    }
+                }
+            }
+            let key = f.key.clone().unwrap_or_default();
+            let progress = self.sources[f.s].download(&key).map(|d| d.progress.clone());
+            match progress {
+                Some(Progress::Done(paths)) => match paths.into_iter().next() {
+                    Some(path) => self.tell(&f, FetchState::Done(path)),
+                    None => self.tell(&f, FetchState::Failed("Nothing came down.".into())),
+                },
+                Some(Progress::Failed(why)) => self.tell(&f, FetchState::Failed(why)),
+                Some(Progress::Running(p)) => {
+                    let note = format!("Downloading {:.0}%", p * 100.0);
+                    self.tell_once(&mut f, FetchState::Fetching(note, p));
+                    keep.push(f);
+                }
+                _ => {
+                    self.tell_once(&mut f, FetchState::Fetching("Downloading…".into(), 0.0));
+                    keep.push(f);
+                }
+            }
+        }
+        self.fetching = keep;
+    }
+
+    fn tell(&mut self, f: &Fetching, state: FetchState) {
+        self.play_updates.push(PlayUpdate {
+            play: f.play.clone(),
+            state,
+        });
+    }
+
+    /// Tells `state` unless it was the last told.
+    fn tell_once(&mut self, f: &mut Fetching, state: FetchState) {
+        if f.told.as_ref() != Some(&state) {
+            f.told = Some(state.clone());
+            self.tell(f, state);
+        }
+    }
+
+    /// Loads file `key` of search `i` of source `s` from the cache,
+    /// fetching it there first if it isn't yet.
+    fn play(&mut self, s: usize, i: usize, key: String) {
         let source = &self.sources[s];
         let Some(found) = source.searches[i].find(&key) else {
             return;
@@ -1933,6 +2172,9 @@ impl Sources {
             row.to_cache = d.cache;
             if is_active(&d.progress) {
                 row.going = d.note.clone().into();
+            } else if matches!(d.progress, Progress::Done(_)) && !d.note.is_empty() {
+                // What the source actually sent, in place of the search's guess.
+                row.quality = d.note.clone().into();
             }
             list.push(row);
         }
@@ -2123,6 +2365,13 @@ pub fn needs_setup(settings: &[Setting], config: &PluginConfig) -> bool {
 
 /// Where playing sources keep their caches: `sources` in the app's cache
 /// folder, one folder per source.
+/// The host of a link, e.g. "tidal.com" for "https://tidal.com/browse/track/1".
+fn link_host(link: &str) -> Option<&str> {
+    let rest = link.split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then_some(host)
+}
+
 fn caches_root() -> Option<PathBuf> {
     opendj_engine::cache::cache_dir().map(|d| d.join("sources"))
 }
@@ -2613,6 +2862,7 @@ mod tests {
             settings: Vec::new(),
             status: None,
             previews: false,
+            catalog: None,
         };
         let progress = |key: &str, progress| Download {
             key: key.into(),
@@ -2645,6 +2895,20 @@ mod tests {
     }
 
     #[test]
+    fn links_name_their_site() {
+        assert_eq!(
+            link_host("https://tidal.com/browse/track/1"),
+            Some("tidal.com")
+        );
+        assert_eq!(
+            link_host("https://open.spotify.com/track/x?si=1"),
+            Some("open.spotify.com")
+        );
+        assert_eq!(link_host("tidal.com/browse/track/1"), None);
+        assert_eq!(link_host(""), None);
+    }
+
+    #[test]
     fn removed_downloads_are_not_picked_again() {
         let (requests, _rx) = channel();
         let mut source = Source {
@@ -2669,6 +2933,7 @@ mod tests {
             settings: Vec::new(),
             status: None,
             previews: false,
+            catalog: None,
         };
         assert_eq!(auto_picks(&source, &source.searches[0]), ["a", "c"]);
         // The DJ took Kerala's download off the list: it stays off, and

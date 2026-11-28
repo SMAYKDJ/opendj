@@ -58,6 +58,16 @@
         return callback;
     };
 
+    const startTimer = function(interval, callback, oneShot, floor) {
+        const fn = typeof callback === "string" ? new Function(callback) : callback;
+        if (typeof fn !== "function") {
+            throw new Error("Invalid timer callback provided to engine.beginTimer");
+        }
+        const id = native.timerStart(Math.max(floor, Number(interval) || 0), !!oneShot, floor);
+        timers.set(id, {fn, oneShot: !!oneShot});
+        return id;
+    };
+
     globalThis.engine = {
         getValue: (group, name) => native.get(String(group), String(name)),
         setValue(group, name, value) {
@@ -104,13 +114,32 @@
         trigger: (group, name) => native.trigger(String(group), String(name)),
         log: message => native.log(String(message)),
         beginTimer(interval, callback, oneShot) {
-            const fn = typeof callback === "string" ? new Function(callback) : callback;
-            if (typeof fn !== "function") {
-                throw new Error("Invalid timer callback provided to engine.beginTimer");
-            }
-            const id = native.timerStart(Math.max(20, Number(interval) || 0), !!oneShot);
-            timers.set(id, {fn, oneShot: !!oneShot});
-            return id;
+            return startTimer(interval, callback, oneShot, 20);
+        },
+        // openDJ: like beginTimer, down to 5 ms rather than 20, for screens
+        // that want a steady stream (the DDJ-FLX10's jog screens).
+        beginFastTimer(interval, callback, oneShot) {
+            return startTimer(interval, callback, oneShot, 5);
+        },
+        // openDJ: the waveform of the track on `group`'s deck, `perSecond`
+        // entries a second, as a Uint8Array of four bytes an entry: the
+        // peak of the low, mid and high bands and of the whole signal, each
+        // 0 to 255 on a square-root scale. Empty with no track, or before
+        // its analysis has started; shorter than the track while it runs.
+        getWaveform(group, perSecond) {
+            return new Uint8Array(native.waveform(String(group), Number(perSecond) || 150));
+        },
+        // openDJ: the cover art of the track on `group`'s deck as a JPEG
+        // about `size` pixels square (16 to 480), as a Uint8Array; empty with
+        // no track or no art.
+        getCoverArt(group, size) {
+            return new Uint8Array(native.cover(String(group), Number(size) || 240));
+        },
+        // openDJ: words the app shares for screens, such as
+        // getText("[Instrument1]", "name"); empty when there are none (see
+        // crates/controllers/src/texts.rs for the keys).
+        getText(group, key) {
+            return String(native.text(String(group), String(key)));
         },
         stopTimer(id) {
             if (timers.delete(id)) {
@@ -127,8 +156,12 @@
                 Number(alpha) || 0, Number(beta) || 0, ramp === undefined ? true : !!ramp);
         },
         scratchTick: (deck, interval) => native.scratchTick(Number(deck), Number(interval)),
-        scratchDisable: (deck, ramp) => native.scratchDisable(Number(deck), ramp === undefined ? true : !!ramp),
+        // openDJ: followWheel defers the release ramp while a let-go platter still sends ticks.
+        scratchDisable: (deck, ramp, followWheel) =>
+            native.scratchDisable(Number(deck), ramp === undefined ? true : !!ramp, !!followWheel),
         isScratching: deck => native.isScratching(Number(deck)),
+        // openDJ: the scratch can still accept movement after touch release.
+        isScratchCoasting: deck => native.isScratchCoasting(Number(deck)),
         brake: (deck, activate, factor, rate) =>
             native.ramp(Number(deck), "brake", !!activate, factor === undefined ? 1 : Number(factor),
                 rate === undefined ? 1 : Number(rate)),
@@ -186,6 +219,11 @@
                 native.hidSendFeature(Number(reportID) & 0xFF, bytesOf(data)),
             getFeatureReport: reportID =>
                 new Uint8Array(native.hidGetFeature(Number(reportID) & 0xFF)).buffer,
+            // openDJ: to the MIDI port of a keyboard whose HID side this
+            // mapping runs (`keys="midi"`).
+            sendShortMsg(status, byte1, byte2) {
+                native.send([status & 0xFF, byte1 & 0xFF, byte2 & 0xFF]);
+            },
         };
     }
     // openDJ: makes note `from` on MIDI channel `channel` (0-15) act as note

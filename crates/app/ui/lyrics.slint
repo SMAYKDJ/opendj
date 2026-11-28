@@ -4,6 +4,7 @@
 // and a click on a line plays from there. Find looks the track up on
 // LRCLIB. PlayerLyrics shows the same lyrics large in Player mode.
 import { Theme } from "theme.slint";
+import { MenuTitle } from "pills.slint";
 import { WaveLook } from "wave_look.slint";
 import { ListView } from "scroll.slint";
 
@@ -130,7 +131,7 @@ export global WaveLyrics {
 export component LyricsLane inherits Rectangle {
     in property <[WaveLine]> lines;
     // The vocals' cyan, as Vocals › Bar draws them.
-    property <color> cyan: #3FD4EE;
+    property <color> cyan: Theme.f-3fd4ee;
     // Seconds into the track at the playhead, and seconds across the width.
     in property <float> now;
     in property <float> visible-seconds: 10;
@@ -185,7 +186,7 @@ export component LyricsLane inherits Rectangle {
     }
 }
 
-component SmallButton inherits Rectangle {
+export component SmallButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary;
     callback clicked();
@@ -338,23 +339,24 @@ export component LyricsPanel inherits Rectangle {
                     y: parent.height + 2px;
                     width: 150px;
                     Rectangle {
-                        background: Theme.panel-raised;
-                        border-radius: Theme.radius;
+                        background: Theme.pill-list;
+                        border-radius: 9px;
                         border-width: 1px;
                         border-color: Theme.border;
-                        drop-shadow-blur: 12px;
+                        drop-shadow-blur: 14px;
                         drop-shadow-color: Theme.s-000000a0;
                     }
                     VerticalLayout {
                         padding: 6px;
+                        MenuTitle { text: "Show"; }
                         for s[i] in ["Playing track", "Selected track", "Deck A", "Deck B"]: Rectangle {
                             height: 26px;
-                            border-radius: 4px;
-                            background: sta.has-hover ? Theme.n-3a3a3d : transparent;
+                            background: sta.has-hover ? Theme.n-38373d : i == LyricsUi.subject ? Theme.n-313036 : transparent;
+                            border-radius: 6px;
                             Text {
                                 x: 10px;
                                 text: s;
-                                color: i == LyricsUi.subject ? Theme.lilac-text : Theme.text;
+                                color: sta.has-hover ? Theme.menu-hover-text : Theme.menu-current-text;
                                 font-size: 13px;
                                 vertical-alignment: center;
                             }
@@ -530,6 +532,8 @@ export component PlayerLyrics inherits Rectangle {
     // its left edge.
     in property <bool> back: true;
     in property <length> inset: 48px;
+    // Its own Karaoke Screen button; Now Playing has one for both views.
+    in property <bool> screen-button: true;
     background: back ? Theme.browser : transparent;
     if back: Rectangle { background: @linear-gradient(180deg, Theme.accent.with-alpha(0.12) 0%, Theme.browser.with-alpha(0) 70%); }
     function follow() {
@@ -617,7 +621,7 @@ export component PlayerLyrics inherits Rectangle {
         }
     }
     // Opens the karaoke screen for a second display.
-    SmallButton {
+    if screen-button: SmallButton {
         x: parent.width - self.width - 16px;
         y: 12px;
         text: LyricsUi.karaoke ? "Close Karaoke" : "Karaoke Screen";

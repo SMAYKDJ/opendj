@@ -77,7 +77,8 @@ pub struct Controllers {
     shared: Arc<Shared>,
     mappings: Vec<(String, PathBuf)>,
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    /// The device thread, until [`Controllers::shut_down`].
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Where notes from MIDI keyboards go: the instrument plugin. Called on the
@@ -110,6 +111,15 @@ struct Shared {
     /// The HID controllers plugged in, by port name: the name of the
     /// mapping Automatic picks for each.
     hid_ports: Mutex<HashMap<String, String>>,
+    /// The MIDI ports of keyboards whose knobs and buttons run over HID
+    /// (`keys="midi"`), with their HID side's port: only their keys, strips
+    /// and pedals play the instrument. Their other controllers (the knobs,
+    /// in the keyboard's own MIDI mode) go to the HID mapping's script
+    /// instead, through `twin_midi`.
+    keys_only: Mutex<Vec<(String, String)>>,
+    /// Controllers from a keys-only MIDI port waiting for its HID mapping,
+    /// by HID port.
+    twin_midi: Arc<Mutex<HashMap<String, Vec<[u8; 3]>>>>,
     /// Why a device couldn't be opened, by port name.
     problems: Mutex<HashMap<String, String>>,
 }
@@ -151,7 +161,7 @@ impl Controllers {
             shared,
             mappings,
             stop,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
         }
     }
 
@@ -323,12 +333,45 @@ fn monitor(port: &str, msg: &[u8]) {
     }
 }
 
-impl Drop for Controllers {
-    fn drop(&mut self) {
+impl Controllers {
+    /// Disconnects every device and waits for their threads: each mapping
+    /// runs its shutdown (lights off) and its MIDI ports close while the
+    /// threads are alive. For quitting, when the app may still hold the
+    /// controllers; dropping them does the same.
+    pub fn shut_down(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
+        let thread = self.thread.lock().unwrap().take();
+        if let Some(t) = thread {
             let _ = t.join();
         }
+    }
+
+    /// As [`Controllers::shut_down`], waiting at most `limit`; whether the
+    /// threads finished. The device thread asks the system for its MIDI
+    /// ports every second, and a MIDI service that stops answering (seen
+    /// with Windows MIDI Services) holds it inside that call for good: it
+    /// is then left behind rather than waited for.
+    pub fn shut_down_within(&self, limit: Duration) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        let Some(thread) = self.thread.lock().unwrap().take() else {
+            return true;
+        };
+        let until = Instant::now() + limit;
+        while !thread.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for Controllers {
+    fn drop(&mut self) {
+        self.shut_down();
     }
 }
 
@@ -353,30 +396,67 @@ fn tokens(name: &str) -> Vec<String> {
     joined
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
-        .filter(|t| !matches!(*t, "midi" | "port" | "in" | "out" | "usb" | "and"))
+        .filter(|t| {
+            !matches!(
+                *t,
+                "midi" | "port" | "in" | "out" | "usb" | "bluetooth" | "and"
+            )
+        })
         .filter(|t| !t.chars().all(|c| c.is_ascii_digit()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Model numbers standing on their own in a name ("DJControl Inpulse 300" →
+/// "300"). [`tokens`] drops bare numbers as port numbers, so these only
+/// break ties: three digits or more, which port numbers on macOS and Windows
+/// never are.
+fn model_numbers(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3 && t.chars().all(|c| c.is_ascii_digit()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every number standing on its own in a name ("Beatmix 2/4" → "2", "4").
+fn bare_numbers(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
         .map(str::to_string)
         .collect()
 }
 
 /// The mapping for a MIDI port: every word of the port's name must appear in
 /// the mapping's name ("DDJ-FLX4" → "Pioneer DDJ-FLX4", "XONE:K2" →
-/// "Allen&Heath Xone K1/K2/K3"); among those, the most specific name wins.
+/// "Allen&Heath Xone K1/K2/K3"); among those, one whose model numbers are
+/// all in the port's name comes first ("DJControl Inpulse 300" → "Hercules
+/// DJControl Inpulse 300", not "… 200"), then the most specific name.
 pub fn match_mapping<'a>(port: &str, mappings: &'a [(String, PathBuf)]) -> Option<&'a Path> {
     let port_tokens = tokens(port);
     if port_tokens.is_empty() {
         return None;
     }
+    let port_numbers = model_numbers(port);
     mappings
         .iter()
         .filter_map(|(name, path)| {
             let m = tokens(name);
+            let missing = model_numbers(name)
+                .iter()
+                .filter(|n| !port_numbers.contains(n))
+                .count();
+            // A bare number in both names ("Beatmix 2" → "Beatmix 2/4")
+            // only breaks ties between names that fit otherwise.
+            let shared = bare_numbers(port)
+                .iter()
+                .filter(|n| bare_numbers(name).contains(n))
+                .count();
             port_tokens
                 .iter()
                 .all(|t| m.contains(t))
-                .then_some((m.len(), path))
+                .then_some(((missing, usize::MAX - shared, m.len()), path))
         })
-        .min_by_key(|(extra, _)| *extra)
+        .min_by_key(|(rank, _)| *rank)
         .map(|(_, p)| p.as_path())
 }
 
@@ -397,30 +477,70 @@ pub fn list_mappings(dir: &Path) -> Vec<(String, PathBuf)> {
 
 /// The HID controllers plugged in, each with a port name of its own and the
 /// mapping Automatic picks: the device's name for itself, or the mapping's,
-/// numbered if two are alike.
-fn hid_ports(
+/// numbered if two are alike. A device that is also a MIDI port running a
+/// MIDI mapping (the DDJ-FLX10, whose jog screens are HID) takes the HID
+/// mapping's name, so the two are told apart and each can be turned off.
+fn hid_ports<'a>(
     devices: Vec<hid::DeviceInfo>,
-    mappings: &[hid::HidMapping],
-) -> Vec<(String, hid::DeviceInfo, &hid::HidMapping)> {
+    mappings: &'a [hid::HidMapping],
+    midi_ports: &[String],
+) -> Vec<(String, hid::DeviceInfo, &'a hid::HidMapping)> {
     let mut out: Vec<(String, hid::DeviceInfo, &hid::HidMapping)> = Vec::new();
     for d in devices {
         let Some(m) = hid::match_mapping(&d, mappings) else {
             continue;
         };
-        let base = if d.product.is_empty() {
+        let midi_twin = midi_ports
+            .iter()
+            .any(|p| *p == d.product || device_key(p) == device_key(&d.product));
+        // A keyboard whose keys play over its own MIDI port (`keys="midi"`)
+        // names its HID side after the mapping, so the two never share a
+        // name and the MIDI port stays free to play instruments.
+        let keys = m.2.iter().any(|p| p.keys);
+        let base = if d.product.is_empty() || midi_twin || keys {
             m.0.clone()
         } else {
             d.product.clone()
         };
         let mut name = base.clone();
         let mut n = 1;
-        while out.iter().any(|(p, _, _)| *p == name) {
+        while out.iter().any(|(p, _, _)| *p == name) || midi_ports.contains(&name) {
             n += 1;
             name = format!("{base} #{n}");
         }
         out.push((name, d, m));
     }
     out
+}
+
+/// The MIDI ports of `found` keyboards whose mapping says their keys play
+/// over MIDI (`keys="midi"`), each with its HID side's port.
+fn keys_only(
+    midi_ports: &[String],
+    found: &[(String, hid::DeviceInfo, &hid::HidMapping)],
+) -> Vec<(String, String)> {
+    midi_ports
+        .iter()
+        .filter_map(|p| {
+            found
+                .iter()
+                .find(|(_, d, m)| {
+                    m.2.iter().any(|product| product.keys)
+                        && !d.product.is_empty()
+                        && (*p == d.product || device_key(p) == device_key(&d.product))
+                })
+                .map(|(hid_port, _, _)| (p.clone(), hid_port.clone()))
+        })
+        .collect()
+}
+
+/// Controllers a keyboard's keys side still plays when its knobs run over
+/// HID: mod wheel, breath, expression, sustain, sostenuto and soft pedals.
+const KEYS_ONLY_CONTROLLERS: [u8; 6] = [1, 2, 11, 64, 66, 67];
+
+/// Whether `data` from a keys-only port (see [`Shared::keys_only`]) plays.
+fn keys_only_plays(data: [u8; 3]) -> bool {
+    data[0] & 0xF0 != 0xB0 || KEYS_ONLY_CONTROLLERS.contains(&data[1])
 }
 
 /// The HID mapping file `port` should run, given the choices: the one
@@ -563,16 +683,21 @@ fn watch_devices(
                 .filter(|n| !n.contains(CLIENT) && !n.contains("Midi Through"))
                 .collect();
             ports.extend(stand_ins.iter().map(|s| s.name.clone()));
-            let found = match hid_api.as_mut() {
-                Some(h) => hid_ports(h.scan(&hid_vendors), &hid_mappings),
-                None => Vec::new(),
-            };
             let mut picked: Vec<(String, Option<PathBuf>)> = {
                 let choices = shared.choices.lock().unwrap();
                 ports
                     .iter()
                     .map(|p| (p.clone(), pick_mapping(p, &dir, &mappings, &choices)))
                     .collect()
+            };
+            let mapped: Vec<String> = picked
+                .iter()
+                .filter(|(_, m)| m.is_some())
+                .map(|(p, _)| p.clone())
+                .collect();
+            let found = match hid_api.as_mut() {
+                Some(h) => hid_ports(h.scan(&hid_vendors), &hid_mappings, &mapped),
+                None => Vec::new(),
             };
             {
                 let choices = shared.choices.lock().unwrap();
@@ -582,6 +707,14 @@ fn watch_devices(
                         .map(|(p, _, m)| (p.clone(), pick_hid_mapping(p, &m.1, &dir, &choices))),
                 );
             }
+            // Only while the HID mapping runs (as of the last scan): if it
+            // can't open, the knobs' own controllers are all there is.
+            let running: Vec<_> = found
+                .iter()
+                .filter(|(p, _, _)| devices.get(p).is_some_and(|d| !d.thread.is_finished()))
+                .cloned()
+                .collect();
+            *shared.keys_only.lock().unwrap() = keys_only(&ports, &running);
             *shared.hid_ports.lock().unwrap() = found
                 .iter()
                 .map(|(p, _, m)| (p.clone(), m.0.clone()))
@@ -653,18 +786,29 @@ fn watch_devices(
                         }
                     };
                     let d_stop = Arc::new(AtomicBool::new(false));
+                    let agent = crate::ni_agent::needs_agent(info.vendor_id, info.product_id)
+                        .then(|| (info.product_id, info.serial.clone()));
                     let thread = {
-                        let (registry, path, port, d_stop, connected) = (
+                        let (registry, path, port, d_stop, connected, twin) = (
                             registry.clone(),
                             path.clone(),
                             port.clone(),
                             d_stop.clone(),
                             connected.clone(),
+                            shared.clone(),
                         );
                         std::thread::Builder::new()
                             .name(format!("hid {port}"))
                             .spawn(move || {
-                                run_hid(&port, &path, device, registry, &d_stop, &connected)
+                                // Held while the mapping runs.
+                                let _agent = agent.map(|(product, serial)| {
+                                    crate::ni_agent::Registration::start(
+                                        product,
+                                        serial,
+                                        port.clone(),
+                                    )
+                                });
+                                run_hid(&port, &path, device, registry, &d_stop, &connected, &twin)
                             })
                             .expect("spawn controller thread")
                     };
@@ -860,6 +1004,24 @@ fn run_keyboard(
             let Some(data) = channel_message(msg) else {
                 return;
             };
+            if data[0] & 0xF0 == 0xB0 && !keys_only_plays(data) {
+                let hid = shared_in
+                    .keys_only
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(midi, _)| *midi == name)
+                    .map(|(_, hid)| hid.clone());
+                if let Some(hid) = hid {
+                    let mut waiting = shared_in.twin_midi.lock().unwrap();
+                    let queue = waiting.entry(hid).or_default();
+                    // Nobody reading: don't grow without end.
+                    if queue.len() < 1024 {
+                        queue.push(data);
+                    }
+                    return;
+                }
+            }
             let note_on = data[0] & 0xF0 == 0x90 && data[2] > 0;
             // Pinned to a deck without the instrument: nothing reaches it,
             // but note offs still do so no note is left hanging.
@@ -900,11 +1062,11 @@ fn channel_message(msg: &[u8]) -> Option<[u8; 3]> {
     Some([status, msg[1], if len == 3 { msg[2] } else { 0 }])
 }
 
-/// Waits `time` on the device thread. On macOS the thread's run loop runs
+/// Waits `time` on the device thread. On macOS and iPadOS the thread's run loop runs
 /// meanwhile: CoreMIDI tells this process about devices plugged in or out
 /// through the run loop of the thread that opened MIDI first, and without it
 /// the device list stays as it was at start.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn wait_for_system(time: Duration) {
     use std::ffi::c_void;
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -922,7 +1084,7 @@ fn wait_for_system(time: Duration) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn wait_for_system(time: Duration) {
     std::thread::sleep(time);
 }
@@ -967,28 +1129,31 @@ fn run_device(
             return;
         }
     };
-    // The output with the same name, or failing that the closest one: some
-    // systems name the two directions slightly differently.
-    let mut out_conn = MidiOutput::new(CLIENT).ok().and_then(|output| {
-        let ports = output.ports();
-        let want = tokens(port);
-        let p = ports
-            .iter()
-            .find(|p| output.port_name(p).as_deref() == Ok(port))
-            .or_else(|| {
-                ports
-                    .iter()
-                    .find(|p| output.port_name(p).is_ok_and(|n| tokens(&n) == want))
-            })?
-            .clone();
-        output.connect(&p, "openDJ out").ok()
-    });
+    let mut out_conn = open_midi_output(port);
     let send = move |m: &[u8]| {
         if let Some(out) = out_conn.as_mut() {
             let _ = out.send(m);
         }
     };
     run_controller(port, mapping_path, own, registry, stop, connected, rx, send);
+}
+
+/// The MIDI output with the same name as input `port`, or failing that the
+/// closest one: some systems name the two directions slightly differently.
+fn open_midi_output(port: &str) -> Option<midir::MidiOutputConnection> {
+    let output = MidiOutput::new(CLIENT).ok()?;
+    let ports = output.ports();
+    let want = tokens(port);
+    let p = ports
+        .iter()
+        .find(|p| output.port_name(p).as_deref() == Ok(port))
+        .or_else(|| {
+            ports
+                .iter()
+                .find(|p| output.port_name(p).is_ok_and(|n| tokens(&n) == want))
+        })?
+        .clone();
+    output.connect(&p, "openDJ out").ok()
 }
 
 /// Runs a mapping until `stop` is set or the input ends.
@@ -1088,6 +1253,7 @@ fn run_hid(
     registry: Arc<ControlRegistry>,
     stop: &AtomicBool,
     connected: &Mutex<Vec<ConnectedController>>,
+    shared: &Shared,
 ) {
     use hid::Io;
     let mapping = match Mapping::load(mapping_path) {
@@ -1126,6 +1292,7 @@ fn run_hid(
     };
     flush(&mut controller);
     let mut buf = [0u8; hid::BUFFER];
+    let mut midi_out = None;
     'run: while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         let deadline = controller
@@ -1145,8 +1312,37 @@ fn run_hid(
             }
             wait = 0;
         }
+        // The knobs a keyboard sends over its MIDI port (`keys="midi"`).
+        let twin = shared
+            .twin_midi
+            .lock()
+            .unwrap()
+            .remove(port)
+            .unwrap_or_default();
+        for msg in twin {
+            controller.receive_twin(msg);
+        }
         controller.poll(Instant::now());
         flush(&mut controller);
+        // And what the mapping sends back to that MIDI port.
+        let out = controller.take_output();
+        if !out.is_empty() {
+            if midi_out.is_none() {
+                let midi_port = shared
+                    .keys_only
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(_, hid)| hid == port)
+                    .map(|(midi, _)| midi.clone());
+                midi_out = midi_port.and_then(|p| open_midi_output(&p));
+            }
+            if let Some(conn) = midi_out.as_mut() {
+                for m in out {
+                    let _ = conn.send(&m);
+                }
+            }
+        }
     }
     controller.shutdown();
     controller.poll(Instant::now());
@@ -1268,13 +1464,54 @@ mod tests {
             ("PIONEER DDJ-SX", "Pioneer DDJ-SX.midi.xml"),
             ("PIONEER DDJ-SX2", "Pioneer DDJ-SX2.midi.xml"),
             ("PIONEER DDJ-RX", "Pioneer DDJ-RX.midi.xml"),
+            ("DDJ-RB", "Pioneer-DDJ-RB.midi.xml"),
+            ("DDJ-RR", "Pioneer DDJ-RR.midi.xml"),
+            ("DDJ-RZ", "Pioneer DDJ-RZ.midi.xml"),
+            ("DDJ-RZX", "Pioneer DDJ-RZX.midi.xml"),
+            ("PIONEER DDJ-SZ", "Pioneer DDJ-SZ.midi.xml"),
+            ("PIONEER DDJ-ERGO", "Pioneer-DDJ-ERGO.midi.xml"),
+            ("PIONEER DDJ-WeGO", "Pioneer-DDJ-WeGO.midi.xml"),
+            ("PIONEER DDJ-WeGO2", "Pioneer-DDJ-WeGO2.midi.xml"),
+            ("DDJ-WeGO3", "Pioneer-DDJ-WeGO3.midi.xml"),
+            ("DDJ-WeGO4", "Pioneer-DDJ-WeGO4.midi.xml"),
             ("PIONEER DDJ-800", "Pioneer-DDJ-800.midi.xml"),
+            ("DDJ-1000", "Pioneer-DDJ-1000.midi.xml"),
             ("XDJ-AZ", "Pioneer-XDJ-AZ.midi.xml"),
+            ("OPUS-QUAD", "Pioneer-OPUS-QUAD.midi.xml"),
+            ("PIONEER XDJ-RX", "Pioneer-XDJ-RX.midi.xml"),
+            ("XDJ-RX", "Pioneer-XDJ-RX.midi.xml"),
+            ("Pioneer DJ XDJ-RX2", "Pioneer-XDJ-RX2.midi.xml"),
+            ("XDJ-RX2", "Pioneer-XDJ-RX2.midi.xml"),
+            ("Pioneer DJ XDJ-RR", "Pioneer-XDJ-RR.midi.xml"),
+            ("XDJ-XZ", "Pioneer-XDJ-XZ.midi.xml"),
+            ("PIONEER XDJ-AERO", "Pioneer-XDJ-AERO.midi.xml"),
+            ("PIONEER XDJ-R1", "Pioneer-XDJ-R1.midi.xml"),
+            ("XDJ-AN", "Pioneer-XDJ-AN.midi.xml"),
+            ("OMNIS-DUO", "AlphaTheta-OMNIS-DUO.midi.xml"),
             ("DDJ-FLX10", "Pioneer-DDJ-FLX10.midi.xml"),
             ("DDJ-FLX6", "Pioneer-DDJ-FLX6.midi.xml"),
+            ("DDJ-GRV6", "Pioneer-DDJ-GRV6.midi.xml"),
+            ("DDJ-GRV6:DDJ-GRV6 MIDI 1 24:0", "Pioneer-DDJ-GRV6.midi.xml"),
             ("XDJ-RX3", "Pioneer-XDJ-RX3.midi.xml"),
             ("DDJ-400", "Pioneer-DDJ-400.midi.xml"),
             ("DDJ-200", "Pioneer DDJ-200.midi.xml"),
+            ("DJM-900NXS2", "Pioneer-DJM-900NXS2.midi.xml"),
+            ("DJM-250MK2", "Pioneer-DJM-250MK2.midi.xml"),
+            ("DJM-V10", "Pioneer-DJM-V10.midi.xml"),
+            ("DJM-TOUR1", "Pioneer-DJM-TOUR1.midi.xml"),
+            ("Pioneer DJ DJM-S9", "Pioneer-DJM-S9.midi.xml"),
+            ("DJM-S11", "Pioneer-DJM-S11.midi.xml"),
+            ("PIONEER DJM-T1", "Pioneer-DJM-T1.midi.xml"),
+            ("EUPHONIA", "AlphaTheta-euphonia.midi.xml"),
+            ("PLX-CRSS12", "Pioneer-PLX-CRSS12.midi.xml"),
+            ("DDJ-FLX2", "Pioneer-DDJ-FLX2.midi.xml"),
+            ("DDJ-REV5", "Pioneer-DDJ-REV5.midi.xml"),
+            ("PIONEER DDJ-SR", "Pioneer DDJ-SR.midi.xml"),
+            ("PIONEER DDJ-SP1", "Pioneer DDJ-SP1.midi.xml"),
+            ("DDJ-XP1", "Pioneer-DDJ-XP1.midi.xml"),
+            ("DDJ-XP2", "Pioneer-DDJ-XP2.midi.xml"),
+            ("PIONEER DDJ-SB", "Pioneer-DDJ-SB.midi.xml"),
+            ("PIONEER DDJ-SB2", "Pioneer-DDJ-SB2.midi.xml"),
             (
                 "Midi Fighter Twister",
                 "DJ TechTools MIDI Fighter Twister.midi.xml",
@@ -1283,9 +1520,136 @@ mod tests {
                 "Midi Fighter Twister:Midi Fighter Twister MIDI 1 32:0",
                 "DJ TechTools MIDI Fighter Twister.midi.xml",
             ),
+            // Hercules names its ports by model number alone.
+            (
+                "DJControl Inpulse 200",
+                "Hercules_DJControl_Inpulse_200.midi.xml",
+            ),
+            (
+                "DJControl Inpulse 300",
+                "Hercules_DJControl_Inpulse_300.midi.xml",
+            ),
+            (
+                "DJControl Inpulse 300:DJControl Inpulse 300 MIDI 1 20:0",
+                "Hercules_DJControl_Inpulse_300.midi.xml",
+            ),
+            (
+                "DJControl Inpulse 500",
+                "Hercules_DJControl_Inpulse_500.midi.xml",
+            ),
+            ("DJCONTROL MIX", "Hercules DJControl MIX.midi.xml"),
+            (
+                "DJControl Mix Ultra",
+                "Hercules DJControl Mix Ultra.midi.xml",
+            ),
+            // Its Bluetooth MIDI port.
+            (
+                "DJControl Mix Ultra Bluetooth",
+                "Hercules DJControl Mix Ultra.midi.xml",
+            ),
+            (
+                "DJControl Inpulse 200 Mk2",
+                "Hercules_DJControl_Inpulse_200_MK2.midi.xml",
+            ),
+            // Port names from djay Pro's built-in Reloop mappings.
+            ("MIXTOUR", "Reloop Mixtour.midi.xml"),
+            ("Reloop Mixtour Pro", "Reloop Mixtour Pro.midi.xml"),
+            ("Reloop Ready", "Reloop Ready.midi.xml"),
+            ("Reloop Buddy", "Reloop Buddy.midi.xml"),
+            ("Mixon 4", "Reloop Mixon 4.midi.xml"),
+            ("Reloop Mixon 8 Pro", "Reloop Mixon 8 Pro.midi.xml"),
+            ("Reloop Beatpad2", "Reloop Beatpad 2.midi.xml"),
+            ("Reloop BeatMix", "Reloop Beatmix.midi.xml"),
+            ("Reloop ELITE", "Reloop Elite.midi.xml"),
+            ("RP8000", "Reloop RP-8000.midi.xml"),
+            ("RP8000mk2", "Reloop RP-8000 MK2.midi.xml"),
+            ("Beatmix 2", "Reloop-Beatmix-2-4-MK2.midi.xml"),
+            ("Beatmix 4", "Reloop-Beatmix-2-4-MK2.midi.xml"),
+            ("Reloop Beatpad", "Reloop Beatpad.midi.xml"),
+            ("Terminal Mix 2", "Reloop Terminal Mix 2-4.midi.xml"),
+            ("Terminal Mix 4", "Reloop Terminal Mix 2-4.midi.xml"),
         ] {
             assert_eq!(name(port).as_deref(), Some(file), "{port}");
         }
         assert_eq!(name("Generic USB MIDI 1"), None);
+    }
+
+    #[test]
+    fn a_keyboards_hid_side_leaves_its_midi_port_to_play() {
+        let mappings = vec![(
+            "Native Instruments Komplete Kontrol M32".to_string(),
+            PathBuf::from("Native Instruments Komplete Kontrol M32.hid.xml"),
+            vec![hid::Product {
+                vendor_id: 0x17cc,
+                product_id: 0x1860,
+                keys: true,
+                ..Default::default()
+            }],
+        )];
+        let device = hid::DeviceInfo {
+            vendor_id: 0x17cc,
+            product_id: 0x1860,
+            interface: 3,
+            product: "KOMPLETE KONTROL M32".into(),
+            ..Default::default()
+        };
+        // The MIDI port has no mapping, so it isn't among the mapped ports;
+        // the HID side still takes the mapping's name.
+        let found = hid_ports(vec![device], &mappings, &[]);
+        assert_eq!(found[0].0, "Native Instruments Komplete Kontrol M32");
+        assert!(plays_instruments(
+            "KOMPLETE KONTROL M32",
+            false,
+            None,
+            false
+        ));
+        // Its knobs also send controllers over MIDI: only the keys, strips
+        // and pedals play from there.
+        let ports = vec!["KOMPLETE KONTROL M32".to_string(), "Other Keys".to_string()];
+        assert_eq!(
+            keys_only(&ports, &found),
+            vec![(
+                "KOMPLETE KONTROL M32".to_string(),
+                "Native Instruments Komplete Kontrol M32".to_string()
+            )]
+        );
+        assert!(keys_only_plays([0x90, 60, 100]));
+        assert!(keys_only_plays([0xE0, 0, 64]));
+        assert!(keys_only_plays([0xB0, 1, 64]));
+        assert!(keys_only_plays([0xB0, 64, 127]));
+        assert!(!keys_only_plays([0xB0, 14, 64]));
+    }
+
+    #[test]
+    fn hid_twins_of_mapped_midi_ports_take_the_mapping_name() {
+        let mappings = vec![(
+            "Pioneer DDJ-FLX10 jog screens".to_string(),
+            PathBuf::from("Pioneer-DDJ-FLX10-screens.hid.xml"),
+            vec![hid::Product {
+                vendor_id: 0x2b73,
+                product_id: 0x0041,
+                interface: Some(5),
+                ..Default::default()
+            }],
+        )];
+        let device = hid::DeviceInfo {
+            vendor_id: 0x2b73,
+            product_id: 0x0041,
+            interface: 5,
+            product: "DDJ-FLX10".into(),
+            ..Default::default()
+        };
+        let named = |midi: &[&str]| {
+            let midi: Vec<String> = midi.iter().map(|s| s.to_string()).collect();
+            hid_ports(vec![device.clone()], &mappings, &midi)
+                .into_iter()
+                .map(|(p, _, _)| p)
+                .collect::<Vec<_>>()
+        };
+        // macOS and Windows name the MIDI port as the device names itself.
+        assert_eq!(named(&["DDJ-FLX10"]), ["Pioneer DDJ-FLX10 jog screens"]);
+        // Linux adds the port's own name and numbers.
+        assert_eq!(named(&["DDJ-FLX10:DDJ-FLX10 MIDI 1 24:0"]), ["DDJ-FLX10"]);
+        assert_eq!(named(&[]), ["DDJ-FLX10"]);
     }
 }

@@ -18,10 +18,12 @@ pub mod format;
 pub mod hid;
 mod host;
 pub mod import;
+pub mod jog_feel;
 pub mod layout;
 pub mod learn;
 mod manager;
 pub mod mapping;
+mod ni_agent;
 pub mod own;
 pub mod pickup;
 pub mod probe;
@@ -30,7 +32,9 @@ pub mod routing;
 mod rows;
 mod script;
 pub mod support;
+pub mod texts;
 pub mod view;
+pub mod waves;
 
 use std::path::PathBuf;
 

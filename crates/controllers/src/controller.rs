@@ -314,11 +314,13 @@ impl Controller {
             .routed_input(status, msg.get(1).copied().unwrap_or(0));
         let value = msg.get(2).copied().unwrap_or(0);
         self.host.borrow_mut().input = Some((status, control));
-        if let Some(inputs) = self.mapping.inputs.get(&(status, control)).cloned() {
+        // Pitch bend's second byte is the low half of its value.
+        let key = if status & 0xF0 == 0xE0 { 0 } else { control };
+        if let Some(inputs) = self.mapping.inputs.get(&(status, key)).cloned() {
             for input in self.rows.shown_through(&inputs) {
                 self.process(input, status, control, value);
             }
-            self.rows.finish(status, control, value, Instant::now());
+            self.rows.finish(status, key, value, Instant::now());
         }
         if self.host.borrow().has_input_handlers(status, control) {
             self.script.fire_input(status, control, value);
@@ -340,6 +342,22 @@ impl Controller {
         for p in self.prefixes.clone() {
             if self.script.has_function(&format!("{p}.incomingData")) {
                 self.script.call_incoming_report(&p, report);
+            }
+        }
+    }
+
+    /// A controller message from the MIDI port of a keyboard whose HID
+    /// side this mapping runs (`keys="midi"`): its knobs, in the keyboard's
+    /// own MIDI mode. The script's `incomingMidi(status, control, value)`
+    /// functions get it.
+    pub fn receive_twin(&mut self, msg: [u8; 3]) {
+        if self.debug {
+            eprintln!("{} midi -> {msg:02X?}", self.name);
+        }
+        for p in self.prefixes.clone() {
+            let f = format!("{p}.incomingMidi");
+            if self.script.has_function(&f) {
+                self.script.call_incoming_midi(&p, msg);
             }
         }
     }
@@ -463,7 +481,8 @@ impl Controller {
                 return;
             }
         }
-        target.set_from_midi(note_off, new_value);
+        let gain = self.host.borrow().bend_gain(&target);
+        target.set_from_midi(note_off, new_value * gain);
     }
 
     /// Lets the device's deck choice in Settings (see [`crate::routing`])

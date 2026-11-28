@@ -33,6 +33,7 @@ use opendj_plugins::{ItemKind, StoreItem, StoreQuery};
 mod albums;
 mod analysis;
 mod buy;
+mod catalog;
 mod checklist;
 mod cleanup;
 pub(crate) mod columns;
@@ -44,21 +45,32 @@ mod history;
 mod home;
 mod inbox_albums;
 mod info;
+mod info_lists;
 mod keep_going;
+mod list_moves;
 mod lyrics;
 mod mix_export;
+mod mixed_set;
+mod navigation;
 mod pages;
+mod panels;
 mod picks;
+mod played;
 mod playlist_files;
 mod prep;
 mod rail_order;
 mod rekordbox_xml;
 mod sets;
 mod side_tabs;
+mod sidelist;
 mod spotify_export;
 mod staging;
+mod stem_files;
+mod stream_play;
 mod streamed;
 mod tag_chips;
+mod tag_health;
+mod tasks;
 mod track_menu;
 mod up_next;
 mod usb;
@@ -76,11 +88,13 @@ use crate::inbox::Inbox;
 use crate::settings::show_key;
 use crate::spotify::{self, open_in_browser, Event, Request, Service, StreamTrack};
 use crate::stores::{self, Stores};
+use crate::tree_navigation::{self, Action, Direction, Row};
 use crate::waves::Waves;
 use crate::{
-    fmt_time, AppWindow, ColumnUi, FilesUi, Folder, HealthUi, KeyNotation, LibraryEdit, SideRow,
-    StoreUi, StreamMatch, TrackDrag, TrackInfo, TrackRow, WantedUi,
+    fmt_time, AppWindow, ColumnUi, FilesUi, Folder, HealthUi, KeyNotation, LibraryEdit, MoveTarget,
+    SideRow, SidelistUi, StoreUi, StreamMatch, TrackDrag, TrackInfo, TrackRow, WantedUi,
 };
+use crate::{BrowserFocus, BrowserPane};
 
 /// Sources in the rail that have a tree of their own.
 const COLLECTION: i32 = 0;
@@ -160,6 +174,14 @@ enum Contents {
     Area(Area),
     /// The tracks a Collection Health check was told to leave alone.
     Ignored,
+    /// The tracks taken out of the collection: merged copies, quarantined
+    /// and removed tracks, to bring back.
+    Quarantine,
+    /// Collection Health's Tags page: genres and tag groups, how they're
+    /// used, and merging names (see [`tag_health`]).
+    Tags,
+    /// Collection Health's Lists page: what is wrong in the DJ's lists.
+    Lists,
 }
 
 /// Whether the streaming services that are built (Spotify, TIDAL) can be
@@ -249,6 +271,9 @@ struct Undo {
     /// Missing tracks that were found elsewhere, by id, with the place
     /// they pointed at before.
     relinked: Vec<(usize, PathBuf)>,
+    /// Lists as they were before tracks were added, moved or taken out:
+    /// each list's track ids, `None` for the Sidelist's scratch pad.
+    lists: Vec<(Option<i64>, Vec<usize>)>,
 }
 
 struct Parked {
@@ -283,6 +308,8 @@ enum StoreRow {
     /// A store's own search page.
     Link(usize, String),
     Wanted(Wanted),
+    /// A track taken out of the collection, on the Quarantine page.
+    Removed(opendj_library::health::Removed),
 }
 
 #[derive(Clone)]
@@ -492,7 +519,8 @@ const KIND_INBOX: i32 = 10;
 const KIND_TRIAGE: i32 = 11;
 /// Collection Health, and one of its checks.
 const KIND_HEALTH: i32 = 12;
-/// One of Collection Health's areas, drawn as a dot in its state's colour.
+/// One of Collection Health's checks, drawn as a dot in its state's colour
+/// (a tick when it finds nothing).
 const KIND_AREA: i32 = 21;
 /// A set: a folder made for one gig, drawn in lilac.
 /// One of the DJ's crates, and the Crates and Playlists headings.
@@ -507,8 +535,11 @@ const KIND_MIX: i32 = 16;
 const KIND_ARTIST: i32 = 20;
 /// Collection Health's Ignored node.
 const KIND_IGNORED: i32 = 22;
+/// A section heading in Collection Health's tree: Files, Location and so on.
+const KIND_HEALTH_SECTION: i32 = 24;
 
-/// Seconds a track must play on a deck to count as played, for the history.
+/// Seconds a track must be heard in the master to count as played, for the
+/// history and this session's played marks.
 const PLAYED_AFTER: f64 = 30.0;
 
 /// Watches one deck's hot cues so changes the DJ makes are saved.
@@ -525,6 +556,21 @@ struct CueWatch {
 
 pub struct Browser {
     app: slint::Weak<AppWindow>,
+    /// Sites whose tracks an add-on source plays (see
+    /// [`crate::sources::Sources::playing_sites`]): a streamed track from
+    /// one loads onto a deck through it instead of opening its page.
+    pub play_sites: Vec<&'static str>,
+    /// Streamed tracks to fetch that way, for the frame loop.
+    stream_plays: Vec<crate::sources::StreamPlay>,
+    /// What each deck is fetching to load (see [`stream_play`]).
+    fetches: [Option<stream_play::DeckFetch>; NUM_DECKS],
+    /// Streamed tracks downloading, by link, as their rows show them.
+    row_fetches: stream_play::RowFetches,
+    /// What a catalog search listed in place of the playlist: every track
+    /// it found (its [`spotify::SEARCH`] key), or an artist's or album's
+    /// tracks ("artist:<id>", "album:<id>"). Empty for the playlist.
+    stream_search: String,
+    catalog: catalog::CatalogState,
     library: Vec<Arc<Track>>,
     nodes: Vec<Node>,
     /// Indices into `nodes` of the rows currently shown in the tree.
@@ -552,7 +598,10 @@ pub struct Browser {
     /// The decks the layout shows: 4 in 4-Deck, else 2. "Load on a free
     /// deck" picks among these.
     decks_shown: usize,
-    side: [Vec<usize>; 2],
+    side: [Vec<usize>; 8],
+    /// The DJ's lists picked with shift- or ⌘-click in the tree, to move
+    /// together.
+    list_picks: Vec<i64>,
     /// The Automix list before the last Order pick, for Undo.
     automix_before_order: Option<Vec<usize>>,
     shown_side_tab: usize,
@@ -567,6 +616,9 @@ pub struct Browser {
     play: [ControlHandle; NUM_DECKS],
     /// The key each deck plays in, with its shift.
     deck_key: [ControlHandle; NUM_DECKS],
+    /// Each deck's `beats_mode`: a grid mode picked for a track on a deck
+    /// goes through the deck, which fits its grid again.
+    deck_grid_mode: [ControlHandle; NUM_DECKS],
     /// How far, in semitones, tracks are shifted to match keys on load.
     key_match_range: ControlHandle,
     /// The key mixing rule and the reach of the key marks the rows were
@@ -575,6 +627,9 @@ pub struct Browser {
     lib: LibraryControls,
     /// Moving the selection with a controller goes through folders instead of tracks.
     folders_focused: bool,
+    /// The rail entry the knob or ↑ ↓ moved to (-1 Collection Health), and
+    /// when: it opens once the moves stop (see `navigation::RAIL_SETTLE`).
+    rail_pending: Option<(i32, std::time::Instant)>,
     /// Tracks loaded with LoadSelectedTrackAndPlay, to start once they arrive.
     play_when_loaded: [Option<usize>; NUM_DECKS],
     /// The streaming services, in the order of [`STREAMS`].
@@ -624,6 +679,14 @@ pub struct Browser {
     /// The copies grouped by case, worked out (reading their files) the
     /// first time they're needed after the library changes.
     dupe_groups: OnceCell<Vec<Group>>,
+    /// What each copy's file is like, read with the groups.
+    dupe_facts: RefCell<HashMap<usize, opendj_library::dupes::FileFacts>>,
+    /// Reads the copies' files in the background, for the groups.
+    dupe_scan: crate::dupe_scan::DupeScan,
+    /// Groups of copies opened to show every copy, by the kept copy's id.
+    open_groups: HashSet<usize>,
+    /// Every group shows its copies.
+    all_copies: bool,
     /// Pairs of linked tracks, both ways round.
     links: HashSet<(usize, usize)>,
     /// Tempo and key of the track playing now, for "mixes with deck", and its id.
@@ -634,11 +697,11 @@ pub struct Browser {
     /// The collection's tree shows Collection Health's checks, picked in
     /// the rail.
     health_view: bool,
-    /// The chip picked on each Collection Health area (an index into
-    /// `health::area_chips`); unpicked, the first with tracks.
-    area_chip: HashMap<Area, usize>,
-    /// Tracks each area found when first opened, for its progress bar.
-    area_start: std::cell::RefCell<HashMap<Area, usize>>,
+    /// The case of copies the Duplicates page's Show tab picks; `None`
+    /// lists every copy.
+    dupe_tab: Option<opendj_library::dupes::Case>,
+    /// Tracks each check found when first opened, for its progress bar.
+    check_start: std::cell::RefCell<HashMap<Check, usize>>,
     /// The review card's place among the listed tracks, while it's open.
     review_at: Option<usize>,
     /// Audio files in the stage and music folders, and what the collection
@@ -662,12 +725,14 @@ pub struct Browser {
     /// When the last track counted as played (Unix seconds): an hour
     /// later, or on a new day, the next play starts a new set.
     last_play: Option<i64>,
+    /// The tracks played in this session, marked in the list.
+    played: played::Played,
     /// Lists tracks can be added to, as offered in the track menu.
     menu_lists: Vec<track_menu::MenuList>,
     /// The crates each track is in, by track id.
     crates: HashMap<usize, Vec<String>>,
     /// Empty crates and entries for removed tracks.
-    list_health: opendj_library::sets::ListHealth,
+    list_report: opendj_library::sets::ListReport,
     /// Hot cue controls per deck: enabled and position.
     /// Each deck's hot cues: enabled, position and a saved loop's end.
     hotcues: [Vec<(ControlHandle, ControlHandle, ControlHandle)>; NUM_DECKS],
@@ -684,6 +749,8 @@ pub struct Browser {
     info: info::InfoState,
     /// The side panel's Lyrics tab.
     lyrics: lyrics::LyricsState,
+    /// What the Background panel showed last (see `browser/tasks.rs`).
+    tasks_shown: tasks::Shown,
     /// The filter bar.
     filter: filters::FilterState,
     /// The track list's columns.
@@ -694,6 +761,8 @@ pub struct Browser {
     mixed_sets: Option<PathBuf>,
     /// A mixed set being made into a Mixcloud MP3.
     mix_export: Option<std::sync::mpsc::Receiver<mix_export::Progress>>,
+    /// The Mixed Set Editor and the set open in it.
+    mixed_set: mixed_set::MixedSetEditor,
     /// Play Album was picked, for Automix to play the list gaplessly.
     album_request: bool,
     keep_going: keep_going::KeepGoing,
@@ -713,12 +782,15 @@ pub struct Browser {
     /// Export to USB's dialog and export.
     usb: usb::State,
     playlist_files: playlist_files::State,
+    stem_files: stem_files::State,
     inbox_albums: inbox_albums::InboxAlbums,
     rekordbox_xml: rekordbox_xml::State,
     phrases_seen: analysis::SeenDecks,
     /// The last stage change or merge of copies, which the track menu can
     /// take back.
     undo: Option<Undo>,
+    /// Tracks an add skipped because the playlist had them, to add again.
+    again: Option<(i64, Vec<usize>)>,
     /// Where files whose moves are waiting (file moves off) will go, by
     /// track id, so they show in the stage subfolder they're headed for.
     pending_moves: HashMap<usize, PathBuf>,
@@ -726,6 +798,18 @@ pub struct Browser {
     health: Facts,
     /// Looks for covers in the background, for the "No cover" check.
     cover_scan: CoverScan,
+    /// Covers and bitrates found and not yet saved or shown.
+    covers_found: Vec<(usize, opendj_library::health::FileLook)>,
+    /// When found covers were last saved and shown.
+    covers_shown: std::time::Instant,
+    /// Makes audio fingerprints, for copies found by their sound.
+    sound_scan: crate::sound_scan::SoundScan,
+    /// Each track's audio fingerprint, by id.
+    sounds: HashMap<usize, Vec<u32>>,
+    /// Pairs of tracks (ids, smaller first) that sound the same.
+    alike: Vec<(usize, usize)>,
+    /// Fingerprints taken in since `alike` was worked out.
+    sounds_new: usize,
     /// What the last Collection Health fix did.
     health_status: String,
     /// How many tracks have been taken out of the library.
@@ -764,6 +848,15 @@ pub(crate) const STREAMS: [(i32, &str, &str); 5] = [
     (SOUNDCLOUD, "SoundCloud", "soundcloud"),
     (MIXCLOUD, "Mixcloud", "mixcloud"),
 ];
+
+/// Whether the service with this id searches its catalog from the search
+/// box (see [`spotify::SEARCH`]).
+fn searches(id: &str) -> bool {
+    id == "tidal"
+}
+
+/// How long typing pauses before a catalog search is asked for.
+const SEARCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// A streaming service: its worker, and what it has sent.
 struct Stream {
@@ -977,6 +1070,15 @@ impl crate::automix::Host for AutomixHost<'_> {
     fn load(&mut self, deck: usize, track: Arc<Track>) {
         self.engine.load_track(deck, track);
     }
+
+    fn pair_mix(&self, out: usize, inc: usize) -> Option<crate::automix_phrases::Paired> {
+        let m = self.browser.db.as_ref()?.pair_mix(out, inc).ok()??;
+        Some(crate::automix_phrases::Paired {
+            out_seconds: m.out_seconds,
+            in_seconds: m.in_seconds,
+            bars: m.bars,
+        })
+    }
 }
 
 const ROW_PAYLOAD: &str = "opendj-row:";
@@ -987,13 +1089,53 @@ const DECK_PAYLOAD: &str = "opendj-deck:";
 /// One of the DJ's lists or folders dragged in the tree: `opendj-list:<id>`.
 const LIST_PAYLOAD: &str = "opendj-list:";
 
-/// The list or folder a tree drag carries.
+/// The list or folder a tree drag carries (the first, when it carries
+/// several).
 fn dragged_list(data: &DataTransfer) -> Option<i64> {
-    data.plain_text()
-        .ok()?
-        .strip_prefix(LIST_PAYLOAD)?
-        .parse()
-        .ok()
+    dragged_lists(data).first().copied()
+}
+
+/// The lists or folders a tree drag carries: `opendj-list:<id>,<id>…`.
+fn dragged_lists(data: &DataTransfer) -> Vec<i64> {
+    let Ok(text) = data.plain_text() else {
+        return Vec::new();
+    };
+    let Some(ids) = text.strip_prefix(LIST_PAYLOAD) else {
+        return Vec::new();
+    };
+    ids.split(',')
+        .map(|id| id.parse().ok())
+        .collect::<Option<Vec<i64>>>()
+        .unwrap_or_default()
+}
+
+/// Where on a tree row a dragged list is: its top edge, its middle or
+/// its bottom edge.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DropZone {
+    Before,
+    Into,
+    After,
+}
+
+impl DropZone {
+    fn from_ui(zone: i32) -> Option<Self> {
+        match zone {
+            0 => Some(Self::Before),
+            1 => Some(Self::Into),
+            2 => Some(Self::After),
+            _ => None,
+        }
+    }
+}
+
+/// Where a list goes: in `folder` (None for the top, under Crates when
+/// `crates`), before the list `before` (None for the end).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ListPlace {
+    folder: Option<i64>,
+    crates: bool,
+    before: Option<i64>,
 }
 
 /// Where a drag from inside the app comes from.
@@ -1205,7 +1347,8 @@ impl Browser {
             loaded: [None; NUM_DECKS],
             prep_pending: None,
             decks_shown: 2,
-            side: [Vec::new(), Vec::new()],
+            side: Default::default(),
+            list_picks: Vec::new(),
             automix_before_order: None,
             shown_side_tab: 0,
             linked_to: None,
@@ -1218,12 +1361,18 @@ impl Browser {
             deck_key: std::array::from_fn(|d| {
                 registry.get(&deck_group(d), "key").expect("key control")
             }),
+            deck_grid_mode: std::array::from_fn(|d| {
+                registry
+                    .get(&deck_group(d), "beats_mode")
+                    .expect("grid mode control")
+            }),
             key_match_range: registry
                 .get("[Controls]", "key_match_on_load")
                 .expect("key matching control"),
             key_rules: (key::Mixing::Harmonic, 1),
             lib: LibraryControls::create(registry),
             folders_focused: false,
+            rail_pending: None,
             play_when_loaded: [None; NUM_DECKS],
             streams: STREAMS
                 .iter()
@@ -1290,13 +1439,17 @@ impl Browser {
             indexed: Vec::new(),
             duplicates: HashSet::new(),
             dupe_groups: OnceCell::new(),
+            dupe_facts: RefCell::new(HashMap::new()),
+            dupe_scan: crate::dupe_scan::DupeScan::start(),
+            open_groups: HashSet::new(),
+            all_copies: false,
             links: HashSet::new(),
             deck_ref: None,
             deck_track: None,
             history_tab: false,
             health_view: false,
-            area_chip: HashMap::new(),
-            area_start: Default::default(),
+            dupe_tab: None,
+            check_start: Default::default(),
             review_at: None,
             relink_files: OnceCell::new(),
             located: std::sync::mpsc::channel(),
@@ -1304,12 +1457,19 @@ impl Browser {
             sorted_list: None,
             view_sort: (1, true),
             wanted_sort: (-1, true),
+            play_sites: Vec::new(),
+            stream_plays: Vec::new(),
+            fetches: Default::default(),
+            row_fetches: Default::default(),
+            stream_search: String::new(),
+            catalog: catalog::CatalogState::new(),
             export_status: None,
             session: None,
             last_play: None,
+            played: played::Played::new(registry),
             menu_lists: Vec::new(),
             crates: HashMap::new(),
-            list_health: Default::default(),
+            list_report: Default::default(),
             hotcues: std::array::from_fn(|d| {
                 (1..=NUM_HOTCUES)
                     .map(|n| {
@@ -1330,11 +1490,13 @@ impl Browser {
             review: Default::default(),
             info: info::InfoState::new(registry),
             lyrics: lyrics::LyricsState::new(registry),
+            tasks_shown: Default::default(),
             filter: filters::FilterState::new(),
             columns: columns::ColumnState::new(&crate::settings::field_names()),
             folders: crate::settings::stage_folders(),
             mixed_sets: crate::settings::mixed_sets_folder(),
             mix_export: None,
+            mixed_set: mixed_set::MixedSetEditor::new(registry),
             album_request: false,
             keep_going: Default::default(),
             pages: Default::default(),
@@ -1347,19 +1509,28 @@ impl Browser {
             analysis_shown: Default::default(),
             usb: Default::default(),
             playlist_files: Default::default(),
+            stem_files: Default::default(),
             inbox_albums: inbox_albums::InboxAlbums::new(),
             rekordbox_xml: Default::default(),
             phrases_seen: Default::default(),
             undo: None,
+            again: None,
             pending_moves: HashMap::new(),
             health: Facts::default(),
             cover_scan: CoverScan::start(),
+            covers_found: Vec::new(),
+            covers_shown: std::time::Instant::now(),
+            sound_scan: crate::sound_scan::SoundScan::start(),
+            sounds: HashMap::new(),
+            alike: Vec::new(),
+            sounds_new: 0,
             health_status: String::new(),
             removed: 0,
             quarantined: 0,
             cleanup: Default::default(),
         }));
         b.borrow_mut().set_library(library);
+        b.borrow_mut().resume_session();
         if STREAMING_ENABLED {
             b.borrow_mut().restore_streams();
         }
@@ -1391,42 +1562,26 @@ impl Browser {
         let w = with.clone();
         app.on_select_folder(move |i| {
             w(Box::new(move |b| {
-                if let Some(&n) = b.visible_nodes.get(i as usize) {
-                    b.park_view();
-                    b.current_node = n;
-                    // An artist opens to show their albums too.
-                    if b.nodes[n].kind == KIND_ARTIST {
-                        b.nodes[n].expanded = true;
-                    }
-                    if let Some(app) = b.app.upgrade() {
-                        app.global::<LibraryEdit>().set_making_smart(false);
-                    }
-                    b.health_status.clear();
-                    b.close_cleanup();
-                    b.close_page();
-                    if let Some(app) = b.app.upgrade() {
-                        app.set_current_track(-1);
-                    }
-                    b.refresh_tree();
-                    b.refresh_rows();
-                    b.fetch_current_playlist();
+                if let Ok(row) = usize::try_from(i) {
+                    b.select_folder_row(row, true);
                 }
             }))
         });
         let w = with.clone();
         app.on_toggle_folder(move |i| {
             w(Box::new(move |b| {
-                if let Some(&n) = b.visible_nodes.get(i as usize) {
-                    if b.nodes[n].lazy {
-                        open_dir(&mut b.nodes, n);
-                    } else {
-                        b.nodes[n].expanded = !b.nodes[n].expanded;
-                        b.save_open_folders();
-                    }
-                    b.refresh_tree();
+                if let Ok(row) = usize::try_from(i) {
+                    b.toggle_folder_row(row);
                 }
             }))
         });
+        let w = with.clone();
+        app.global::<BrowserFocus>()
+            .on_navigate(move |code, steps| {
+                w(Box::new(move |b| b.navigate_browser(code, steps)));
+            });
+        let w = with.clone();
+        app.on_navigate_folders(move |code| w(Box::new(move |b| b.navigate_folders(code))));
         let w = with.clone();
         app.on_sort(move |c| {
             w(Box::new(move |b| {
@@ -1457,6 +1612,7 @@ impl Browser {
                 if is_stores(b.tree) {
                     b.search_stores(StoreQuery::text(&text));
                 }
+                b.search_catalog(&text);
                 b.refresh_rows();
             }))
         });
@@ -1468,11 +1624,11 @@ impl Browser {
                 } else if let Some(&Some(id)) = b.rows.get(row as usize) {
                     b.adopt(&[id]);
                     b.load_to_free_deck(id);
-                } else if let Some(t) = b.stream_track(row as usize) {
-                    // Not in the collection: it plays on the service's page.
-                    if !t.page.is_empty() {
-                        open_in_browser(&t.page);
-                    }
+                } else if let Some((t, service)) = b.stream_row(row as usize) {
+                    // Not in the collection: it downloads and loads through
+                    // an add-on that plays the service's tracks, or plays on
+                    // its page.
+                    b.play_stream(&t, &service, None);
                 }
             }))
         });
@@ -1510,18 +1666,20 @@ impl Browser {
             DataTransfer::from(SharedString::from(format!("{DECK_PAYLOAD}{deck}")))
         });
         drag.on_accepts(|data| dragged(&data).is_some() || dropped_file(&data).is_some());
+        drag.on_is_rows_drag(|data| matches!(dragged(&data), Some(Dragged::Rows(..))));
         let w = with.clone();
         drag.on_drop(move |deck, data| w(Box::new(move |b| b.load_dropped(deck as usize, &data))));
         let w = with.clone();
-        drag.on_drop_side(move |index, data| {
+        drag.on_drop_side(move |index, data, moving| {
             w(Box::new(move |b| {
                 let tab = b.side_tab();
                 let at = index.max(0) as usize;
                 // Rows dragged within their own list move there.
                 if let Some(Dragged::Side(from, first, last)) = dragged(&data) {
                     if from == tab {
-                        if tab != LINKED_TAB {
+                        if tab != LINKED_TAB && (tab == 0 || b.side_list(tab).is_some()) {
                             move_block(&mut b.side[tab], first, last, at);
+                            b.side_changed(tab);
                             b.refresh_side();
                         }
                         return;
@@ -1535,6 +1693,10 @@ impl Browser {
                     for id in ids {
                         b.link(id);
                     }
+                    return;
+                }
+                if sidelist::is_list_tab(tab) {
+                    b.drop_tracks_on_sidelist(tab, &data, at, moving);
                     return;
                 }
                 let list = &mut b.side[tab];
@@ -1573,6 +1735,8 @@ impl Browser {
                     for row in (first..=last).rev() {
                         b.unlink_row(row);
                     }
+                } else if sidelist::is_list_tab(tab) {
+                    b.remove_from_sidelist(tab, first, last);
                 } else if first < b.side[tab].len() {
                     let end = (last + 1).min(b.side[tab].len());
                     b.side[tab].drain(first..end);
@@ -1591,13 +1755,16 @@ impl Browser {
             crate::settings::set_hidden_sources(hidden.clone());
             hidden
         });
+        // Add-on sources that work behind another source stay out.
+        let off_rail = crate::sources::off_rail_sources();
         let shown: Vec<bool> = names
             .iter()
-            .map(|n| !hidden.iter().any(|h| h == n))
+            .map(|n| !hidden.iter().any(|h| h == n) && !off_rail.contains(n))
             .collect();
         app.set_sources_shown(std::rc::Rc::new(slint::VecModel::from(shown)).into());
         side_tabs::install(app);
         rail_order::install(app);
+        panels::install(app);
         // Collection Health's rail button hides the same way.
         app.global::<HealthUi>()
             .set_rail_shown(!hidden.iter().any(|h| h == HEALTH_RAIL_NAME));
@@ -1677,6 +1844,13 @@ impl Browser {
             let w = with.clone();
             ui.on_open(move |row| w(Box::new(move |b| b.open_match(row as usize))));
             let w = with.clone();
+            ui.on_fetch(move |row| {
+                w(Box::new(move |b| {
+                    let row = row.max(0) as usize;
+                    b.fetch_rows(row, row);
+                }))
+            });
+            let w = with.clone();
             ui.on_search(move |text| {
                 let text = text.to_string();
                 w(Box::new(move |b| b.search_match(&text)))
@@ -1700,6 +1874,7 @@ impl Browser {
         Self::install_info(app, &b);
         Self::install_picks(app, &b);
         Self::install_wanted(app, &b);
+        Self::install_catalog(app, &b);
         Self::install_buy(app, &b);
         Self::install_filters(app, &b);
         Self::install_columns(app, &b);
@@ -1817,6 +1992,21 @@ impl Browser {
             w(&|b| row.set(b.create_list(what, at)));
             row.get()
         });
+        let weak_top = Rc::downgrade(b);
+        edit.on_tree_row_top(move |row, height| {
+            weak_top
+                .upgrade()
+                .and_then(|b| {
+                    b.try_borrow().ok().map(|b| {
+                        b.visible_nodes
+                            .iter()
+                            .take(row.max(0) as usize)
+                            .map(|&n| height + if b.nodes[n].separator { 11.0 } else { 0.0 })
+                            .sum::<f32>()
+                    })
+                })
+                .unwrap_or(0.0)
+        });
         let w = with.clone();
         edit.on_rename(move |i, name| w(&|b| b.rename_node(i as usize, &name)));
         let w = with.clone();
@@ -1835,64 +2025,175 @@ impl Browser {
         });
         // The open list's own rows are already in it, so only the side
         // panel's rows and the decks' tracks go in by dropping on it.
-        edit.on_accepts_list_drop(|data| {
-            matches!(dragged(&data), Some(Dragged::Side(..) | Dragged::Deck(_)))
+        let weak_open = Rc::downgrade(b);
+        edit.on_accepts_list_drop(move |data| {
+            weak_open
+                .upgrade()
+                .and_then(|b| b.try_borrow().ok().map(|b| b.open_list_accepts(&data)))
+                .unwrap_or(false)
         });
         let w = with.clone();
-        edit.on_drop_on_list(move |data| {
-            w(&|b| {
-                if !matches!(dragged(&data), Some(Dragged::Side(..) | Dragged::Deck(_))) {
-                    return;
-                }
-                let Some(n) = b.nodes.get(b.current_node) else {
-                    return;
-                };
-                if !(n.kind == KIND_LIST || n.kind == KIND_CRATE) || n.locked {
-                    return;
-                }
-                if let Some(list) = n.playlist {
-                    let ids = b.dropped_tracks(&data);
-                    b.add_to_playlist(&ids, list);
-                }
+        edit.on_drop_on_list(move |at, data, moving| {
+            w(&|b| match dragged(&data) {
+                // Its own rows, to put the playlist in a new order.
+                Some(Dragged::Rows(first, last)) => b.reorder_open(first, last, at.max(0) as usize),
+                _ => b.drop_tracks_on_open(&data, moving),
             })
+        });
+        let w = with.clone();
+        edit.on_add_again(move || w(&|b| b.add_again()));
+        let weak_badge = Rc::downgrade(b);
+        edit.on_drop_badge(move |i, data, moving| {
+            weak_badge
+                .upgrade()
+                .and_then(|b| {
+                    b.try_borrow()
+                        .ok()
+                        .map(|b| b.drop_badge(i.max(0) as usize, &data, moving))
+                })
+                .unwrap_or_default()
+                .into()
         });
         edit.on_accepts_drop(|_, data| dragged(&data).is_some());
         // Asked while dragging, so it never waits on a busy browser.
         let weak = Rc::downgrade(b);
         let w = weak.clone();
         edit.on_list_payload(move |row| {
-            let id = w
+            let ids = w
+                .upgrade()
+                .and_then(|b| b.try_borrow().ok().map(|b| b.lists_at(row.max(0) as usize)))
+                .unwrap_or_default();
+            let ids: Vec<String> = ids.iter().map(i64::to_string).collect();
+            let ids = if ids.is_empty() {
+                "-1".to_string()
+            } else {
+                ids.join(",")
+            };
+            DataTransfer::from(SharedString::from(format!("{LIST_PAYLOAD}{ids}")))
+        });
+        let weak_detail = Rc::downgrade(b);
+        edit.on_delete_detail(move |row| {
+            weak_detail
                 .upgrade()
                 .and_then(|b| {
                     b.try_borrow()
                         .ok()
-                        .and_then(|b| b.own_list_at(row.max(0) as usize))
+                        .map(|b| b.delete_detail(row.max(0) as usize))
                 })
-                .unwrap_or(-1);
-            DataTransfer::from(SharedString::from(format!("{LIST_PAYLOAD}{id}")))
+                .unwrap_or_default()
+                .into()
         });
-        edit.on_accepts_list_move(move |i, data| {
+        let w = with.clone();
+        edit.on_pick_lists(move |i, range| w(&|b| b.pick_lists(i.max(0) as usize, range)));
+        edit.on_is_list_drag(|data| dragged_list(&data).is_some());
+        let w = with.clone();
+        edit.on_show_in_sidelist(move |i| {
+            w(&|b| {
+                if let Some(list) = b.own_list_at(i.max(0) as usize) {
+                    b.show_in_sidelist(list);
+                }
+            })
+        });
+        let sidelist = app.global::<SidelistUi>();
+        let w = with.clone();
+        sidelist.on_pick(move |v| w(&|b| b.pick_sidelist(v)));
+        let w = with.clone();
+        sidelist.on_clear(move || w(&|b| b.clear_scratch()));
+        let w = with.clone();
+        sidelist.on_save(move || w(&|b| b.save_scratch_as_playlist()));
+        let w = with.clone();
+        sidelist.on_drop_on_tab(move |tab, data, moving| {
+            w(&|b| b.drop_tracks_on_side_tab(tab.max(0) as usize, &data, moving))
+        });
+        let w = weak.clone();
+        sidelist.on_accepts_list(move |data| {
             let Some(list) = dragged_list(&data) else {
+                return false;
+            };
+            w.upgrade()
+                .and_then(|b| {
+                    b.try_borrow()
+                        .ok()
+                        .map(|b| b.menu_lists.iter().any(|l| l.id == list && !l.is_crate))
+                })
+                .unwrap_or(false)
+        });
+        let w = with.clone();
+        sidelist.on_show_list(move |data| {
+            if let Some(list) = dragged_list(&data) {
+                w(&|b| {
+                    if b.menu_lists.iter().any(|l| l.id == list && !l.is_crate) {
+                        b.show_in_sidelist(list);
+                    }
+                })
+            }
+        });
+        edit.set_mac(cfg!(target_os = "macos"));
+        let w = with.clone();
+        edit.on_nudge_list(move |i, steps| w(&|b| b.nudge_lists(i.max(0) as usize, steps)));
+        let weak_targets = Rc::downgrade(b);
+        edit.on_move_targets(move |i| {
+            let targets: Vec<MoveTarget> = weak_targets
+                .upgrade()
+                .and_then(|b| {
+                    b.try_borrow().ok().map(|b| {
+                        b.move_targets(i.max(0) as usize)
+                            .into_iter()
+                            .map(|(name, depth, _)| MoveTarget {
+                                name: name.into(),
+                                depth,
+                            })
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            ModelRc::new(VecModel::from(targets))
+        });
+        let w = with.clone();
+        edit.on_move_list_to(move |i, k| {
+            w(&|b| {
+                let row = i.max(0) as usize;
+                let Some((_, _, at)) = b.move_targets(row).into_iter().nth(k.max(0) as usize)
+                else {
+                    return;
+                };
+                let ids = b.lists_at(row);
+                b.move_lists_to_node(&ids, at, DropZone::Into);
+            })
+        });
+        edit.on_accepts_list_move(move |i, data, zone| {
+            let ids = dragged_lists(&data);
+            let Some(zone) = DropZone::from_ui(zone) else {
                 return false;
             };
             weak.upgrade()
                 .and_then(|b| {
                     b.try_borrow()
                         .ok()
-                        .map(|b| b.list_move(list, i as usize).is_some())
+                        .map(|b| b.lists_move(&ids, i as usize, zone))
                 })
                 .unwrap_or(false)
         });
         let w = with.clone();
-        edit.on_drop(move |i, data| {
+        edit.on_drop_list(move |i, data, zone| {
             w(&|b| {
-                if let Some(list) = dragged_list(&data) {
-                    b.move_list(list, i as usize);
-                } else if dragged(&data).is_some() {
-                    let ids = b.dropped_tracks(&data);
+                let ids = dragged_lists(&data);
+                if let (Some(&at), Some(zone)) = (
+                    b.visible_nodes.get(i.max(0) as usize),
+                    DropZone::from_ui(zone),
+                ) {
+                    b.move_lists_to_node(&ids, at, zone);
+                }
+            })
+        });
+        let w = with.clone();
+        edit.on_drop(move |i, data, moving| {
+            w(&|b| {
+                if dragged(&data).is_some() {
                     if let Some(list) = b.own_list_at(i as usize) {
-                        b.add_to_playlist(&ids, list);
+                        b.drop_tracks_on_list(&data, list, moving);
                     } else if let Some((stage, dir)) = b.stage_at(i as usize) {
+                        let ids = b.dropped_tracks(&data);
                         b.change_stage(&ids, stage, dir.as_deref());
                     }
                 }
@@ -1928,10 +2229,7 @@ impl Browser {
         edit.on_remove_from_list(move |row| {
             w(&|b| {
                 let row = row.max(0) as usize;
-                // From the bottom up, so the rows above stay where they are.
-                for r in b.chosen_rows(row, row).into_iter().rev() {
-                    b.remove_row_from_list(r);
-                }
+                b.remove_rows_from_list(row, row);
             })
         });
         let w = with.clone();
@@ -1959,19 +2257,24 @@ impl Browser {
         Self::install_checklist(app, &with);
         Self::install_lyrics(app, &with);
         Self::install_track_menu(&edit, &with);
+        Self::install_played(&edit, &with);
         Self::install_keep_going(&app.global::<crate::KeepGoingUi>(), &with);
         Self::install_up_next(&app.global::<crate::UpNextUi>(), &with);
         Self::install_pages(&app.global::<crate::PageUi>(), &with);
         Self::install_mix_export(&app.global::<FilesUi>(), &with);
+        Self::install_mixed_set(app, &with);
         Self::install_health(&app.global::<HealthUi>(), &with);
         Self::install_cleanup(&app.global::<crate::CleanupUi>(), &with);
+        Self::install_lists(&app.global::<crate::ListsUi>(), &with);
         Self::install_fix_names(app, &with);
         Self::install_analysis(&edit, &with);
+        Self::install_tasks(app, &with);
         Self::install_albums(&edit, &with);
         Self::install_album_covers(&app.global::<crate::AlbumsUi>(), &with);
         Self::install_usb_export(app, &edit, &with);
         Self::install_spotify_export(&edit, &with);
         Self::install_playlist_files(&edit, &with);
+        Self::install_stem_files(&edit, &with);
         Self::install_rekordbox_xml(&edit, &with);
     }
 
@@ -2213,7 +2516,7 @@ impl Browser {
     /// Whether the list shows store rows: the stores' results, or the
     /// wanted list wherever it is.
     fn shows_store_rows(&self) -> bool {
-        is_stores(self.tree) || self.shows_wanted()
+        is_stores(self.tree) || self.shows_wanted() || self.shows_quarantine()
     }
 
     /// A store row's button: open its page (and remember the track as
@@ -2247,6 +2550,7 @@ impl Browser {
             StoreRow::Wanted(w) => {
                 open_in_browser(&w.page_url);
             }
+            StoreRow::Removed(r) => return self.bring_back_removed(&[r.id]),
         }
         self.refresh_rows();
     }
@@ -2378,6 +2682,30 @@ impl Browser {
                     notice = "Tracks you click Buy on, or Add to Wanted on a streaming service, wait here until your collection has them.".into();
                 }
             }
+            Some(Contents::Quarantine) => {
+                let needle = query::fold(&self.search);
+                let removed = self
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.removed_tracks().ok())
+                    .unwrap_or_default();
+                rows.extend(
+                    removed
+                        .into_iter()
+                        .filter(|r| {
+                            needle.is_empty()
+                                || [&r.artist, &r.title]
+                                    .iter()
+                                    .any(|t| query::fold(t).contains(&needle))
+                        })
+                        .map(StoreRow::Removed),
+                );
+                if rows.is_empty() && !needle.is_empty() {
+                    notice = "Nothing in quarantine matches.".into();
+                } else if rows.is_empty() {
+                    notice = "Nothing here: tracks you merge, quarantine or remove from your collection wait here until you bring them back.".into();
+                }
+            }
             Some(which @ (Contents::Store(_) | Contents::OtherStores)) => {
                 let bandcamp = self
                     .store
@@ -2448,6 +2776,7 @@ impl Browser {
             .iter()
             .map(|s| s.name.clone())
             .collect();
+        let quarantine = opendj_library::dupes::quarantine_root(&self.folders);
         let list: Vec<TrackRow> = rows
             .iter()
             .map(|r| {
@@ -2483,6 +2812,13 @@ impl Browser {
                         w.duration,
                         "Buy",
                     ),
+                    StoreRow::Removed(r) => (
+                        r.title.clone(),
+                        r.artist.clone(),
+                        health::removed_detail(r, quarantine.as_deref()),
+                        r.duration,
+                        "Bring back",
+                    ),
                 };
                 let row = TrackRow {
                     title: title.into(),
@@ -2498,15 +2834,17 @@ impl Browser {
                     action: action.into(),
                     ..Default::default()
                 };
+                // On the Quarantine page: where the file is, and the fix.
+                let prep = match r {
+                    StoreRow::Removed(_) => columns::PrepFacts {
+                        problem: row.genre.to_string(),
+                        fix: "Bring back".into(),
+                        ..Default::default()
+                    },
+                    _ => Default::default(),
+                };
                 TrackRow {
-                    cells: columns::row_cells(
-                        &ids,
-                        &row,
-                        None,
-                        None,
-                        Default::default(),
-                        Default::default(),
-                    ),
+                    cells: columns::row_cells(&ids, &row, None, None, Default::default(), prep),
                     ..row
                 }
             })
@@ -2696,6 +3034,15 @@ impl Browser {
     /// Loads a file from a music server's cache onto a deck that isn't
     /// playing (deck A first), without it joining the collection: it stays
     /// a file shown, as in Files, until the DJ adds it.
+    /// Whether an add-on plays the streamed track at `link`.
+    fn plays_link(&self, link: &str) -> bool {
+        let host = link
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+            .unwrap_or_default();
+        !host.is_empty() && self.play_sites.contains(&host)
+    }
+
     pub fn load_cached(&mut self, path: &Path) {
         let index = match self.path_index.get(path) {
             Some(&i) => Some(i),
@@ -2841,7 +3188,12 @@ impl Browser {
         self.show_stream();
     }
 
-    /// The streaming service shown in the tree, if one is.
+    /// Whether the list shows a catalog search, or an artist's or album's
+    /// tracks found by one, rather than a playlist.
+    fn shows_catalog_search(&self) -> bool {
+        !self.stream_search.is_empty() && self.shown_stream().is_some_and(|s| searches(s.id))
+    }
+
     fn shown_stream(&self) -> Option<&Stream> {
         self.streams.iter().find(|s| s.source == self.tree)
     }
@@ -2864,7 +3216,10 @@ impl Browser {
 
     /// The streaming playlist selected in the tree, if a service is shown.
     fn current_playlist(&self) -> Option<&str> {
-        self.shown_stream()?;
+        let st = self.shown_stream()?;
+        if searches(st.id) && !self.stream_search.is_empty() {
+            return Some(&self.stream_search);
+        }
         match &self.nodes.get(self.current_node)?.contents {
             Contents::Stream(k) => Some(k),
             _ => None,
@@ -3026,6 +3381,7 @@ impl Browser {
     /// Takes in what the streaming services' workers have done. Called
     /// every frame.
     pub fn poll_streams(&mut self) {
+        self.poll_catalog();
         for i in 0..self.streams.len() {
             let source = self.streams[i].source;
             for event in self.streams[i].service.poll() {
@@ -3087,7 +3443,25 @@ impl Browser {
                         }
                         self.synced_arrived(i, &key);
                     }
+                    Event::Searched { words, hits } => {
+                        if shown {
+                            self.catalog_found(&words, hits);
+                        }
+                    }
                     Event::TracksFailed { key, error } => {
+                        if let Some(words) = key.strip_prefix(spotify::SEARCH) {
+                            let words = words.to_string();
+                            if shown {
+                                self.catalog_failed(&words, &error);
+                            }
+                            let st = &mut self.streams[i];
+                            st.state.loading.remove(&key);
+                            st.state.errors.insert(key.clone(), error);
+                            if shown && self.current_playlist() == Some(key.as_str()) {
+                                self.refresh_rows();
+                            }
+                            continue;
+                        }
                         st.state.loading.remove(&key);
                         if st.state.tracks.contains_key(&key) {
                             // The tracks from last time stay.
@@ -3153,7 +3527,8 @@ impl Browser {
         self.index_of = library.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
         self.indexed = library.iter().map(|t| Indexed::new(t)).collect();
         self.library = library;
-        self.side = [Vec::new(), Vec::new()];
+        self.side[0].clear();
+        self.load_sidelist();
         self.folders = crate::settings::stage_folders();
         self.mixed_sets = crate::settings::mixed_sets_folder();
         self.read_pending_moves();
@@ -3709,6 +4084,8 @@ impl Browser {
             }
             (_, None) => db.create_top_playlist(&name("New playlist")),
         };
+        // At the top of its folder or section, where it's seen.
+        let made = made.and_then(|id| db.put_first(id).map(|_| id));
         match made {
             Ok(id) => {
                 self.reload_tree(Some(id));
@@ -3724,12 +4101,15 @@ impl Browser {
         }
     }
 
-    /// Where the DJ's list or folder `id` would go, dropped on tree row
-    /// `row`: into the folder there, or to the top of the Crates or
-    /// Playlists heading there. None when it can't: imported, the list
-    /// itself or a folder inside it, a crate's top-level place in
-    /// Playlists or a playlist's in Crates.
-    fn list_move(&self, id: i64, row: usize) -> Option<(Option<i64>, bool)> {
+    /// Where the DJ's list or folder `id` would go, dropped on tree node
+    /// `at` at `zone` (see [`DropZone`]): the folder it goes in (None for
+    /// the top), whether that top is under Crates, and the list it goes
+    /// before (None for the end). Into a folder or heading it goes first;
+    /// after an open folder, first inside it. None when it can't: imported,
+    /// the list itself or a folder inside it, a crate under Playlists or a
+    /// playlist under Crates. `at` indexes `nodes`, shown or in a closed
+    /// folder.
+    fn list_move_node(&self, id: i64, at: usize, zone: DropZone) -> Option<ListPlace> {
         if self.tree != COLLECTION || self.history_tab {
             return None;
         }
@@ -3737,46 +4117,307 @@ impl Browser {
             .nodes
             .iter()
             .find(|n| n.playlist == Some(id) && !n.history && !n.locked)?;
-        let target = self.nodes.get(*self.visible_nodes.get(row)?)?;
-        if target.locked {
+        let target = self.nodes.get(at)?;
+        if target.locked || target.history || target.playlist == Some(id) {
             return None;
         }
+        let lists = self.db.as_ref()?.playlists().ok()?;
+        let parent_of = |l: i64| lists.iter().find(|p| p.id == l).and_then(|p| p.parent);
+        // The first of the DJ's own lists right under tree row `at`.
+        let first_inside = |at: usize| {
+            let depth = self.nodes[at].depth;
+            self.nodes[at + 1..]
+                .iter()
+                .take_while(|n| n.depth > depth)
+                .find(|n| n.depth == depth + 1 && !n.locked && n.playlist.is_some_and(|l| l != id))
+                .and_then(|n| n.playlist)
+        };
+        let fits = |crates: bool| match moved.kind {
+            KIND_FOLDER => true,
+            KIND_CRATE => crates,
+            _ => !crates,
+        };
         if target.kind == KIND_SECTION {
             let crates = target.name == "Crates";
-            let fits = match moved.kind {
-                KIND_FOLDER => true,
-                KIND_CRATE => crates,
-                _ => !crates,
-            };
-            return fits.then_some((None, crates));
+            if zone != DropZone::Into || !fits(crates) {
+                return None;
+            }
+            return Some(ListPlace {
+                folder: None,
+                crates,
+                before: first_inside(at),
+            });
         }
-        if target.kind != KIND_FOLDER {
+        let target_id = target.playlist?;
+        let crates = self.on_crate_side(at);
+        if !fits(crates) {
             return None;
         }
-        let folder = target.playlist?;
+        let place = match zone {
+            DropZone::Into if target.kind == KIND_FOLDER => ListPlace {
+                folder: Some(target_id),
+                crates,
+                before: first_inside(at),
+            },
+            DropZone::After
+                if target.kind == KIND_FOLDER && target.expanded && first_inside(at).is_some() =>
+            {
+                ListPlace {
+                    folder: Some(target_id),
+                    crates,
+                    before: first_inside(at),
+                }
+            }
+            DropZone::Into => return None,
+            // Smart lists at the top show under their own heading, so
+            // nothing lines up beside them there.
+            _ if target.kind == KIND_SMART && parent_of(target_id).is_none() => return None,
+            DropZone::Before => ListPlace {
+                folder: parent_of(target_id),
+                crates,
+                before: Some(target_id),
+            },
+            DropZone::After => {
+                let folder = parent_of(target_id);
+                let siblings: Vec<i64> = lists
+                    .iter()
+                    .filter(|p| p.parent == folder && p.id != id)
+                    .map(|p| p.id)
+                    .collect();
+                let next = siblings
+                    .iter()
+                    .position(|&l| l == target_id)
+                    .and_then(|i| siblings.get(i + 1))
+                    .copied();
+                ListPlace {
+                    folder,
+                    crates,
+                    before: next,
+                }
+            }
+        };
         // Not into itself or a folder inside it.
-        let lists = self.db.as_ref()?.playlists().ok()?;
-        let mut at = Some(folder);
-        while let Some(f) = at {
+        let mut up = place.folder;
+        while let Some(f) = up {
             if f == id {
                 return None;
             }
-            at = lists.iter().find(|p| p.id == f).and_then(|p| p.parent);
+            up = parent_of(f);
         }
-        Some((Some(folder), false))
+        Some(place)
     }
 
-    /// Moves the DJ's list or folder `id` to where dropping it on tree row
-    /// `row` puts it.
-    fn move_list(&mut self, id: i64, row: usize) {
-        let Some((folder, crates)) = self.list_move(id, row) else {
+    /// The places Move to… offers for the list at tree row `row`: the top
+    /// of Crates or Playlists and each of the DJ's folders on that side
+    /// (not the list itself or a folder inside it), each with its name,
+    /// depth and where the list goes there (first).
+    fn move_targets(&self, row: usize) -> Vec<(String, i32, usize)> {
+        let Some(id) = self.own_list_at(row) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (at, n) in self.nodes.iter().enumerate() {
+            if n.history || n.locked {
+                continue;
+            }
+            let name = match n.kind {
+                KIND_SECTION => format!("Top of {}", n.name),
+                KIND_FOLDER if n.playlist.is_some() => n.name.clone(),
+                _ => continue,
+            };
+            if self.list_move_node(id, at, DropZone::Into).is_some() {
+                out.push((name, if n.kind == KIND_SECTION { 0 } else { n.depth }, at));
+            }
+        }
+        out
+    }
+
+    /// Moves the list at tree row `row` one place up (`steps` -1) or down
+    /// (1) among the lists beside it.
+    fn nudge_list(&mut self, row: usize, steps: i32) {
+        let Some(id) = self.own_list_at(row) else {
             return;
         };
+        let Some(&at) = self.visible_nodes.get(row) else {
+            return;
+        };
+        let depth = self.nodes[at].depth;
+        // The list or folder beside it in the tree, at the same level.
+        let beside = if steps < 0 {
+            self.nodes[..at]
+                .iter()
+                .enumerate()
+                .rev()
+                .take_while(|(_, n)| n.depth >= depth)
+                .find(|(_, n)| n.depth == depth)
+                .map(|(i, _)| i)
+        } else {
+            self.nodes[at + 1..]
+                .iter()
+                .enumerate()
+                .take_while(|(_, n)| n.depth >= depth)
+                .find(|(_, n)| n.depth == depth)
+                .map(|(i, _)| at + 1 + i)
+        };
+        let Some(beside) = beside else { return };
+        let Some(other) = self.nodes[beside]
+            .playlist
+            .filter(|_| !self.nodes[beside].locked)
+        else {
+            return;
+        };
+        let Some(lists) = self.db.as_ref().and_then(|db| db.playlists().ok()) else {
+            return;
+        };
+        let folder = lists.iter().find(|p| p.id == id).and_then(|p| p.parent);
+        if lists.iter().find(|p| p.id == other).and_then(|p| p.parent) != folder {
+            return;
+        }
+        let before = if steps < 0 {
+            Some(other)
+        } else {
+            let siblings: Vec<i64> = lists
+                .iter()
+                .filter(|p| p.parent == folder && p.id != id)
+                .map(|p| p.id)
+                .collect();
+            siblings
+                .iter()
+                .position(|&l| l == other)
+                .and_then(|i| siblings.get(i + 1))
+                .copied()
+        };
+        let crates = self.on_crate_side(at);
+        self.place_list(
+            id,
+            ListPlace {
+                folder,
+                crates,
+                before,
+            },
+        );
+    }
+
+    /// Whether tree row `at` (an index into `nodes`) is under Crates.
+    fn on_crate_side(&self, at: usize) -> bool {
+        self.nodes[..at]
+            .iter()
+            .rev()
+            .find(|n| n.kind == KIND_SECTION)
+            .is_some_and(|n| n.name == "Crates")
+    }
+
+    /// The lists a move from tree row `row` takes: all the picked ones
+    /// (in tree order) when it is one of several picked, else its own.
+    fn lists_at(&self, row: usize) -> Vec<i64> {
+        let Some(id) = self.own_list_at(row) else {
+            return Vec::new();
+        };
+        if self.list_picks.len() < 2 || !self.list_picks.contains(&id) {
+            return vec![id];
+        }
+        self.nodes
+            .iter()
+            .filter(|n| !n.history && !n.locked)
+            .filter_map(|n| n.playlist)
+            .filter(|p| self.list_picks.contains(p))
+            .collect()
+    }
+
+    /// Shift-click (`range`) picks the lists from the current row to tree
+    /// row `row`; ⌘-click adds or drops the list at `row`.
+    fn pick_lists(&mut self, row: usize, range: bool) {
+        let Some(id) = self.own_list_at(row) else {
+            return;
+        };
+        let current = self
+            .visible_nodes
+            .iter()
+            .position(|&n| n == self.current_node);
+        if self.list_picks.is_empty() {
+            if let Some(own) = current.and_then(|c| self.own_list_at(c)) {
+                self.list_picks.push(own);
+            }
+        }
+        if range {
+            let from = current.unwrap_or(row);
+            for r in from.min(row)..=from.max(row) {
+                if let Some(l) = self.own_list_at(r) {
+                    if !self.list_picks.contains(&l) {
+                        self.list_picks.push(l);
+                    }
+                }
+            }
+        } else if let Some(at) = self.list_picks.iter().position(|&l| l == id) {
+            self.list_picks.remove(at);
+        } else {
+            self.list_picks.push(id);
+        }
+        self.refresh_tree();
+    }
+
+    /// Whether lists `ids` can all go where a drop on tree row `row` at
+    /// `zone` puts them (not onto one of themselves).
+    fn lists_move(&self, ids: &[i64], row: usize, zone: DropZone) -> bool {
+        let Some(&at) = self.visible_nodes.get(row) else {
+            return false;
+        };
+        let onto = self.nodes[at].playlist;
+        !ids.is_empty()
+            && ids.iter().all(|&id| {
+                (ids.len() == 1 || !onto.is_some_and(|o| ids.contains(&o)))
+                    && self.list_move_node(id, at, zone).is_some()
+            })
+    }
+
+    /// Moves lists `ids`, in their order, to where dropping them on
+    /// `nodes[at]` at `zone` puts them, and shows the first there.
+    fn move_lists_to_node(&mut self, ids: &[i64], at: usize, zone: DropZone) {
+        let places: Vec<(i64, ListPlace)> = ids
+            .iter()
+            .filter_map(|&id| Some((id, self.list_move_node(id, at, zone)?)))
+            .collect();
+        if places.is_empty() {
+            return;
+        }
         let Some(db) = &self.db else { return };
-        if let Err(e) = db.move_playlist(id, folder, crates) {
+        for (id, place) in &places {
+            if let Err(e) = db.place_playlist(*id, place.folder, place.crates, place.before) {
+                eprintln!("can't move the list: {e}");
+            }
+        }
+        self.reload_tree(Some(places[0].0));
+        self.save_open_folders();
+    }
+
+    /// Moves the list at tree row `row`, or all the picked ones, one place
+    /// up (`steps` -1) or down (1).
+    fn nudge_lists(&mut self, row: usize, steps: i32) {
+        let mut ids = self.lists_at(row);
+        if steps > 0 {
+            ids.reverse();
+        }
+        for id in ids {
+            let Some(row) = self
+                .visible_nodes
+                .iter()
+                .position(|&n| self.nodes[n].playlist == Some(id) && !self.nodes[n].history)
+            else {
+                continue;
+            };
+            self.nudge_list(row, steps);
+        }
+    }
+
+    fn place_list(&mut self, id: i64, place: ListPlace) {
+        let Some(db) = &self.db else { return };
+        if let Err(e) = db.place_playlist(id, place.folder, place.crates, place.before) {
             eprintln!("can't move the list: {e}");
         }
+        // Selected, with the folders above it open, so it doesn't seem to
+        // vanish.
         self.reload_tree(Some(id));
+        self.save_open_folders();
     }
 
     /// Turns the list at `row` into a crate, or a crate into a playlist.
@@ -3868,6 +4509,37 @@ impl Browser {
         self.reload_tree(None);
     }
 
+    /// What deleting the list or folder at tree row `row` takes with it:
+    /// the lists in a folder, or a list's tracks (which stay in the
+    /// collection).
+    fn delete_detail(&self, row: usize) -> String {
+        let (Some(id), Some(db), Some(&at)) =
+            (self.own_list_at(row), &self.db, self.visible_nodes.get(row))
+        else {
+            return String::new();
+        };
+        if self.nodes[at].kind == KIND_FOLDER {
+            let depth = self.nodes[at].depth;
+            let inside = self.nodes[at + 1..]
+                .iter()
+                .take_while(|n| n.depth > depth)
+                .filter(|n| n.playlist.is_some() && n.kind != KIND_FOLDER)
+                .count();
+            return match inside {
+                0 => "The folder is empty.".to_string(),
+                1 => "The list in it goes too. Its tracks stay in your collection.".to_string(),
+                n => format!("The {n} lists in it go too. Their tracks stay in your collection."),
+            };
+        }
+        match db.playlist_tracks(id).map(|t| t.len()).unwrap_or(0) {
+            0 => "It's empty.".to_string(),
+            n => format!(
+                "It holds {}. They stay in your collection.",
+                health::tracks(n)
+            ),
+        }
+    }
+
     fn delete_node(&mut self, row: usize) {
         let (Some(id), Some(db)) = (self.own_list_at(row), &self.db) else {
             return;
@@ -3886,7 +4558,7 @@ impl Browser {
     /// Adds the tracks of rows `first..=last`, in order, to a playlist.
     fn add_rows_to_playlist(&mut self, first: usize, last: usize, playlist: i64) {
         let indices = self.chosen_tracks(first, last);
-        self.add_to_playlist(&indices, playlist);
+        self.add_tracks(&indices, playlist);
     }
 
     /// Adds library tracks (indices into `library`), in order, to a playlist.
@@ -3905,43 +4577,6 @@ impl Browser {
         if self.nodes.get(self.current_node).and_then(|n| n.playlist) == Some(playlist) {
             self.refresh_rows();
         }
-    }
-
-    /// Takes the track at `row` out of the list being shown.
-    fn remove_row_from_list(&mut self, row: usize) {
-        let Some(Contents::Playlist(list)) = self
-            .nodes
-            .get(self.current_node)
-            .map(|n| n.contents.clone())
-        else {
-            return;
-        };
-        let Some(&Some(index)) = self.rows.get(row) else {
-            return;
-        };
-        // Rows may be sorted or filtered: find which entry of the list this
-        // row is (the nth time the track appears).
-        let id = self.library[index].id;
-        let nth = self.rows[..row]
-            .iter()
-            .filter(|r| r.is_some_and(|i| self.library[i].id == id))
-            .count();
-        let Some(db) = &mut self.db else { return };
-        let entries = db.playlist_tracks(list).unwrap_or_default();
-        let Some(position) = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| **t == id)
-            .nth(nth)
-            .map(|(p, _)| p)
-        else {
-            return;
-        };
-        if let Err(e) = db.remove_from_playlist(list, position) {
-            eprintln!("can't remove from the list: {e}");
-        }
-        self.refresh_crates();
-        self.refresh_rows();
     }
 
     /// Changes the library tracks `indices`, then lists the rows once.
@@ -4041,14 +4676,15 @@ impl Browser {
             if opendj_library::row_id(t.id).is_none() {
                 continue;
             }
-            let w = &mut self.watch[d];
-            if w.track.map(|(id, _)| id) != Some(t.id) {
-                *w = CueWatch {
+            if self.watch[d].track.map(|(id, _)| id) != Some(t.id) {
+                self.watch[d] = CueWatch {
                     track: Some((t.id, std::time::Instant::now())),
                     saved: t.info.hotcues.clone(),
                     ..Default::default()
                 };
+                self.note_load(d, t.id);
             }
+            let w = &mut self.watch[d];
             // The engine sets the new track's cues as it loads; wait for that.
             let settled = w
                 .track
@@ -4097,7 +4733,7 @@ impl Browser {
                 }
             }
             let w = &mut self.watch[d];
-            if self.play[d].get_bool() && !w.recorded {
+            if self.play[d].get_bool() && !w.recorded && self.played.heard(d) {
                 w.played += dt;
                 if w.played >= PLAYED_AFTER {
                     w.recorded = true;
@@ -4106,8 +4742,9 @@ impl Browser {
                 }
             }
         }
-        if (changed && self.history_tab) || cues_changed {
-            self.refresh_rows();
+        self.keep_played(dt);
+        if changed || cues_changed {
+            self.refresh_rows_keeping_current();
         }
     }
 
@@ -4120,6 +4757,7 @@ impl Browser {
             .is_some_and(|last| history::new_set(last, now))
         {
             self.session = None;
+            self.played.at.clear();
         }
         self.last_play = Some(now);
         if self.session.is_none() {
@@ -4137,30 +4775,20 @@ impl Browser {
         if let Err(e) = db.record_play(self.session, id) {
             eprintln!("can't record the play: {e}");
         }
+        self.mark_played(id, now);
         if let Some(&i) = self.index_of.get(&id) {
             let mut e = (*self.library[i]).clone();
             e.info.play_count += 1;
             self.library[i] = Arc::new(e);
         }
-        let showing_session =
-            self.nodes
-                .get(self.current_node)
-                .is_some_and(|n| match (&n.contents, self.session) {
-                    (Contents::Playlist(p), Some(s)) => *p == s,
-                    (Contents::HistoryDay(sets), Some(s)) => sets.contains(&s),
-                    _ => false,
-                });
-        if showing_session {
-            self.refresh_rows();
-        }
     }
 
     fn side_tab(&self) -> usize {
-        self.app
-            .upgrade()
-            .map(|a| a.get_side_tab())
-            .unwrap_or(0)
-            .clamp(0, info::INFO_TAB as i32) as usize
+        let tab = self.app.upgrade().map(|a| a.get_side_tab()).unwrap_or(0);
+        if tab == sidelist::PLAYLIST_TAB as i32 {
+            return sidelist::PLAYLIST_TAB;
+        }
+        tab.clamp(0, info::INFO_TAB as i32) as usize
     }
 
     /// Loads onto a deck that is not playing, preferring deck A.
@@ -4174,6 +4802,15 @@ impl Browser {
         }
         if let Some(id) = self.dropped_track(data) {
             self.engine.load_track(deck, self.library[id].clone());
+            return;
+        }
+        // A streamed track the collection hasn't got: fetched to play here.
+        if let Some(Dragged::Rows(first, _)) = dragged(data) {
+            if self.rows.get(first).is_some_and(Option::is_none) {
+                if let Some((t, service)) = self.stream_row(first) {
+                    self.play_stream(&t, &service, Some(deck));
+                }
+            }
         }
     }
 
@@ -4257,89 +4894,118 @@ impl Browser {
         }
     }
 
+    /// Whether the folder picked in the tree is open.
+    fn picked_folder_open(&self, app: &AppWindow) -> bool {
+        // Jam's column has no folders.
+        if app.global::<StoreUi>().get_source() == INSTRUMENTS {
+            return false;
+        }
+        self.visible_nodes.contains(&self.current_node)
+            && self.navigation_row(self.current_node).children == 2
+    }
+
     /// Acts on library controls set by controller mappings: browsing,
     /// switching between folders and tracks, loading. Called every frame.
     pub fn poll_controllers(&mut self, app: &AppWindow) {
+        self.settle_rail(false);
         if take(&self.lib.show_linked) > 0.0 {
             app.set_side_panel_visible(true);
             app.set_side_tab(LINKED_TAB as i32);
         }
-        let mut steps: f64 = self.lib.steps.iter().map(|(c, sign)| take(c) * sign).sum();
-        // Clicking a folder or a track moves the focus too.
-        self.folders_focused = app.get_folders_focused();
-        if self.lib.focus.iter().map(take).sum::<f64>() != 0.0 {
-            self.folders_focused = !self.folders_focused;
-            app.set_folders_focused(self.folders_focused);
-        }
-        let folder_steps: f64 = self.lib.folder_steps.iter().map(|(c, s)| take(c) * s).sum();
-        // The browse selector on screen shows the turn and its way, from
-        // the controller or the screen alike.
-        let moved = (steps + folder_steps).round() as i64;
-        if moved != 0 {
-            let edit = app.global::<LibraryEdit>();
-            edit.set_browse_way(moved.signum() as i32);
-            edit.set_browse_turns(edit.get_browse_turns().wrapping_add(moved as i32));
-            edit.set_browse_moves(edit.get_browse_moves().wrapping_add(1));
-        }
-        let mut folder_steps = folder_steps.round() as i64;
-        if self.folders_focused {
-            folder_steps += steps.round() as i64;
-            steps = 0.0;
-        }
-        if folder_steps != 0 && !self.visible_nodes.is_empty() {
-            let at = self
-                .visible_nodes
-                .iter()
-                .position(|&n| n == self.current_node)
-                .unwrap_or(0) as i64;
-            let to = (at + folder_steps).clamp(0, self.visible_nodes.len() as i64 - 1) as usize;
-            self.park_view();
-            self.current_node = self.visible_nodes[to];
-            app.set_current_track(-1);
-            self.refresh_tree();
-            self.refresh_rows();
-            self.fetch_current_playlist();
-        }
-        let steps = steps.round() as i64;
-        if steps != 0 && !self.rows.is_empty() {
-            // Moving the selection picks one track again.
-            self.clear_picks();
-            let current = app.get_current_track() as i64;
-            let to = if current < 0 {
-                if steps > 0 {
-                    steps - 1
-                } else {
-                    self.rows.len() as i64 + steps
-                }
+        // Preserve direction: forward and backward have the same meaning as
+        // Right and Left in the keyboard scopes, including leaf-to-content.
+        let forward = take(&self.lib.focus[0]).round() as i32;
+        let backward = take(&self.lib.focus[1]).round() as i32;
+        let relative = take(&self.lib.focus[2]).round() as i32;
+        for _ in 0..forward.max(0) {
+            // A browse press steps right, as → does. From the tracks, where →
+            // has nowhere to go, it goes back to the folders: mappings with
+            // one press and no Shift+press still get from one to the other.
+            if app.global::<BrowserFocus>().get_pane() == BrowserPane::Content {
+                app.global::<BrowserFocus>()
+                    .invoke_focus(BrowserPane::Folders);
             } else {
-                current + steps
-            };
-            app.set_current_track(to.clamp(0, self.rows.len() as i64 - 1) as i32);
+                self.navigate_browser(3, 1);
+            }
         }
+        for _ in 0..backward.max(0) {
+            // A Shift+press steps left, as ← does, except in the folders:
+            // it closes an open folder, and otherwise goes straight to the
+            // rail instead of up one folder at a time, since turning the
+            // knob already reaches the parents.
+            let focus = app.global::<BrowserFocus>();
+            if focus.get_pane() == BrowserPane::Folders && !self.picked_folder_open(app) {
+                focus.invoke_focus(BrowserPane::Sources);
+            } else {
+                self.navigate_browser(2, 1);
+            }
+        }
+        for _ in 0..relative.saturating_abs() {
+            self.navigate_browser(if relative > 0 { 3 } else { 2 }, 1);
+        }
+        let steps = self
+            .lib
+            .steps
+            .iter()
+            .map(|(c, sign)| take(c) * sign)
+            .sum::<f64>()
+            .round() as i32;
+        if steps != 0 {
+            self.clear_picks();
+            let edit = app.global::<LibraryEdit>();
+            edit.set_browse_way(steps.signum());
+            edit.set_browse_turns(edit.get_browse_turns().wrapping_add(steps));
+            edit.set_browse_moves(edit.get_browse_moves().wrapping_add(1));
+            self.navigate_browser(if steps > 0 { 1 } else { 0 }, steps.saturating_abs());
+        }
+        let folder_steps = self
+            .lib
+            .folder_steps
+            .iter()
+            .map(|(c, sign)| take(c) * sign)
+            .sum::<f64>()
+            .round() as i32;
+        if folder_steps != 0 {
+            app.global::<BrowserFocus>()
+                .invoke_focus(BrowserPane::Folders);
+            self.navigate_browser(
+                if folder_steps > 0 { 1 } else { 0 },
+                folder_steps.saturating_abs(),
+            );
+        }
+        self.folders_focused = app.global::<BrowserFocus>().get_pane() == BrowserPane::Folders;
+        app.set_folders_focused(self.folders_focused);
 
         let selected = usize::try_from(app.get_current_track())
             .ok()
             .and_then(|r| self.rows.get(r).copied().flatten());
-        let widget = if self.folders_focused { 2.0 } else { 3.0 };
-        if self.lib.focused_widget.get() != widget {
-            self.lib.focused_widget.set(widget);
+        let pane = app.global::<BrowserFocus>().get_pane();
+        if pane != BrowserPane::Sources {
+            let widget = if pane == BrowserPane::Folders {
+                2.0
+            } else {
+                3.0
+            };
+            if self.lib.focused_widget.get() != widget {
+                self.lib.focused_widget.set(widget);
+            }
         }
         let go = take(&self.lib.go_to_item) > 0.0;
         if take(&self.lib.toggle_folder) > 0.0 {
-            if let Some(n) = self.nodes.get_mut(self.current_node) {
-                n.expanded = !n.expanded;
-                self.save_open_folders();
-                self.refresh_tree();
+            if app.global::<StoreUi>().get_source() == INSTRUMENTS {
+                // Jam's column has no folders to open.
+            } else if let Some(row) = self
+                .visible_nodes
+                .iter()
+                .position(|&n| n == self.current_node)
+            {
+                self.toggle_folder_row(row);
             }
         }
-        if go && self.folders_focused {
-            // Like pressing the browse knob on a folder: open or close it.
-            if let Some(n) = self.nodes.get_mut(self.current_node) {
-                n.expanded = !n.expanded;
-                self.save_open_folders();
-                self.refresh_tree();
-            }
-        } else if (go || take(&self.lib.load_first_stopped) > 0.0) && selected.is_some() {
+        let load_first = take(&self.lib.load_first_stopped) > 0.0;
+        if go && pane != BrowserPane::Content {
+            self.navigate_browser(3, 1);
+        } else if (go || load_first) && selected.is_some() {
             self.adopt(&[selected.unwrap()]);
             self.load_to_free_deck(selected.unwrap());
         }
@@ -4535,7 +5201,14 @@ impl Browser {
             let edited = t.info.fixed_grid && t.grid != entry.grid && !t.grid.is_empty();
             let key_changed = entry.key != t.key || entry.info.key_detected != t.info.key_detected;
             let lock_changed = entry.info.grid_locked != t.info.grid_locked;
-            if !(analysed || edited || lock_changed || entry.bpm != t.bpm || key_changed) {
+            let mode_changed = entry.info.grid_mode != t.info.grid_mode;
+            if !(analysed
+                || edited
+                || lock_changed
+                || mode_changed
+                || entry.bpm != t.bpm
+                || key_changed)
+            {
                 continue;
             }
             // An analysed grid replacing one the DJ edited or an import
@@ -4546,6 +5219,7 @@ impl Browser {
             e.key = t.key.clone();
             e.info.key_detected = t.info.key_detected;
             e.info.grid_locked = t.info.grid_locked;
+            e.info.grid_mode = t.info.grid_mode;
             if analysed || edited {
                 e.set_grid(t.grid.clone());
                 e.info.fixed_grid = true;
@@ -4559,6 +5233,9 @@ impl Browser {
                 } else {
                     Ok(())
                 };
+                if mode_changed {
+                    result = result.and_then(|()| db.set_grid_mode(t.id, t.info.grid_mode));
+                }
                 if reset {
                     result = result.and_then(|()| db.clear_grid(t.id));
                 }
@@ -4661,6 +5338,143 @@ impl Browser {
         }
     }
 
+    fn select_folder_row(&mut self, row: usize, open_artist: bool) {
+        let Some(&n) = self.visible_nodes.get(row) else {
+            return;
+        };
+        self.park_view();
+        // Health headings open their first check on click. Directional
+        // navigation skips the headings so that moving up never gets stuck.
+        let n = if self.nodes[n].kind == KIND_HEALTH_SECTION {
+            (n + 1).min(self.nodes.len() - 1)
+        } else {
+            n
+        };
+        self.current_node = n;
+        self.list_picks.clear();
+        // A playlist picked in a streaming service takes the
+        // place of what a catalog search listed.
+        self.stream_search.clear();
+        self.review_at = None;
+        self.dupe_tab = None;
+        // Clicking an artist opens it; navigating through artists does not.
+        if open_artist && self.nodes[n].kind == KIND_ARTIST {
+            self.nodes[n].expanded = true;
+        }
+        if let Some(app) = self.app.upgrade() {
+            app.global::<LibraryEdit>().set_making_smart(false);
+            app.global::<crate::CatalogSearch>().set_open(false);
+            app.set_folders_focused(true);
+            app.set_current_track(-1);
+        }
+        self.health_status.clear();
+        self.close_cleanup();
+        self.close_page();
+        self.refresh_tree();
+        self.refresh_rows();
+        self.fetch_current_playlist();
+    }
+
+    fn toggle_folder_row(&mut self, row: usize) {
+        let Some(&n) = self.visible_nodes.get(row) else {
+            return;
+        };
+        if !self.nodes[n].lazy && !self.has_children(n) {
+            return;
+        }
+        if self.nodes[n].lazy {
+            let old_len = self.nodes.len();
+            open_dir(&mut self.nodes, n);
+            if self.current_node > n {
+                self.current_node += self.nodes.len() - old_len;
+            }
+        } else {
+            self.nodes[n].expanded = !self.nodes[n].expanded;
+            self.save_open_folders();
+            if !self.nodes[n].expanded && self.current_node > n {
+                let depth = self.nodes[n].depth;
+                let hidden = self.nodes[n + 1..]
+                    .iter()
+                    .take_while(|node| node.depth > depth)
+                    .count();
+                if self.current_node - n <= hidden {
+                    self.select_folder_row(row, false);
+                    return;
+                }
+            }
+        }
+        self.refresh_tree();
+    }
+
+    fn navigate_folders(&mut self, code: i32) {
+        let Some(direction) = Direction::from_code(code) else {
+            return;
+        };
+        let rows: Vec<Row> = self
+            .visible_nodes
+            .iter()
+            .map(|&i| self.navigation_row(i))
+            .collect();
+        let current = self
+            .visible_nodes
+            .iter()
+            .position(|&n| n == self.current_node);
+        if let Some(app) = self.app.upgrade() {
+            app.set_folders_focused(true);
+        }
+        match tree_navigation::navigate(&rows, current, direction) {
+            Some(Action::Select(row)) => self.select_folder_row(row, false),
+            Some(Action::Toggle(row)) => {
+                let was_lazy = self
+                    .visible_nodes
+                    .get(row)
+                    .is_some_and(|&i| self.nodes[i].lazy);
+                self.toggle_folder_row(row);
+                if matches!(direction, Direction::Right)
+                    && was_lazy
+                    && self
+                        .visible_nodes
+                        .get(row)
+                        .is_some_and(|&i| self.navigation_row(i).children == 0)
+                {
+                    if let Some(app) = self.app.upgrade() {
+                        app.global::<BrowserFocus>()
+                            .invoke_focus(BrowserPane::Content);
+                    }
+                }
+            }
+            Some(Action::EnterContent) => {
+                if let Some(app) = self.app.upgrade() {
+                    app.global::<BrowserFocus>()
+                        .invoke_focus(BrowserPane::Content);
+                }
+            }
+            Some(Action::ExitToSources) => {
+                if let Some(app) = self.app.upgrade() {
+                    app.global::<BrowserFocus>()
+                        .invoke_focus(BrowserPane::Sources);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn navigation_row(&self, i: usize) -> Row {
+        let n = &self.nodes[i];
+        Row {
+            depth: n.depth,
+            children: if n.lazy {
+                1
+            } else if !self.has_children(i) {
+                0
+            } else if n.expanded {
+                2
+            } else {
+                1
+            },
+        }
+    }
+
     fn refresh_tree(&mut self) {
         self.visible_nodes.clear();
         let mut hidden_below: Option<i32> = None;
@@ -4679,23 +5493,25 @@ impl Browser {
                 hidden_below = Some(n.depth);
             }
         }
+        let mut top = 0.0;
+        // Only worked out while Collection Health's tree is shown.
+        let tags_to_roll_up = if self.health_view && self.saved() && self.tree == COLLECTION {
+            self.tags_to_roll_up()
+        } else {
+            0
+        };
         let folders: Vec<Folder> = self
             .visible_nodes
             .iter()
             .map(|&i| {
                 let n = &self.nodes[i];
+                let row_top = top;
+                top += if n.separator { 45.0 } else { 34.0 };
                 Folder {
                     name: n.name.clone().into(),
                     depth: n.depth,
-                    children: if n.lazy {
-                        1
-                    } else if !self.has_children(i) {
-                        0
-                    } else if n.expanded {
-                        2
-                    } else {
-                        1
-                    },
+                    children: self.navigation_row(i).children,
+                    top: row_top,
                     kind: n.kind,
                     editable: n.playlist.is_some() && !n.history && !n.locked,
                     locked: n.locked,
@@ -4703,10 +5519,27 @@ impl Browser {
                     analysable: !n.history && Self::analysable(&n.contents),
                     stage: matches!(n.contents, Contents::Stage(..)),
                     bundle: matches!(n.contents, Contents::InboxAlbum(_)),
+                    picked: n.playlist.is_some_and(|p| self.list_picks.contains(&p)),
                     separator: n.separator,
                     color: n.color.map_or(-1, |c| c as i32),
                     icon: match n.contents {
-                        Contents::Area(a) => self.area_state(a) as i32,
+                        Contents::Health(Some(c)) if n.kind == KIND_AREA => {
+                            self.check_state(c) as i32
+                        }
+                        Contents::Lists => {
+                            (if self.list_report.issues.is_empty() {
+                                health::CheckState::Clear
+                            } else {
+                                health::CheckState::Check
+                            }) as i32
+                        }
+                        Contents::Tags if n.kind == KIND_AREA => {
+                            (if tags_to_roll_up > 0 {
+                                health::CheckState::Check
+                            } else {
+                                health::CheckState::Clear
+                            }) as i32
+                        }
                         _ => n.icon as i32,
                     },
                     count: match &n.contents {
@@ -4726,8 +5559,12 @@ impl Browser {
                             .count() as i32,
                         Contents::Health(Some(check)) => self.health_count(*check) as i32,
                         Contents::Dupes(case) => self.dupe_tracks(Some(*case)).len() as i32,
-                        Contents::Area(a) => self.area_count(*a) as i32,
                         Contents::Ignored => self.ignored_tracks().len() as i32,
+                        Contents::Quarantine => self.removed as i32,
+                        Contents::Tags if n.kind == KIND_AREA => tags_to_roll_up as i32,
+                        Contents::Lists => {
+                            (self.list_report.lists - self.list_report.tidy()) as i32
+                        }
                         _ => n.count.map_or(-1, |c| c as i32),
                     },
                     dim: n.dim,
@@ -4755,6 +5592,7 @@ impl Browser {
             path.push(&n.name);
         }
         self.menu_lists = lists;
+        self.refresh_sidelist_ui();
         let in_list = self.nodes.get(self.current_node).is_some_and(|n| {
             (n.kind == KIND_LIST || n.kind == KIND_CRATE) && n.playlist.is_some() && !n.locked
         });
@@ -4791,6 +5629,7 @@ impl Browser {
                     && matches!(kind, KIND_LIST | KIND_HISTORY | KIND_CRATE),
                 mixcloud: self.tree == MIXED_SETS,
                 rekordbox: node.is_some() && self.rekordbox_exportable(self.current_node),
+                stems: analysable,
             });
             let name = match self.nodes.get(self.current_node) {
                 Some(n) => n.title.clone().unwrap_or_else(|| n.name.clone()),
@@ -4969,11 +5808,14 @@ impl Browser {
                 .filter(|&t| self.at_stage(&self.library[t], *stage, dir.as_deref()))
                 .collect(),
             Contents::Query(q) => self.search(&Query::parse(q), None),
-            Contents::Health(Some(Check::Duplicate)) => self.dupe_tracks(None),
-            Contents::Dupes(case) => self.dupe_tracks(Some(*case)),
+            Contents::Health(Some(Check::Duplicate)) => self.dupe_rows(None),
+            Contents::Dupes(case) => self.dupe_rows(Some(*case)),
             Contents::Health(Some(check)) => self.health_tracks(*check),
             Contents::Health(None) | Contents::Area(_) => Vec::new(),
             Contents::Ignored => self.ignored_tracks(),
+            // Store rows: tracks no longer in the library.
+            Contents::Quarantine => Vec::new(),
+            Contents::Tags | Contents::Lists => Vec::new(),
             Contents::Grouping(g) => all()
                 .into_iter()
                 .filter(|&t| self.library[t].info.grouping == *g)
@@ -5049,8 +5891,8 @@ impl Browser {
                                     artist: t.artist(),
                                     album: &t.album,
                                     genre: "",
-                                    bpm: 0.0,
-                                    key: "",
+                                    bpm: t.bpm,
+                                    key: &t.key,
                                     duration: t.duration,
                                     rating: 0,
                                     local: None,
@@ -5153,8 +5995,8 @@ impl Browser {
                         artist: sp.artist(),
                         album: &sp.album,
                         genre: "",
-                        bpm: 0.0,
-                        key: "",
+                        bpm: sp.bpm,
+                        key: &sp.key,
                         duration: sp.duration,
                         rating: 0,
                         local: None,
@@ -5186,24 +6028,58 @@ impl Browser {
         same_length: bool,
     ) -> Vec<Option<usize>> {
         // Files only shown in Files don't count as in the collection.
-        let normalized: Vec<(String, String)> = self
-            .library
-            .iter()
-            .map(|t| match is_browsed(t) {
-                true => Default::default(),
-                false => (spotify::normalize(&t.title), spotify::normalize(&t.artist)),
-            })
-            .collect();
+        // Each track's names are made comparable once, and found by title,
+        // so matching a long list stays quick while the DJ types.
+        let mut artists = vec![String::new(); self.library.len()];
+        let mut by_title: HashMap<String, Vec<usize>> = HashMap::new();
         let mut by_isrc = HashMap::new();
         for (i, t) in self.library.iter().enumerate() {
+            if is_browsed(t) {
+                continue;
+            }
+            let title = spotify::normalize(&t.title);
+            if !title.is_empty() {
+                artists[i] = spotify::normalize(&t.artist);
+                by_title.entry(title).or_default().push(i);
+            }
             let isrc = spotify::normalize_isrc(&t.info.isrc);
-            if !isrc.is_empty() && !is_browsed(t) {
+            if !isrc.is_empty() {
                 by_isrc.entry(isrc).or_insert(i);
             }
         }
         let length_fits = |sp: &StreamTrack, i: usize| {
             let d = self.library[i].duration;
             !same_length || sp.duration <= 0.0 || d <= 0.0 || (sp.duration - d).abs() <= 2.0
+        };
+        // The first collection track (as `spotify::matches` would pick it):
+        // the same title by one of its artists, or, with no artist, the
+        // artist and title run together in the title.
+        let by_names = |sp: &StreamTrack| {
+            let want = spotify::normalize(&sp.title);
+            if want.is_empty() {
+                return None;
+            }
+            let names: Vec<String> = sp
+                .artists
+                .iter()
+                .map(|a| spotify::normalize(a))
+                .filter(|a| !a.is_empty())
+                .collect();
+            let same = by_title
+                .get(&want)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&i| names.iter().any(|a| artists[i].contains(a.as_str())));
+            let joined = names.iter().flat_map(|a| {
+                by_title
+                    .get(&format!("{a}{want}"))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|&i| artists[i].is_empty())
+            });
+            same.chain(joined).filter(|&i| length_fits(sp, i)).min()
         };
         tracks
             .iter()
@@ -5215,14 +6091,7 @@ impl Browser {
                 by_isrc
                     .get(&spotify::normalize_isrc(&sp.isrc))
                     .copied()
-                    .or_else(|| {
-                        normalized
-                            .iter()
-                            .enumerate()
-                            .position(|(i, (title, artist))| {
-                                spotify::matches(sp, title, artist) && length_fits(sp, i)
-                            })
-                    })
+                    .or_else(|| by_names(sp))
             })
             .collect()
     }
@@ -5282,10 +6151,12 @@ impl Browser {
                 .shown_stream()
                 .is_some_and(|st| st.state.manual.contains_key(&key)),
         };
+        let fetchable = self.fetchable_row(row);
         if let Some(app) = self.app.upgrade() {
             let ui = app.global::<StreamMatch>();
             ui.set_query(query.clone().into());
             ui.set_manual(manual);
+            ui.set_fetchable(fetchable);
         }
         self.search_match(&query);
     }
@@ -5491,6 +6362,10 @@ impl Browser {
         }
         if self.shows_store_rows() {
             self.set_close_matches(false);
+            // The Quarantine page has Collection Health's columns.
+            if self.shows_quarantine() {
+                self.follow_list_sort();
+            }
             self.refresh_store_rows();
             return;
         }
@@ -5504,8 +6379,10 @@ impl Browser {
         let needle = query::fold(&self.search);
         let filtering = self.filtering();
         let all = self.row_data();
+        // What the service found for the words is listed as it came.
+        let found = self.shows_catalog_search();
         let keep = |q: &Query, r: &RowData| match r.local {
-            _ if q.is_empty() => true,
+            _ if q.is_empty() || found => true,
             Some(id) => q.matches(&self.library[id], &self.indexed[id], &cx),
             None if filtering => false,
             None => [r.title, &r.artist, r.album]
@@ -5632,6 +6509,15 @@ impl Browser {
                     streamed: r.stream.is_some(),
                     // Only while the day is in play order.
                     set_start: r.list.set_start && self.sort_column == columns::ORDER,
+                    played: r
+                        .local
+                        .map(|id| self.played.time_of(library[id].id))
+                        .unwrap_or_default()
+                        .into(),
+                    // Filled in by `show_row_fetches`.
+                    fetching: false,
+                    fetch: 0.0,
+                    fetch_failed: false,
                 };
                 let crates = r.local.and_then(|id| self.crates.get(&library[id].id));
                 TrackRow {
@@ -5696,6 +6582,10 @@ impl Browser {
             }
         }
         self.refresh_album_ui();
+        // A check's page counts the tracks listed, so it follows the list.
+        if self.shown_check().is_some() {
+            self.refresh_health_ui();
+        }
     }
 
     /// Sets the sort and columns up for the node shown: one of the DJ's
@@ -5716,7 +6606,15 @@ impl Browser {
         let history = list.is_some() && node.is_some_and(|n| n.history);
         let prep = node.is_some_and(|n| matches!(n.contents, Contents::Stage(Stage::Triage, _)));
         let area = self.health_view
-            && node.is_some_and(|n| matches!(n.contents, Contents::Area(_) | Contents::Ignored));
+            && node.is_some_and(|n| {
+                matches!(
+                    n.contents,
+                    Contents::Health(Some(_))
+                        | Contents::Area(_)
+                        | Contents::Ignored
+                        | Contents::Quarantine
+                )
+            });
         let kind = if history {
             columns::Columns::History
         } else if area {
@@ -5800,7 +6698,7 @@ impl Browser {
                 title: t.title.clone().into(),
                 artist: t.artist.clone().into(),
                 bpm: if t.bpm > 0.0 {
-                    format!("{:.0}", t.bpm).into()
+                    format!("{:.1}", t.bpm).into()
                 } else {
                     SharedString::new()
                 },
@@ -5829,7 +6727,12 @@ impl Browser {
         app.set_side_total(
             format!(
                 "{} · {} song{}",
-                short_time(total),
+                // Past an hour, as hours and minutes: easier to read.
+                if total >= 3600.0 {
+                    total_time(total)
+                } else {
+                    short_time(total).to_string()
+                },
                 ids.len(),
                 if ids.len() == 1 { "" } else { "s" }
             )
@@ -5894,7 +6797,7 @@ impl Browser {
                     title: t.title.clone().into(),
                     artist: t.artist.clone().into(),
                     bpm: if t.bpm > 0.0 {
-                        format!("{:.0}", t.bpm).into()
+                        format!("{:.1}", t.bpm).into()
                     } else {
                         SharedString::new()
                     },

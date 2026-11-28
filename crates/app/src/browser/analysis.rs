@@ -1,30 +1,36 @@
 //! Analysing tracks on request: the track menu's Analyze Track and the
 //! tree's Analyze All, how the queue is going (a dot on each queued row,
-//! "Analyzing 3 of 12" in the footer), and keeping the phrases analysis
+//! with the Background panel for the rest), and keeping the phrases analysis
 //! finds in the library.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use opendj_engine::{phrases, Source, Track, NUM_DECKS};
+use opendj_engine::{phrases, GridMode, Source, Track, NUM_DECKS};
 use slint::{ComponentHandle, Model};
 
 use super::{is_browsed, Browser, Contents};
 use crate::{AppWindow, LibraryEdit};
 
 /// Where the queue's progress was last shown: rows with a dot and their
-/// state (1 waiting, 2 being analysed), and the footer's text.
+/// state (1 waiting, 2 being analysed).
 #[derive(Default)]
 pub(super) struct Shown {
     pub(super) marks: HashMap<usize, i32>,
-    footer: String,
     /// The queue as it was then (see [`crate::analysis_queue::AnalysisQueue::signature`]).
     signature: (usize, usize, usize),
     /// Tracks analysed and not yet saved and shown.
     waiting: Vec<Track>,
     /// When analysed tracks were last saved and shown.
     applied: Option<Instant>,
+    /// Tracks due to be saved and shown, a few each UI tick while a deck
+    /// plays (see [`Shown::slice`]).
+    pub(super) applying: std::collections::VecDeque<Track>,
+    /// The sidebar's counts wait while a deck plays; when they were last
+    /// worked out, and whether they're behind.
+    pub(super) tree_at: Option<Instant>,
+    pub(super) tree_stale: bool,
 }
 
 /// How often tracks analysed in the background are saved and shown, at
@@ -32,7 +38,45 @@ pub(super) struct Shown {
 /// sidebar's counts).
 pub(super) const APPLY_EVERY: Duration = Duration::from_secs(2);
 
+/// Tracks saved and shown per UI tick while a deck plays: each costs a
+/// database write and its rows, and a whole batch at once ran over a frame.
+const PER_TICK_PLAYING: usize = 1;
+
+/// How often the sidebar's counts are worked out again while a deck plays,
+/// at most: it goes through the whole library and lays the sidebar out
+/// again, which ran over a frame.
+pub(super) const TREE_EVERY_PLAYING: Duration = Duration::from_secs(30);
+
 impl Shown {
+    /// The tracks to save and show this tick: all that are due, or only a
+    /// few while `playing`, the rest waiting for the next ticks.
+    pub(super) fn slice(&mut self, due: Vec<Track>, playing: bool) -> Vec<Track> {
+        self.applying.extend(due);
+        let n = if playing {
+            PER_TICK_PLAYING.min(self.applying.len())
+        } else {
+            self.applying.len()
+        };
+        self.applying.drain(..n).collect()
+    }
+
+    /// Whether the sidebar's counts should be worked out now, after
+    /// analysed tracks changed them: at once while no deck plays, else at
+    /// most every [`TREE_EVERY_PLAYING`].
+    pub(super) fn tree_due(&mut self, changed: bool, playing: bool) -> bool {
+        self.tree_stale |= changed;
+        let due = self.tree_stale
+            && (!playing
+                || self
+                    .tree_at
+                    .is_none_or(|at| at.elapsed() >= TREE_EVERY_PLAYING));
+        if due {
+            self.tree_stale = false;
+            self.tree_at = Some(Instant::now());
+        }
+        due
+    }
+
     /// Takes in tracks just analysed, and gives back those to save and
     /// show now: all that are waiting, once [`APPLY_EVERY`] has passed
     /// since last time or the queue is `empty`.
@@ -80,6 +124,7 @@ impl Browser {
             })
         });
         let w = with.clone();
+        let w = with.clone();
         edit.on_analyze_next(move |count| {
             w(&|b| {
                 let tracks: Vec<usize> = b
@@ -102,6 +147,34 @@ impl Browser {
             })
         });
         let w = with.clone();
+        edit.on_prepare_hq_stems_all(move |row| {
+            w(&|b| {
+                let Some(&node) = b.visible_nodes.get(row as usize) else {
+                    return;
+                };
+                // One queue, in list order; the background tasks panel shows
+                // it and can pause, stop or reorder it. Tracks with stems
+                // already are skipped, and mixed sets too (hours long, as
+                // for Analyze All).
+                for t in b.node_tracks(node) {
+                    let track = &b.library[t];
+                    if matches!(track.source, Source::File(_)) && !b.is_mixed_set(track) {
+                        b.engine.prepare_hq_stems(track);
+                    }
+                }
+            })
+        });
+        let w = with.clone();
+        edit.on_set_grid_mode(move |first, last, mode| {
+            w(&|b| {
+                let Some(mode) = GridMode::from_id(mode as u8) else {
+                    return;
+                };
+                let picked = b.picked_rows(first, last);
+                b.set_grid_mode(&picked, mode);
+            })
+        });
+        let w = with.clone();
         edit.on_prepare_hq_stems(move |first, last| {
             w(&|b| {
                 for i in b.picked_rows(first, last) {
@@ -113,13 +186,6 @@ impl Browser {
                         b.engine.prepare_hq_stems(t);
                     }
                 }
-            })
-        });
-        let w = with.clone();
-        edit.on_cancel_analysis(move || {
-            w(&|b| {
-                b.analysis.cancel();
-                b.show_analysis();
             })
         });
     }
@@ -135,6 +201,44 @@ impl Browser {
                 | Contents::Dir(_)
                 | Contents::Health(None)
         )
+    }
+
+    /// Gives library tracks (by index) a grid mode and fits their grids
+    /// again in it. A track on a deck goes through the deck; locked grids
+    /// stay as they are.
+    fn set_grid_mode(&mut self, indices: &[usize], mode: GridMode) {
+        for &i in indices {
+            let Some(t) = self.library.get(i).cloned() else {
+                continue;
+            };
+            if t.info.grid_locked || !matches!(t.source, Source::File(_)) || is_browsed(&t) {
+                continue;
+            }
+            if let Some(d) = self.loaded.iter().position(|l| *l == Some(t.id)) {
+                self.deck_grid_mode[d].set(f64::from(mode.id()));
+                continue;
+            }
+            if t.info.grid_mode == Some(mode) {
+                continue;
+            }
+            let mut e = (*t).clone();
+            e.info.grid_mode = Some(mode);
+            if let (true, Some(db)) = (self.saved(), &self.db) {
+                if let Err(err) = db.set_grid_mode(e.id, e.info.grid_mode) {
+                    eprintln!("can't save the grid mode: {err}");
+                }
+            }
+            let e = Arc::new(e);
+            self.library[i] = e.clone();
+            // An edited grid gives way to the analysed one, as Reset does.
+            let mut queued = (*e).clone();
+            if !matches!(e.info.grid_from.as_str(), "" | "analysis") {
+                queued.info.fixed_grid = true;
+                queued.info.grid_analysed = true;
+            }
+            self.analysis.add_refit(&Arc::new(queued));
+        }
+        self.show_analysis();
     }
 
     /// Queues library tracks (by index) to be analysed afresh.
@@ -215,8 +319,8 @@ impl Browser {
         self.library[i] = Arc::new(e);
     }
 
-    /// Puts the queue's progress on the rows and in the footer, when it
-    /// has changed.
+    /// Puts the queue's progress on the rows, when it has changed (the
+    /// Background panel shows the rest; see `browser/tasks.rs`).
     pub(super) fn show_analysis(&mut self) {
         let signature = self.analysis.signature();
         if signature == self.analysis_shown.signature {
@@ -224,16 +328,7 @@ impl Browser {
         }
         self.analysis_shown.signature = signature;
         self.mark_analysis_rows();
-        let footer = match self.analysis.progress() {
-            Some((n, total)) => format!("Analyzing {n} of {total}"),
-            None => String::new(),
-        };
         if let Some(app) = self.app.upgrade() {
-            let edit = app.global::<LibraryEdit>();
-            if footer != self.analysis_shown.footer {
-                edit.set_analysis_status(footer.as_str().into());
-                self.analysis_shown.footer = footer;
-            }
             // Keep unanalyzed-count in sync so the context menu shows
             // the right quick-analyze options.
             self.update_unanalyzed_count(&app);
@@ -335,5 +430,55 @@ mod tests {
         let ids: Vec<usize> = shown.due(Vec::new(), true).iter().map(|t| t.id).collect();
         assert_eq!(ids, [2, 3]);
         assert!(shown.due(Vec::new(), true).is_empty());
+    }
+
+    #[test]
+    fn analysed_tracks_trickle_in_while_a_deck_plays() {
+        let mut shown = Shown::default();
+        let track = |id| Track {
+            id,
+            artist: String::new(),
+            title: String::new(),
+            album: String::new(),
+            genre: String::new(),
+            rating: 0,
+            bpm: 0.0,
+            key: String::new(),
+            duration: 0.0,
+            first_beat: 0.0,
+            source: Source::Synth { seed: 1 },
+            waveform: Default::default(),
+            audio: None,
+            cover: None,
+            grid: Default::default(),
+            info: Default::default(),
+        };
+        // Playing: one per tick, the rest wait their turn.
+        let ids = |v: Vec<Track>| v.iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(shown.slice(vec![track(1), track(2), track(3)], true)),
+            [1]
+        );
+        assert_eq!(ids(shown.slice(Vec::new(), true)), [2]);
+        // Stopped: all that are left at once.
+        assert_eq!(ids(shown.slice(vec![track(4)], false)), [3, 4]);
+        assert!(shown.slice(Vec::new(), true).is_empty());
+    }
+
+    #[test]
+    fn the_sidebar_counts_wait_while_a_deck_plays() {
+        let mut shown = Shown::default();
+        // Stopped: at once, and only after something changed.
+        assert!(!shown.tree_due(false, false));
+        assert!(shown.tree_due(true, false));
+        assert!(!shown.tree_due(false, false));
+        // Playing: not again within TREE_EVERY_PLAYING...
+        assert!(!shown.tree_due(true, true));
+        assert!(!shown.tree_due(false, true));
+        // ...but as soon as the decks stop.
+        assert!(shown.tree_due(false, false));
+        // Long enough since the last time: while playing too.
+        shown.tree_at = Some(Instant::now() - TREE_EVERY_PLAYING);
+        assert!(shown.tree_due(true, true));
     }
 }

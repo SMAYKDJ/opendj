@@ -1,7 +1,7 @@
 //! The helper process. Two modes:
 //!
 //! - `opendj-plugin-host --shm <path> (--test <id> | --clap <file> --id <id> |
-//!   --vst3 <bundle> --id <cid>)`
+//!   --vst3 <bundle> --id <cid> | --au <id> | --pd <patch>)`
 //!   maps the block openDJ shares, loads one effect, describes it on stdout
 //!   (`name`, `latency`, `param` lines, then `ready`) and runs a block each
 //!   time openDJ writes a byte to stdin. It exits when stdin closes, so a
@@ -63,6 +63,7 @@ fn main() {
     let mut clap = None;
     let mut vst3 = None;
     let mut au = None;
+    let mut pd = None;
     let mut scan_au = false;
     let mut list_presets = false;
     let mut id = None;
@@ -78,6 +79,7 @@ fn main() {
             Some("--clap") => clap = args.next().map(PathBuf::from),
             Some("--vst3") => vst3 = args.next().map(PathBuf::from),
             Some("--au") => au = args.next().and_then(|s| s.into_string().ok()),
+            Some("--pd") => pd = args.next().map(PathBuf::from),
             Some("--scan-au") => scan_au = true,
             Some("--presets") => list_presets = true,
             Some("--id") => id = args.next().and_then(|s| s.into_string().ok()),
@@ -99,10 +101,12 @@ fn main() {
         }
     }
     if let Some(file) = scan {
-        return run_scan(&file);
+        run_scan(&file);
+        opendj_plugin_host::leave(0);
     }
     if scan_au {
-        return run_scan_au();
+        run_scan_au();
+        opendj_plugin_host::leave(0);
     }
     if list_presets {
         let found = match (clap, id, au) {
@@ -111,20 +115,23 @@ fn main() {
             (None, _, Some(au)) => opendj_plugin_host::au::presets(&au),
             _ => fail("usage: opendj-plugin-host --presets (--clap <file> --id <id> | --au <id>)"),
         };
-        return run_presets(found);
+        run_presets(found);
+        opendj_plugin_host::leave(0);
     }
-    let plugin = match (test, clap, vst3, au, id) {
-        (Some(t), None, None, None, _) => Plugin::Test(t),
-        (None, Some(file), None, None, Some(id)) => Plugin::Clap { file, id },
-        (None, None, Some(file), None, Some(id)) => Plugin::Vst3 { file, id },
-        (None, None, None, Some(id), _) => Plugin::Au { id },
+    let plugin = match (test, clap, vst3, au, pd, id) {
+        (Some(t), None, None, None, None, _) => Plugin::Test(t),
+        (None, Some(file), None, None, None, Some(id)) => Plugin::Clap { file, id },
+        (None, None, Some(file), None, None, Some(id)) => Plugin::Vst3 { file, id },
+        (None, None, None, Some(id), None, _) => Plugin::Au { id },
+        (None, None, None, None, Some(file), _) => Plugin::Pd { file },
         _ => fail(
-            "usage: opendj-plugin-host --shm <path> (--test <id> | --clap <file> --id <id> | --vst3 <bundle> --id <cid> | --au <type:subtype:maker>)",
+            "usage: opendj-plugin-host --shm <path> (--test <id> | --clap <file> --id <id> | --vst3 <bundle> --id <cid> | --au <type:subtype:maker> | --pd <patch>)",
         ),
     };
     let Some(shm_path) = shm_path else {
         fail("--shm <path> is needed");
     };
+    opendj_plugin_host::display::set_helper_path(opendj_plugin_host::display::path_for(&shm_path));
     let shm =
         Arc::new(Shm::open(&shm_path).unwrap_or_else(|e| fail(&format!("shared memory: {e}"))));
     let h = shm.header();
@@ -151,6 +158,9 @@ fn main() {
     }
     for (id, name) in &info.all {
         say(&format!("all\t{id}\t{}", clean(name)));
+    }
+    for name in &info.pages {
+        say(&format!("page\t{}", clean(name)));
     }
     let mut main = loaded.main;
     let mut no_main = NoMain {
@@ -202,13 +212,13 @@ fn main() {
         }
     }
     if !editor.wants_run() {
-        std::process::exit(0);
+        opendj_plugin_host::leave(0);
     }
     // macOS, once a window was made: the system's loop runs the main thread
     // from here, and this is done whenever it is idle.
     editor.run(move |win, el| {
         if audio.is_finished() {
-            std::process::exit(0);
+            opendj_plugin_host::leave(0);
         }
         let h = shm.header();
         let m: &mut dyn MainThread = match main.as_mut() {
@@ -403,7 +413,8 @@ fn run_audio(shm: &Shm, mut fx: Box<dyn Effect>) {
             bpm: shm::load_f64(&h.bpm),
             beat: shm::load_f64(&h.beat),
             playing: h.playing.load(Ordering::Relaxed) != 0,
-        };
+        }
+        .for_plugins();
         {
             let [l, r] = &mut output[..] else {
                 unreachable!()
@@ -419,6 +430,12 @@ fn run_audio(shm: &Shm, mut fx: Box<dyn Effect>) {
         for (ch, buf) in output.iter().enumerate() {
             shm.write(true, ch, &buf[..frames]);
         }
+        let sent = fx.midi_out();
+        let n = sent.len().min(MAX_EVENTS);
+        for (slot, m) in h.out_events.iter().zip(&sent[..n]) {
+            slot.store(m.pack(), Ordering::Relaxed);
+        }
+        h.out_events_len.store(n as u32, Ordering::Relaxed);
         h.process_ns
             .store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         h.seq_out.store(seq, Ordering::Release);
@@ -492,7 +509,7 @@ fn say(line: &str) {
 
 fn fail(msg: &str) -> ! {
     say(&format!("error {}", clean(msg)));
-    std::process::exit(2);
+    opendj_plugin_host::leave(2);
 }
 
 /// Real-time priority for the helper's audio thread.

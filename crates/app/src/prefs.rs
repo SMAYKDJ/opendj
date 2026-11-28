@@ -8,6 +8,7 @@
 
 mod backups;
 mod broadcasting;
+mod karaoke;
 mod keyboard;
 mod plugins;
 mod sources;
@@ -39,6 +40,7 @@ use opendj_engine::{
     input_devices, key, meter, separation, AudioSetup, InputRole, InputRoute, RecordFormat,
     Recorder, BUFFER_SIZES, DEFAULT_AUTO_GAIN_TARGET, NUM_DECKS, SAMPLE_RATES, XFADER_CUT_IN,
 };
+use opendj_engine::{DeviceScan, GridMode};
 use opendj_library::query;
 use opendj_plugins::source::DOWNLOAD_FOLDER;
 use opendj_plugins::{LibraryImport, Plugin, SettingKind};
@@ -57,7 +59,7 @@ const AUDIO: i32 = 0;
 /// Settings › Audio, for opening it from elsewhere.
 pub const AUDIO_PAGE: i32 = AUDIO;
 /// Settings › Audio's tabs.
-const AUDIO_TABS: [&str; 2] = ["Devices", "Recording"];
+const AUDIO_TABS: [&str; 3] = ["Devices", "Recording", "Room EQ"];
 const MIXER: i32 = 1;
 const DECKS: i32 = 2;
 /// Settings › Decks' tabs.
@@ -164,11 +166,14 @@ const FOLDER_LIST: i32 = 21;
 const TRACK_COLOR: i32 = 22;
 /// The storage bar with its Manage menu (see StorageUi in preferences.slint).
 const STORAGE: i32 = 23;
+/// The Room EQ editor (see room_eq.slint).
+const ROOM_EQ: i32 = 24;
 /// The Manage menu's clean-ups, in its order.
-const STORAGE_ACTIONS: [&str; 4] = [
+const STORAGE_ACTIONS: [&str; 5] = [
     "Clear analysis cache…",
     "Clear high quality stems…",
     "Clear played tracks…",
+    "Clear analyses of files gone…",
     "Show cache folder",
 ];
 /// A folder list's title icon in `chosen`: the sidebar's stage icons (its node
@@ -329,6 +334,7 @@ pub fn apply_saved(registry: &ControlRegistry) {
     analysis::set_bpm_range(lo, hi);
     key::set_detector(key_detector());
     beatthis::set_enabled(settings::flag("neural_beats", true));
+    opendj_engine::gridfit::set_default_mode(grid_mode());
     separation::set_on_load(settings::flag("stems_on_load", true));
     apply_stems_cache_limit();
     key::set_mixing(key_mixing());
@@ -342,6 +348,9 @@ pub fn apply_saved(registry: &ControlRegistry) {
         "pfl_on_load",
         f(settings::flag("pfl_on_load", true)),
     );
+    for id in ["bpm_match_on_load", "sync_on_play"] {
+        set("[Controls]", id, f(settings::flag(id, false)));
+    }
     // The levels as the DJ left them; the first time, the engine's own
     // starting levels stand (master 50%, phones 25%, cue only).
     for (key, id) in LEVEL_KEYS {
@@ -424,8 +433,22 @@ fn key_mixing() -> key::Mixing {
 
 /// How far tracks are shifted to match keys on load: 0 (off), 1 or 2
 /// semitones.
+/// Shows the automatic deck helpers in the deck options panel under each deck's key.
+fn show_deck_auto(app: &AppWindow) {
+    let g = app.global::<crate::DeckAuto>();
+    g.set_bpm(settings::flag("bpm_match_on_load", false));
+    g.set_key(key_match_range() > 0);
+    g.set_sync(settings::flag("sync_on_play", false));
+    g.set_pitch(settings::flag("keylock_default", true));
+}
+
 pub fn key_match_range() -> u8 {
     settings::number("key_match_on_load", 1.0).clamp(0.0, 2.0) as u8
+}
+
+/// How grids follow the tempo for tracks without a mode of their own.
+fn grid_mode() -> GridMode {
+    GridMode::from_name(&settings::string("grid_mode")).unwrap_or_default()
 }
 
 fn key_detector() -> key::Detector {
@@ -582,6 +605,8 @@ pub struct Prefs {
     plugins: Vec<Box<dyn Plugin>>,
     /// Whether each of `plugins` plays from a cache: the DJ's own server.
     plugin_plays: Vec<bool>,
+    /// openDJ's own services an add-on works behind ("tidal").
+    behind_services: Vec<&'static str>,
     /// The source open on Settings › Sources, by its place in the rail.
     open_source: Option<i32>,
     /// What the last Clear or Sign out on Settings › Sources did.
@@ -596,6 +621,14 @@ pub struct Prefs {
     /// Opens the inputs again with the saved audio settings, and tells
     /// each input's state (see [`opendj_engine::AudioEngine::input_status`]).
     inputs: InputHooks,
+    /// The device lists last shown (see [`opendj_engine::devices_generation`]):
+    /// when a scan changes them, Settings › Audio is filled again.
+    devices_shown: u64,
+    /// Refresh devices was pressed while a deck played and waits for a
+    /// second press (see `refresh_devices_item`).
+    refresh_pending: bool,
+    /// A device scan was under way when Settings › Audio was last filled.
+    devices_scanning: bool,
     /// The inputs table's rows last shown, and what each row's menus
     /// offered: the devices ("" for None), and the first channel of each
     /// choice and whether it is mono.
@@ -656,9 +689,19 @@ impl Prefs {
         let (chosen_tx, chosen_rx) = mpsc::channel();
         let (tested_tx, tested_rx) = mpsc::channel();
         let (backup_tx, backup_rx) = mpsc::channel();
+        // An add-on that works behind one of openDJ's own services (see
+        // `SearchSource::catalog`) shows as that service, not on its own.
+        let mut behind_services = Vec::new();
         let mut plugins: Vec<Box<dyn Plugin>> = crate::stores::configured()
             .into_iter()
             .filter(|p| !p.settings().is_empty())
+            .filter_map(|mut p| match p.source().and_then(|s| s.catalog()) {
+                Some(service) => {
+                    behind_services.push(service);
+                    None
+                }
+                None => Some(p),
+            })
             .collect();
         let plugin_plays = plugins
             .iter_mut()
@@ -693,12 +736,16 @@ impl Prefs {
             ports: Vec::new(),
             plugins,
             plugin_plays,
+            behind_services,
             open_source: None,
             sources_note: String::new(),
             rail_names: crate::browser::all_source_names(),
             plugin_changed,
             audio_changed,
             inputs,
+            devices_shown: opendj_engine::devices_generation(),
+            devices_scanning: false,
+            refresh_pending: false,
             input_menus: Vec::new(),
             aux_added: 0,
             wizard: None,
@@ -722,9 +769,37 @@ impl Prefs {
         let p = prefs.clone();
         audio.on_set_buffer(move |i| p.borrow_mut().picked("buffer_frames", i.max(0) as usize));
         let p = prefs.clone();
-        g.on_toggled(move |id, on| p.borrow_mut().toggled(&id, on));
+        let weak = app.as_weak();
+        g.on_toggled(move |id, on| {
+            p.borrow_mut().toggled(&id, on);
+            if let Some(app) = weak.upgrade() {
+                show_deck_auto(&app);
+            }
+        });
+        // The deck options panel under each deck's key: the same settings.
+        show_deck_auto(app);
         let p = prefs.clone();
-        g.on_picked(move |id, i| p.borrow_mut().picked(&id, i.max(0) as usize));
+        app.global::<crate::DeckAuto>().on_toggle(move |id, on| {
+            let mut p = p.borrow_mut();
+            if id == "key_match_on_load" {
+                p.picked(&id, on as usize);
+            } else {
+                p.toggled(&id, on);
+            }
+            if let Some(app) = p.app.upgrade() {
+                show_deck_auto(&app);
+            }
+            // The settings page shows them too.
+            p.refresh();
+        });
+        let p = prefs.clone();
+        let weak = app.as_weak();
+        g.on_picked(move |id, i| {
+            p.borrow_mut().picked(&id, i.max(0) as usize);
+            if let Some(app) = weak.upgrade() {
+                show_deck_auto(&app);
+            }
+        });
         let p = prefs.clone();
         g.on_pressed(move |id| p.borrow_mut().pressed(&id));
         let p = prefs.clone();
@@ -898,6 +973,18 @@ impl Prefs {
         if self.audio_plugins.borrow_mut().poll() && g.get_open() && g.get_page() == AUDIO_PLUGINS {
             self.refresh();
         }
+        // A device scan finished: the output menus and table, and the
+        // inputs on Settings › Audio, show what it found.
+        let devices = opendj_engine::devices_generation();
+        let scanning = opendj_engine::devices_scanning();
+        if devices != self.devices_shown || scanning != self.devices_scanning {
+            self.devices_shown = devices;
+            self.devices_scanning = scanning;
+            app.global::<AudioSettings>().invoke_refresh();
+            if g.get_open() && g.get_page() == AUDIO {
+                self.refresh();
+            }
+        }
         // The controller list follows what is plugged in.
         if g.get_open() && g.get_page() == CONTROLLERS && g.get_query().is_empty() {
             let ports = self
@@ -1028,8 +1115,18 @@ impl Prefs {
     /// A page was opened or the search changed.
     fn shown(&mut self) {
         if let Some(app) = self.app.upgrade() {
+            // The devices as last scanned: no driver is loaded for this.
             app.global::<AudioSettings>().invoke_refresh();
+            // Devices plugged in since show up: Windows Audio's are looked
+            // at again, on a thread of its own, and the rows follow (see
+            // `poll`). ASIO drivers are left alone until Refresh devices:
+            // loading them takes seconds and can interrupt the sound.
+            let g = app.global::<Preferences>();
+            if g.get_open() && g.get_page() == AUDIO {
+                opendj_engine::rescan_devices(DeviceScan::System);
+            }
         }
+        self.refresh_pending = false;
         self.storage_pending = None;
         self.storage_note.clear();
         self.sources_note.clear();
@@ -1239,6 +1336,7 @@ impl Prefs {
                         )
                     });
                     items.extend(deck_output_items());
+                    items.push(self.refresh_devices_item());
                     items.extend([item("inputs", HEADING, "INPUTS", ""), self.inputs_item()]);
                 }
                 if shows(1) {
@@ -1262,6 +1360,14 @@ impl Prefs {
                         },
                         air_ceiling_item(),
                     ]);
+                }
+                if shows(2) {
+                    items.push(item(
+                        "room_eq",
+                        ROOM_EQ,
+                        "Room EQ",
+                        "Corrects the room the main output or the booth plays into.",
+                    ));
                 }
                 items
             }
@@ -1316,6 +1422,23 @@ impl Prefs {
                         )
                     },
                     PrefItem {
+                        choices: strings(&["Fixed", "Auto", "Flexible"]),
+                        chosen: GridMode::ALL
+                            .iter()
+                            .position(|&m| m == grid_mode())
+                            .unwrap_or(1) as i32,
+                        ..item(
+                            "grid_mode",
+                            SEGMENTED,
+                            "Grids",
+                            "How grids follow the tempo. Auto keeps one tempo unless the \
+                             track drifts for a while. Fixed always keeps one. Flexible \
+                             follows the beats bar by bar, for live drums. \
+                             A track can have its own in Edit Grid or its right-click menu. \
+                             Edited and locked grids stay.",
+                        )
+                    },
+                    PrefItem {
                         choices: strings(&["Standard", "Neural"]),
                         chosen: key_detector().id() as i32,
                         ..item(
@@ -1348,7 +1471,7 @@ impl Prefs {
                                 "cue_mode",
                                 SEGMENTED,
                                 "CUE button",
-                                "Hold to preview plays while CUE is held, as on Pioneer players.",
+                                "Hold to preview plays while CUE is held, as on club players.",
                             )
                         },
                         switch(
@@ -1407,7 +1530,7 @@ impl Prefs {
                                 SEGMENTED,
                                 "Tempo fader direction",
                                 "Which way the tempo faders, on screen and on controllers, speed \
-                                 the deck up. Pioneer players slow down as the fader goes up.",
+                                 the deck up. Club players slow down as the fader goes up.",
                             )
                         },
                         switch(
@@ -1463,6 +1586,18 @@ impl Prefs {
                                  the shift they'd get.",
                             )
                         },
+                        switch(
+                            "bpm_match_on_load",
+                            "Match tempo on load",
+                            "A track loaded while another deck plays takes its tempo (or half or double it), without syncing.",
+                            settings::flag("bpm_match_on_load", false),
+                        ),
+                        switch(
+                            "sync_on_play",
+                            "Sync on play",
+                            "Pressing PLAY on a deck that isn't synced lines its beats up with the other deck once.",
+                            settings::flag("sync_on_play", false),
+                        ),
                     ]);
                 }
                 if shows(2) {
@@ -1545,6 +1680,29 @@ impl Prefs {
                              computer's light or dark setting.",
                     )
                 }]);
+                items.extend([PrefItem {
+                    choices: strings(&crate::ui_scale::LABELS),
+                    chosen: crate::ui_scale::step() as i32,
+                    ..item(
+                        crate::ui_scale::KEY,
+                        SEGMENTED,
+                        "Interface scale",
+                        "Makes everything smaller to fit a small screen, or larger to \
+                         read from further away. A step too large for this screen \
+                         uses the largest that fits.",
+                    )
+                }]);
+                items.extend([PrefItem {
+                    choices: strings(&crate::list_text::LABELS),
+                    chosen: crate::list_text::size() as i32,
+                    ..item(
+                        crate::list_text::KEY,
+                        SEGMENTED,
+                        "List text",
+                        "Larger text in the track list, the lists and the side panel, \
+                         with taller rows to match.",
+                    )
+                }]);
                 items.extend([
                     switch(
                         crate::wave_look::GAIN_KEY,
@@ -1565,11 +1723,12 @@ impl Prefs {
                             MENU,
                             "List waveforms",
                             "The small waveforms in the track list: shades of lilac, \
-                             or the full color of the deck waveforms (red lows, amber \
-                             mids, blue highs).",
+                             or the full color of the deck waveforms (deep red lows, \
+                             amber mids, ice-blue highs).",
                         )
                     },
                 ]);
+                items.extend(self.karaoke_items());
                 items
             }
             _ => Vec::new(),
@@ -1933,6 +2092,38 @@ impl Prefs {
         }
     }
 
+    /// Refresh devices, under the outputs. On Windows it loads each ASIO
+    /// driver in turn, which stops a Windows Audio stream on the same
+    /// interface for a moment, so while a deck plays it asks first.
+    fn refresh_devices_item(&self) -> PrefItem {
+        let (action, detail) = if opendj_engine::devices_scanning() {
+            ("Refresh", "Looking for audio devices…")
+        } else if self.refresh_pending {
+            (
+                "Refresh anyway",
+                "A deck is playing, and loading ASIO drivers can stop the sound. Press again.",
+            )
+        } else if cfg!(windows) {
+            (
+                "Refresh",
+                "Finds devices plugged in later. Loading ASIO drivers can stop the sound.",
+            )
+        } else {
+            ("Refresh", "Finds devices plugged in after openDJ started.")
+        };
+        PrefItem {
+            action: action.into(),
+            ..item("audio_devices_refresh", BUTTON, "Refresh devices", detail)
+        }
+    }
+
+    /// Whether any deck is playing.
+    fn decks_playing(&self) -> bool {
+        (0..NUM_DECKS)
+            .filter_map(|d| self.registry.get(&deck_group(d), "play"))
+            .any(|c| c.get() > 0.5)
+    }
+
     /// How the audio keeps up, from the engine's `[App],audio_latency_*`
     /// controls: the share of each buffer it takes and the dropouts so far.
     fn audio_health(&self) -> String {
@@ -2239,10 +2430,20 @@ impl Prefs {
                 crate::lrclib::ENABLED,
                 "Find lyrics online",
                 "Find in the Lyrics tab looks the track up on LRCLIB, a free lyrics \
-                 database, and saves what you pick as an .lrc file beside it.",
+                 database, and saves what you pick as an .lrc file beside it. Sends only \
+                 the track's names and length.",
                 crate::lrclib::enabled(),
             ),
         ];
+        if crate::lrclib::enabled() {
+            items.push(switch(
+                crate::lrclib::ON_ANALYZE,
+                "Find lyrics when analyzing",
+                "Analyze also saves the closest lyrics LRCLIB has for each track that has \
+                 none. Pick others with Find in the Lyrics tab.",
+                crate::lrclib::on_analyze(),
+            ));
+        }
         items.push(PrefItem {
             action: if self.cleanup_open { "open" } else { "closed" }.into(),
             ..item(CLEANUP_FOLD, HEADING, "CLEAN-UP", "")
@@ -2760,6 +2961,8 @@ impl Prefs {
             "xfader_enabled" => self.set("[Mixer]", "crossfader_enabled", f(on)),
             "head_split" => self.set("[Master]", "headSplit", f(on)),
             "pfl_on_load" => self.set("[Controls]", "pfl_on_load", f(on)),
+            "bpm_match_on_load" => self.set("[Controls]", "bpm_match_on_load", f(on)),
+            "sync_on_play" => self.set("[Controls]", "sync_on_play", f(on)),
             "auto_gain" => self.set("[ReplayGain]", "ReplayGainEnabled", f(on)),
             "stems_on_load" => separation::set_on_load(on),
             crate::wave_look::GAIN_KEY => crate::wave_look::set_follows_gain(on),
@@ -2772,6 +2975,10 @@ impl Prefs {
     }
 
     fn picked(&mut self, id: &str, index: usize) {
+        if karaoke::picked(id, index) {
+            self.refresh();
+            return;
+        }
         if let Some(d) = crate::apc_pads::COLOR_KEYS.iter().position(|k| *k == id) {
             if index < crate::apc_pads::COLORS.len() {
                 settings::set(crate::apc_pads::COLOR_KEYS[d], json!(index));
@@ -2788,6 +2995,26 @@ impl Prefs {
         if id == backup::EVERY_KEY {
             settings::set(id, json!(index));
             backup::run_if_due();
+            self.refresh();
+            return;
+        }
+        if let Some(t) = id
+            .strip_prefix("tag_merge:")
+            .and_then(|x| x.parse::<i64>().ok())
+        {
+            // The menu lists the group's other tags after its title.
+            let into = open_library()
+                .and_then(|db| db.tags_of_group(self.open_group?).ok())
+                .and_then(|tags| {
+                    tags.into_iter()
+                        .filter(|x| x.id != t)
+                        .nth(index.checked_sub(1)?)
+                });
+            if let Some(into) = into {
+                self.removing_tag = None;
+                with_library(|db| db.rename_tag(t, &into.name).map(|_| ()));
+                settings::tags_changed();
+            }
             self.refresh();
             return;
         }
@@ -2977,6 +3204,13 @@ impl Prefs {
                 settings::set("stems_cache_gb", json!(gb));
                 apply_stems_cache_limit();
             }
+            "grid_mode" => {
+                let Some(&m) = GridMode::ALL.get(index) else {
+                    return;
+                };
+                settings::set("grid_mode", json!(m.name()));
+                opendj_engine::gridfit::set_default_mode(m);
+            }
             "beat_detector" => {
                 let on = index == 1;
                 settings::set("neural_beats", json!(on));
@@ -2998,6 +3232,16 @@ impl Prefs {
             crate::appearance::KEY => {
                 if let Some(app) = self.app.upgrade() {
                     crate::appearance::choose(&app, index);
+                }
+            }
+            crate::list_text::KEY => {
+                if let Some(app) = self.app.upgrade() {
+                    crate::list_text::choose(&app, index);
+                }
+            }
+            crate::ui_scale::KEY => {
+                if let Some(app) = self.app.upgrade() {
+                    crate::ui_scale::choose(&app, index);
                 }
             }
             crate::track_end::STYLE_KEY => crate::track_end::choose_style(index),
@@ -3260,6 +3504,17 @@ impl Prefs {
             return;
         }
         if self.broadcast_pressed(id) || self.backup_pressed(id) {
+            return;
+        }
+        if id == "audio_devices_refresh" {
+            // A first press while a deck plays only warns (see
+            // `refresh_devices_item`); a second one goes on.
+            let ask = cfg!(windows) && !self.refresh_pending && self.decks_playing();
+            self.refresh_pending = ask;
+            if !ask {
+                opendj_engine::rescan_devices(DeviceScan::All);
+            }
+            self.refresh();
             return;
         }
         if id == "controllers_refresh" {

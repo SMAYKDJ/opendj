@@ -238,6 +238,24 @@ impl Script {
         });
     }
 
+    /// Calls `prefix.incomingMidi(status, control, value)`: a keyboard's
+    /// MIDI-port controllers, for the mapping that runs its HID side.
+    pub(crate) fn call_incoming_midi(&self, prefix: &str, msg: [u8; 3]) {
+        self.context.with(|ctx| {
+            let result = (|| {
+                let f: Function = ctx.eval_with_options(
+                    format!("{prefix}.incomingMidi.bind({prefix})"),
+                    options("<incomingMidi>"),
+                )?;
+                f.call::<_, ()>((msg[0], msg[1], msg[2]))
+            })()
+            .catch(&ctx);
+            if let Err(e) = result {
+                self.log(&format!("{prefix}.incomingMidi: {e}"));
+            }
+        });
+    }
+
     pub(crate) fn fire_connection(&self, id: u32, value: f64) {
         self.call_hook(&self.fire, id, value, "connection callback");
     }
@@ -371,8 +389,20 @@ fn natives<'js>(ctx: &Ctx<'js>, host: &Rc<RefCell<Host>>) -> rquickjs::Result<Ob
     native!("routeNote", |h, channel: u8, from: u8, to: u8| h
         .route_note(channel, from, to));
     native!("log", |h, m: String| h.log(&m));
-    native!("timerStart", |h, ms: f64, one_shot: bool| h
-        .timer_start(ms, one_shot));
+    native!("timerStart", |h, ms: f64, one_shot: bool, floor: f64| h
+        .timer_start(ms, one_shot, floor));
+    // openDJ: a deck's waveform summary, for controllers with screens.
+    native!("waveform", |h, g: String, per_second: f64| {
+        crate::waves::for_group(&h.layered(&g), per_second)
+    });
+    // openDJ: a deck's cover art as a JPEG, for controllers with screens.
+    native!("cover", |h, g: String, size: f64| {
+        crate::waves::cover_for_group(&h.layered(&g), size)
+    });
+    native!("text", |h, g: String, k: String| {
+        let _ = &h;
+        crate::texts::text(&g, &k)
+    });
     native!("timerStop", |h, id: u32| h.timer_stop(id));
     native!("softTakeover", |h, g: String, k: String, on: bool| h
         .soft_takeover(&g, &k, on));
@@ -392,9 +422,13 @@ fn natives<'js>(ctx: &Ctx<'js>, host: &Rc<RefCell<Host>>) -> rquickjs::Result<Ob
         .scratch_enable(deck, ipr, rpm, alpha, beta, ramp));
     native!("scratchTick", |h, deck: f64, n: f64| h
         .scratch_tick(deck, n));
-    native!("scratchDisable", |h, deck: f64, ramp: bool| h
-        .scratch_disable(deck, ramp));
+    native!(
+        "scratchDisable",
+        |h, deck: f64, ramp: bool, follow_wheel: bool| h.scratch_disable(deck, ramp, follow_wheel)
+    );
     native!("isScratching", |h, deck: f64| h.is_scratching(deck));
+    native!("isScratchCoasting", |h, deck: f64| h
+        .is_scratch_coasting(deck));
     native!("ramp", |h,
                      deck: f64,
                      kind: String,

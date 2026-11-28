@@ -23,7 +23,8 @@ const MAX_STEER: f64 = 0.5;
 /// The stretcher's block interval in seconds (`presetDefault`'s).
 const INTERVAL_SECONDS: f64 = 0.03;
 
-pub(crate) struct KeyShifter {
+/// Plays a source at any speed and key.
+pub struct KeyShifter {
     stretch: Stretch,
     /// Interleaved stereo scratch buffers, sized ahead of time.
     input: Vec<f32>,
@@ -51,7 +52,7 @@ pub(crate) struct KeyShifter {
 }
 
 impl KeyShifter {
-    pub(crate) fn new(sample_rate: f64) -> Self {
+    pub fn new(sample_rate: f64) -> Self {
         let stretch = Stretch::preset_default_split(2, sample_rate as u32);
         Self {
             // Room for a jump's seed (see `render`) or a buffer at top speed.
@@ -70,12 +71,12 @@ impl KeyShifter {
     }
 
     /// Forgets the audio in flight; the next render starts afresh.
-    pub(crate) fn stop(&mut self) {
+    pub fn stop(&mut self) {
         self.active = false;
     }
 
     /// Whether the stretcher holds audio continuing from the last buffer.
-    pub(crate) fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.active
     }
 
@@ -113,7 +114,7 @@ impl KeyShifter {
     /// `ratio` is source frames per output frame at normal speed; `looping`
     /// is the active loop in source frames.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn render<F: Frames + ?Sized>(
+    pub fn render<F: Frames + ?Sized>(
         &mut self,
         audio: &F,
         pos: f64,
@@ -135,11 +136,18 @@ impl KeyShifter {
             fade: self.declick as f64 * ratio,
         };
         let tolerance = 4.0 * ratio + 1.0;
-        // A loop that starts, ends or changes size leaves the input already
-        // fed (which runs ahead of the play position) read the wrong way
-        // round its end, so it is fed afresh, like a jump.
+        // A loop change only invalidates audio already fed to the stretcher
+        // when that input reached an old or new loop end. If every affected
+        // end is still ahead of read_pos, the buffered audio is identical and
+        // resetting the stretcher here would create an audible skip for a
+        // transport change that did not move the playhead.
+        let loop_change_is_ahead = looping != self.looping
+            && [self.looping, looping]
+                .into_iter()
+                .flatten()
+                .all(|(_, end)| self.read_pos < end);
         let continuing = self.active
-            && looping == self.looping
+            && (looping == self.looping || loop_change_is_ahead)
             && match looping {
                 _ if (pos - self.expected_pos).abs() < tolerance => true,
                 // The loop wrapped: carry the read position back with it.

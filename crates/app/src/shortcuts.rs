@@ -43,6 +43,20 @@ pub const DEFAULTS: &[Shortcut] = &[
         key: "g",
         script: "edit_grid",
     },
+    Shortcut {
+        key: "s",
+        script: "sidelist_add",
+    },
+    // Load the picked track onto deck 1 or 2: Shift+← and Shift+→ in
+    // most DJ apps.
+    Shortcut {
+        key: "shift+left",
+        script: "deck 1 load",
+    },
+    Shortcut {
+        key: "shift+right",
+        script: "deck 2 load",
+    },
     // Unload deck 1 or 2, as Serato's keys.
     Shortcut {
         key: "alt+shift+left",
@@ -510,6 +524,15 @@ impl Host for AppHost<'_> {
                 }
                 let picked = self.browser.picked_rows(first, last);
                 self.browser.analyze(&picked);
+                Ok(())
+            }
+            "sidelist_add" => {
+                let (first, last) = self.picked;
+                if first < 0 {
+                    return Err(Error::new("Pick a track in the browser first"));
+                }
+                self.browser
+                    .add_rows_to_sidelist(first as usize, last.max(first) as usize);
                 Ok(())
             }
             other => Err(Error::new(format!("'{other}' isn't available here"))),

@@ -8,9 +8,12 @@
 //! simply has no stems on load, and high-quality stems fall back to the
 //! Demucs command if it is installed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use opendj_separation::rates::Rates;
 use opendj_separation::spleeter;
 
 use crate::dsp::Lr4;
@@ -99,7 +102,7 @@ static ON_LOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 static CACHE_LIMIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(DEFAULT_CACHE_LIMIT);
 
-/// 10 GB: about 150 tracks of five minutes.
+/// 10 GB: about 200 tracks of five minutes (three stems each).
 pub const DEFAULT_CACHE_LIMIT: u64 = 10 << 30;
 
 /// Sets whether tracks loaded from now on get stems at once.
@@ -167,6 +170,36 @@ pub(crate) fn channels(audio: &Audio) -> [Vec<f32>; 2] {
     [l, r]
 }
 
+/// Our stems (drums split into kick and hi-hat), from the model's `parts`
+/// (`[stem][channel][sample]`, ours `s` being its `from[s]`) at `rate`,
+/// leaving out the first `lead` frames, which only settle the split.
+#[allow(clippy::needless_range_loop)] // frame by frame across the stems
+fn stem_frames(
+    parts: &[[&[f32]; 2]],
+    from: [usize; 4],
+    lead: usize,
+    rate: u32,
+) -> Box<[StemFrame]> {
+    let mut low = Lr4::lowpass(rate as f64, KICK_SPLIT_HZ);
+    let n = parts[0][0].len();
+    let mut out = Vec::with_capacity(n.saturating_sub(lead));
+    for i in 0..n {
+        let at = |s: usize| [parts[from[s]][0][i], parts[from[s]][1][i]];
+        let (k, h) = split(&mut low, at(0));
+        if i < lead {
+            continue;
+        }
+        let mut f: StemFrame = [[0; 2]; MAX_STEMS];
+        f[0] = k.map(to_i16);
+        for s in 1..4 {
+            f[s] = at(s).map(to_i16);
+        }
+        f[4] = h.map(to_i16);
+        out.push(f);
+    }
+    out.into_boxed_slice()
+}
+
 /// Separates the decoded `audio` with Spleeter and gives it the stems,
 /// which play at once: the stretch around frame `from` is separated first,
 /// in about a second, and the original plays wherever the stems aren't
@@ -190,29 +223,7 @@ pub fn separate_fast(
     }
     let [l, r] = channels(audio);
     let model_rate = opendj_separation::SAMPLE_RATE;
-    // Our stems, with the drums split, for `n` frames from `lead` on.
-    #[allow(clippy::needless_range_loop)] // frame by frame across the stems
-    let frames = |parts: &[[&[f32]; 2]], lead: usize| -> Box<[StemFrame]> {
-        let mut low = Lr4::lowpass(rate as f64, KICK_SPLIT_HZ);
-        let n = parts[0][0].len();
-        let mut out = Vec::with_capacity(n - lead);
-        for i in 0..n {
-            let at = |s: usize| [parts[FROM_SPLEETER[s]][0][i], parts[FROM_SPLEETER[s]][1][i]];
-            let drums = at(0);
-            let (k, h) = split(&mut low, drums);
-            if i < lead {
-                continue;
-            }
-            let mut f: StemFrame = [[0; 2]; MAX_STEMS];
-            f[0] = k.map(to_i16);
-            for s in 1..4 {
-                f[s] = at(s).map(to_i16);
-            }
-            f[4] = h.map(to_i16);
-            out.push(f);
-        }
-        out.into_boxed_slice()
-    };
+    let frames = |parts: &[[&[f32]; 2]], lead: usize| stem_frames(parts, FROM_SPLEETER, lead, rate);
     if rate == model_rate {
         let complete =
             spleeter::separate_in_chunks(&*net, [&l, &r], from, CHUNK, SPLIT_LEAD, |k, parts| {
@@ -225,57 +236,148 @@ pub fn separate_fast(
         }
         return Ok(());
     }
-    // Another rate: separate at the model's and bring the stems back, all
-    // at once.
-    let resample =
-        |x: &[f32], from_rate, to_rate| opendj_separation::resample(x, from_rate, to_rate);
-    let (l, r) = (
-        resample(&l, rate, model_rate)?,
-        resample(&r, rate, model_rate)?,
+    // Another rate: separate at the model's, from the cue as at 44.1 kHz,
+    // and bring each of our chunks back once the model's chunks it is made
+    // from are separated, so the stems still play within about a second.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let there = Rates::new(rate, model_rate);
+    let back = Rates::new(model_rate, rate);
+    let (ml, mr) = (
+        there.resample_all(&l, threads),
+        there.resample_all(&r, threads),
     );
-    let from = (from as f64 * model_rate as f64 / rate as f64) as usize;
-    let separated = spleeter::separate(&*net, [&l, &r], from, |_, _| {});
-    if !keep_going() {
-        return Ok(());
-    }
-    let back: Vec<[Vec<f32>; 2]> = separated
-        .iter()
-        .map(|[sl, sr]| {
-            let fit = |x: &[f32]| -> Result<Vec<f32>, String> {
-                let mut y = resample(x, model_rate, rate)?;
-                y.resize(audio.len(), 0.0);
-                Ok(y)
-            };
-            Ok([fit(sl)?, fit(sr)?])
-        })
-        .collect::<Result<_, String>>()?;
-    for (k, start) in (0..audio.len()).step_by(CHUNK).enumerate() {
-        let end = (start + CHUNK).min(audio.len());
+    drop((l, r));
+    let (len, mlen) = (audio.len(), ml.len());
+    let ours = len.div_ceil(CHUNK);
+    // Our chunk `t` with its lead, and the model's samples it needs.
+    let need = |t: usize| {
+        let start = t * CHUNK;
         let lead = start.min(SPLIT_LEAD);
-        let parts: Vec<[&[f32]; 2]> = back
-            .iter()
-            .map(|[sl, sr]| [&sl[start - lead..end], &sr[start - lead..end]])
-            .collect();
-        stems.fill(k, frames(&parts, lead));
+        let out = start - lead..(start + CHUNK).min(len);
+        let input = back.input_for(out.clone(), mlen);
+        (out, lead, input)
+    };
+    // Our chunks that may need the model's chunk `m`.
+    let users = |m: usize| {
+        let at = |x: usize| x * rate as usize / model_rate as usize;
+        let lo = at(m * CHUNK).saturating_sub(SPLIT_LEAD + CHUNK / 2) / CHUNK;
+        let hi = (at((m + 1) * CHUNK) + CHUNK / 2) / CHUNK;
+        lo..(hi + 1).min(ours)
+    };
+    let mut got: HashMap<usize, Vec<[Vec<f32>; 2]>> = HashMap::new();
+    let mut filled = vec![false; ours];
+    let complete = spleeter::separate_in_chunks(
+        &*net,
+        [&ml, &mr],
+        (from as f64 * model_rate as f64 / rate as f64) as usize,
+        CHUNK,
+        0,
+        |m, parts| {
+            got.insert(
+                m,
+                parts
+                    .iter()
+                    .map(|[a, b]| [a.to_vec(), b.to_vec()])
+                    .collect(),
+            );
+            for t in users(m) {
+                if filled[t] {
+                    continue;
+                }
+                let (out, lead, input) = need(t);
+                let first = input.start / CHUNK;
+                let last = (input.end.max(1) - 1) / CHUNK;
+                if !(first..=last).all(|k| got.contains_key(&k)) {
+                    continue;
+                }
+                let resampled: Vec<[Vec<f32>; 2]> = (0..parts.len())
+                    .map(|stem| {
+                        [0, 1].map(|c| {
+                            let joined: Vec<f32> = (first..=last)
+                                .flat_map(|k| got[&k][stem][c].iter().copied())
+                                .collect();
+                            let at = input.start - first * CHUNK;
+                            let slice = &joined[at..at + input.len()];
+                            back.resample_part(slice, input.start, out.clone())
+                        })
+                    })
+                    .collect();
+                let views: Vec<[&[f32]; 2]> =
+                    resampled.iter().map(|[a, b]| [&a[..], &b[..]]).collect();
+                stems.fill(t, frames(&views, lead));
+                filled[t] = true;
+            }
+            // Let go of the model's chunks all their users have.
+            got.retain(|&k, _| users(k).any(|t| !filled[t]));
+            keep_going()
+        },
+    );
+    if complete && filled.iter().all(|f| *f) {
+        stems.finish();
     }
-    stems.finish();
     Ok(())
 }
 
 /// Separates the file at `path` into high-quality stems with HTDemucs,
 /// leaving four FLAC files at the track's own rate where
 /// [`crate::stems::find`] looks. Uses the GPU (Metal on macOS, Vulkan on
-/// Linux). Without the model, or when it fails, the Demucs command does it
-/// if it is installed.
+/// Linux), or the CPU once the GPU has failed. Without the model, or when
+/// both fail, the Demucs command does it if it is installed.
 pub fn separate_hq(path: &Path) -> Result<StemSource, String> {
+    separate_hq_watched(path, &[], &mut |_, _| {}, &|| true)
+}
+
+/// As [`separate_hq`], telling `progress` as each of the model's chunks is
+/// done (it may wait, pausing between chunks), and giving up with
+/// [`opendj_separation::htdemucs::STOPPED`] once `keep_going` says no,
+/// without trying the CPU or the Demucs command after.
+///
+/// `live` is the track's audio on the decks that have it, each with its
+/// play position (a frame), the first deck's first: HTDemucs then starts
+/// there and works outwards, and each stretch of the stems plays as soon
+/// as it is separated (see [`Stems::set_upgrade`]), so a deck has
+/// high-quality stems seconds after asking rather than once the whole
+/// track is done.
+pub fn separate_hq_watched(
+    path: &Path,
+    live: &[(Arc<Audio>, usize)],
+    progress: &mut dyn FnMut(usize, usize),
+    keep_going: &dyn Fn() -> bool,
+) -> Result<StemSource, String> {
+    use opendj_separation::htdemucs::{HtDemucs, STOPPED};
     let weights = match model_or_fetch(HTDEMUCS, &MODELS) {
         Ok(w) => w,
         Err(e) => return crate::stems::run_demucs(path).map_err(|_| e),
     };
-    let result = std::panic::catch_unwind(|| htdemucs(path, &weights))
-        .unwrap_or_else(|_| Err("the GPU separation crashed".into()));
+    let track = crate::decode::decode(path)?;
+    let live = attach(live, &track);
+    let live = live.as_ref().map(|(up, from)| (&**up, *from));
+    let mut result = Err(String::new());
+    if !GPU_FAILED.load(Ordering::Relaxed) {
+        result = caught(|| {
+            with_gpu_model(&weights, |model| {
+                htdemucs(path, &track, model, live, &mut *progress, keep_going)
+            })
+        });
+        if !keep_going() {
+            return Err(STOPPED.into());
+        }
+        if let Err(e) = &result {
+            eprintln!("HTDemucs on the GPU: {e}; using the CPU");
+            GPU_FAILED.store(true, Ordering::Relaxed);
+        }
+    }
+    if result.is_err() {
+        result = caught(|| {
+            let bytes =
+                std::fs::read(&weights).map_err(|e| format!("{}: {e}", weights.display()))?;
+            let model = HtDemucs::<opendj_separation::Cpu>::load(&bytes, &Default::default())?;
+            htdemucs(path, &track, &model, live, &mut *progress, keep_going)
+        });
+    }
     match result {
         Ok(s) => Ok(s),
+        Err(_) if !keep_going() => Err(STOPPED.into()),
         Err(e) => {
             eprintln!("HTDemucs: {e}; trying the Demucs command");
             crate::stems::run_demucs(path).map_err(|_| e)
@@ -283,38 +385,257 @@ pub fn separate_hq(path: &Path) -> Result<StemSource, String> {
     }
 }
 
-fn htdemucs(path: &Path, weights: &Path) -> Result<StemSource, String> {
-    use opendj_separation::htdemucs::HtDemucs;
+/// Set once HTDemucs has failed on the GPU: a failure can leave burn's
+/// locks poisoned for the rest of the run, so after one the CPU does the
+/// separating.
+static GPU_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// HTDemucs on the GPU, loaded once and kept, so a separation doesn't read
+/// and upload the 84 MB of weights again before its first chunk.
+static GPU_MODEL: Mutex<Option<opendj_separation::htdemucs::HtDemucs<opendj_separation::Gpu>>> =
+    Mutex::new(None);
+
+/// Runs `f` with HTDemucs on the GPU, loading it from `weights` first if
+/// it isn't yet. One at a time.
+fn with_gpu_model<T>(
+    weights: &Path,
+    f: impl FnOnce(&opendj_separation::htdemucs::HtDemucs<opendj_separation::Gpu>) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut model = GPU_MODEL.lock().unwrap_or_else(|e| e.into_inner());
+    if model.is_none() {
+        if let Some(dir) = crate::cache::cache_dir() {
+            opendj_separation::set_gpu_cache_dir(dir.join("gpu"));
+        }
+        let bytes = std::fs::read(weights).map_err(|e| format!("{}: {e}", weights.display()))?;
+        *model = Some(opendj_separation::htdemucs::HtDemucs::load(
+            &bytes,
+            &Default::default(),
+        )?);
+    }
+    f(model.as_ref().expect("loaded above"))
+}
+
+/// Gets HTDemucs ready on the GPU: loads it and compiles its kernels for
+/// the model's shapes, which otherwise happens during the first separation
+/// and holds back its first stems by seconds. Does nothing without the
+/// downloaded model (it isn't downloaded for this) or once the GPU has
+/// failed; a failure here sends separations to the CPU straight away.
+/// Takes a few seconds; see [`crate::stems::warm_up_when_idle`].
+pub fn warm_up() {
+    if GPU_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(weights) = model(HTDEMUCS) else {
+        return;
+    };
+    let result = caught(|| {
+        with_gpu_model(&weights, |m| {
+            m.warm_up();
+            Ok(())
+        })
+    });
+    if let Err(e) = result {
+        eprintln!("HTDemucs on the GPU: {e}; separations will use the CPU");
+        GPU_FAILED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Rewrites the FLAC file at `path` at `rate`.
+pub(crate) fn resample_flac(path: &Path, rate: u32) -> Result<(), String> {
     let audio = crate::decode::decode(path)?;
-    let rate = audio.sample_rate;
     let [l, r] = channels(&audio);
-    // Decoding is the first 5%, the model up to 90%, writing the rest.
-    crate::stems::set_progress(path, Some(0.05));
-    let bytes = std::fs::read(weights).map_err(|e| format!("{}: {e}", weights.display()))?;
-    let device = Default::default();
-    let model = HtDemucs::<opendj_separation::Gpu>::load(&bytes, &device)?;
-    let stems = model.separate_with_progress([&l, &r], |p| {
-        crate::stems::set_progress(path, Some(0.05 + 0.85 * p));
-    })?;
-    crate::stems::set_progress(path, Some(0.9));
+    let rates = Rates::new(audio.sample_rate, rate);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let (l, r) = (
+        rates.resample_all(&l, threads),
+        rates.resample_all(&r, threads),
+    );
+    crate::recorder::write_flac(path, rate, [&l, &r]).map_err(|e| e.to_string())
+}
+
+/// Runs `f`, turning a panic into an error with its message.
+fn caught<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        Err(format!("the separation crashed: {msg}"))
+    })
+}
+
+/// High-quality stems for the decks in `live` that fit `track`: set as
+/// the upgrade of the stems they have (or as their stems, if none), to be
+/// filled as HTDemucs goes. With the first deck's play position.
+fn attach(live: &[(Arc<Audio>, usize)], track: &Audio) -> Option<(Arc<Stems>, usize)> {
+    let mut info = default_info();
+    split_drums(&mut info);
+    let rate = track.sample_rate;
+    let up = Arc::new(Stems::separated(info, rate, track.len(), Quality::High));
+    let mut from = None;
+    for (audio, at) in live {
+        if audio.sample_rate != rate {
+            continue;
+        }
+        let given = match audio.stems() {
+            Some(s) => s.set_upgrade(up.clone()),
+            None => audio.set_stems(up.clone()),
+        };
+        if given && from.is_none() {
+            from = Some((*at).min(track.len()));
+        }
+    }
+    from.map(|f| (up, f))
+}
+
+/// Merged stretches of samples.
+#[derive(Default)]
+struct Stretches(Vec<std::ops::Range<usize>>);
+
+impl Stretches {
+    fn add(&mut self, r: std::ops::Range<usize>) {
+        self.0.push(r);
+        self.0.sort_unstable_by_key(|r| r.start);
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(self.0.len());
+        for r in self.0.drain(..) {
+            match merged.last_mut() {
+                Some(m) if r.start <= m.end => m.end = m.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        self.0 = merged;
+    }
+
+    fn covers(&self, r: &std::ops::Range<usize>) -> bool {
+        r.is_empty() || self.0.iter().any(|m| m.start <= r.start && m.end >= r.end)
+    }
+}
+
+fn htdemucs<B: opendj_separation::burn::prelude::Backend>(
+    path: &Path,
+    track: &Audio,
+    model: &opendj_separation::htdemucs::HtDemucs<B>,
+    live: Option<(&Stems, usize)>,
+    progress: &mut dyn FnMut(usize, usize),
+    keep_going: &dyn Fn() -> bool,
+) -> Result<StemSource, String> {
+    let rate = track.sample_rate;
+    let len = track.len();
+    let [l, r] = channels(track);
+    // At the model's 44.1 kHz. Told 44.1 kHz for a 48 kHz track, it would
+    // hear it 9% slow and its stems, stretched back, would drift off the
+    // original they are taken out of, so muting one would add it back late
+    // instead of removing it.
     let model_rate = opendj_separation::SAMPLE_RATE;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let back = (rate != model_rate).then(|| Rates::new(model_rate, rate));
+    let (ml, mr) = match back {
+        Some(_) => {
+            let there = Rates::new(rate, model_rate);
+            (
+                there.resample_all(&l, threads),
+                there.resample_all(&r, threads),
+            )
+        }
+        None => (l, r),
+    };
+    let mlen = ml.len();
+    // Each of our chunks with its lead for the drum split, and the model's
+    // samples it is made from.
+    let need = |t: usize| {
+        let start = t * CHUNK;
+        let lead = start.min(SPLIT_LEAD);
+        let out = start - lead..(start + CHUNK).min(len);
+        let input = match &back {
+            Some(b) => b.input_for(out.clone(), mlen),
+            None => out.clone(),
+        };
+        (out, lead, input)
+    };
+    let ours = len.div_ceil(CHUNK);
+    let mut filled = vec![false; ours];
+    let mut separated = Stretches::default();
+    let from = live.map_or(0, |(_, f)| {
+        (f as f64 * model_rate as f64 / rate as f64) as usize
+    });
+    let stems =
+        model.separate_from([&ml, &mr], from, progress, keep_going, &mut |range, out| {
+            let Some((up, _)) = live else {
+                return;
+            };
+            separated.add(range);
+            for (t, done) in filled.iter_mut().enumerate() {
+                if *done {
+                    continue;
+                }
+                let (part, lead, input) = need(t);
+                if !separated.covers(&input) {
+                    continue;
+                }
+                let mut parts: Vec<[Vec<f32>; 2]> = out
+                    .iter()
+                    .map(|stem| {
+                        [0, 1].map(|c| match &back {
+                            Some(b) => {
+                                b.resample_part(&stem[c][input.clone()], input.start, part.clone())
+                            }
+                            None => stem[c][part.clone()].to_vec(),
+                        })
+                    })
+                    .collect();
+                // Other as the cache will have it: the track less the rest.
+                let other = crate::stems::OTHER;
+                for c in 0..2 {
+                    for (j, i) in part.clone().enumerate() {
+                        let rest: f32 = (0..parts.len())
+                            .filter(|&k| k != other)
+                            .map(|k| parts[k][c][j])
+                            .sum();
+                        parts[other][c][j] = track.frame(i)[c] - rest;
+                    }
+                }
+                let views: Vec<[&[f32]; 2]> = parts.iter().map(|[a, b]| [&a[..], &b[..]]).collect();
+                // HTDemucs's order is ours: drums, bass, other, vocals.
+                up.fill(t, stem_frames(&views, [0, 1, 2, 3], lead, rate));
+                *done = true;
+            }
+        })?;
+    if let Some((up, _)) = live {
+        if filled.iter().all(|f| *f) {
+            up.finish();
+        }
+    }
+    let stems: Vec<[Vec<f32>; 2]> = match &back {
+        Some(b) => stems
+            .into_iter()
+            .map(|[sl, sr]| [b.resample_all(&sl, threads), b.resample_all(&sr, threads)])
+            .collect(),
+        None => stems,
+    };
     let dir = crate::cache::stems_dir(path).ok_or("no cache folder")?;
     let work = dir.with_extension(format!("work{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let written = (|| -> Result<(), String> {
-        // HTDemucs's order is ours: drums, bass, other, vocals.
-        for (name, [sl, sr]) in opendj_separation::htdemucs::STEMS.iter().zip(&stems) {
-            let fit = |x: &[f32]| -> Result<Vec<f32>, String> {
-                let mut y = opendj_separation::resample(x, model_rate, rate)?;
-                y.resize(audio.len(), 0.0);
-                Ok(y)
+        // HTDemucs's order is ours: drums, bass, other, vocals. Other is
+        // left out: it is the track less the rest (see `stems::OTHER`).
+        for (k, (name, [sl, sr])) in opendj_separation::htdemucs::STEMS
+            .iter()
+            .zip(&stems)
+            .enumerate()
+        {
+            if k == crate::stems::OTHER {
+                continue;
+            }
+            let fit = |x: &[f32]| -> Vec<f32> {
+                let mut y = x.to_vec();
+                y.resize(len, 0.0);
+                y
             };
-            let (sl, sr) = (fit(sl)?, fit(sr)?);
+            let (sl, sr) = (fit(sl), fit(sr));
             crate::recorder::write_flac(&work.join(format!("{name}.flac")), rate, [&sl, &sr])
                 .map_err(|e| e.to_string())?;
-            let written = crate::stems::separation_progress(path).unwrap_or(0.9);
-            crate::stems::set_progress(path, Some(written + 0.025));
         }
         Ok(())
     })();
@@ -322,6 +643,7 @@ fn htdemucs(path: &Path, weights: &Path) -> Result<StemSource, String> {
         let _ = std::fs::remove_dir_all(&work);
         return Err(e);
     }
+    crate::stems::mark_aligned(&work);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::rename(&work, &dir).map_err(|e| e.to_string())?;
     crate::stems::find(path).ok_or_else(|| "the stems weren't written".into())
@@ -333,6 +655,59 @@ mod tests {
 
     /// Needs the Spleeter weights: `OPENDJ_MODELS=<folder with
     /// spleeter-4stems.safetensors> cargo test -p opendj-engine -- --ignored spleeter_on`.
+    /// As above, for a 48 kHz track: separated at the model's rate a chunk
+    /// at a time and brought back, the stems match separating it all at
+    /// once and resampling the lot.
+    #[test]
+    #[ignore]
+    fn spleeter_on_load_works_a_chunk_at_a_time_at_48_khz() {
+        let model_rate = opendj_separation::SAMPLE_RATE;
+        let synth = crate::synth::render_with(124.0, 0.25, 40.0, 5);
+        let [l, r] = channels(&synth);
+        let up = |x: &[f32]| opendj_separation::resample(x, model_rate, 48_000).unwrap();
+        let (l, r) = (up(&l), up(&r));
+        let audio = Audio::from_frames(48_000, l.iter().zip(&r).map(|(a, b)| [*a, *b]).collect());
+        let t = std::time::Instant::now();
+        // When the first stems around the cue are there to play.
+        let first = std::thread::scope(|s| {
+            let watch = s.spawn(|| loop {
+                if audio.stems().is_some_and(|st| st.decoded() > 0) {
+                    return t.elapsed().as_secs_f64();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            });
+            separate_fast(&audio, 20 * 48_000, || true).unwrap();
+            watch.join().unwrap()
+        });
+        println!(
+            "40 s at 48 kHz: first stems in {first:.2} s, all in {:.2} s",
+            t.elapsed().as_secs_f64()
+        );
+        let stems = audio.stems().unwrap();
+        assert!(stems.is_complete());
+        // All at once, as before.
+        let net = spleeter_net().unwrap();
+        let down = |x: &[f32]| opendj_separation::resample(x, 48_000, model_rate).unwrap();
+        let whole = spleeter::separate(&*net, [&down(&l), &down(&r)], 0, |_, _| {});
+        let back: Vec<Vec<f32>> = whole
+            .iter()
+            .map(|[sl, _]| opendj_separation::resample(sl, model_rate, 48_000).unwrap())
+            .collect();
+        // Bass, Instru and Vocal (ours 1 to 3) against Spleeter's.
+        let mut worst = 0.0f32;
+        for ours in 1..4 {
+            let mut g = [1.0; MAX_STEMS];
+            g[ours] = 0.0;
+            for i in (0..audio.len()).step_by(997) {
+                let got = -stems.mix(i, &g, || [0.0; 2])[0];
+                let want = back[FROM_SPLEETER[ours]][i];
+                worst = worst.max((got - want).abs());
+            }
+        }
+        println!("largest difference {worst:.5}");
+        assert!(worst < 2e-3, "{worst}");
+    }
+
     #[test]
     #[ignore]
     fn spleeter_on_load_fills_the_stems_from_the_cue() {
@@ -363,6 +738,92 @@ mod tests {
         let no_drums = rms([0.0, 1.0, 1.0, 1.0, 0.0]);
         println!("full {full:.1}, without kick and hats {no_drums:.1}");
         assert!(no_drums < full);
+    }
+
+    /// Needs the HTDemucs weights and takes a few minutes on the CPU:
+    /// `OPENDJ_MODELS=<folder with htdemucs.safetensors> cargo test -p
+    /// opendj-engine --release -- --ignored hq_stems_from`.
+    /// A deck playing a 48 kHz track 10 s in gets high-quality stems there
+    /// first, and the stems it is given a stretch at a time are those kept
+    /// in the cache.
+    #[test]
+    #[ignore]
+    fn hq_stems_from_the_play_position_match_the_cache() {
+        let model_rate = opendj_separation::SAMPLE_RATE;
+        let synth = crate::synth::render_with(124.0, 0.25, 16.0, 5);
+        let [l, r] = channels(&synth);
+        let up = |x: &[f32]| opendj_separation::resample(x, model_rate, 48_000).unwrap();
+        let file = std::env::temp_dir().join(format!("opendj-hq-{}.flac", std::process::id()));
+        crate::recorder::write_flac(&file, 48_000, [&up(&l), &up(&r)]).unwrap();
+        let audio = Arc::new(crate::decode::decode(&file).unwrap());
+        let from = 10 * 48_000;
+        let t = std::time::Instant::now();
+        let (first, source) = std::thread::scope(|s| {
+            let watch = s.spawn(|| loop {
+                if audio.stems().is_some_and(|st| st.has(from)) {
+                    return t.elapsed().as_secs_f64();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            });
+            let source =
+                separate_hq_watched(&file, &[(audio.clone(), from)], &mut |_, _| {}, &|| true)
+                    .unwrap();
+            (watch.join().unwrap(), source)
+        });
+        println!(
+            "16 s at 48 kHz: HQ stems at the play position in {first:.1} s, all in {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
+        // Three files kept: Other is what they leave of the track.
+        let StemSource::Files(files) = &source else {
+            panic!("{source:?}")
+        };
+        assert!(!files[crate::stems::OTHER].exists());
+        let live = audio.stems().unwrap().clone();
+        assert!(live.is_complete());
+        assert_eq!(live.quality, Quality::High);
+        let cached = crate::stems::Decode::open(&source)
+            .unwrap()
+            .with_original(audio.clone())
+            .run(|| true)
+            .unwrap();
+        let stem = |st: &Stems, k: usize, i: usize| {
+            let mut g = [1.0; MAX_STEMS];
+            g[k] = 0.0;
+            -st.mix(i, &g, || [0.0; 2])[0]
+        };
+        let mut worst = 0.0f32;
+        for i in (0..audio.len()).step_by(331) {
+            // The cache's 16-bit files clip at full scale where a stem goes
+            // past it; the stems kept in memory clip each part of the drums.
+            let loud = (0..MAX_STEMS).any(|k| stem(&cached, k, i).abs() > 0.97);
+            if loud {
+                continue;
+            }
+            // Bass, Instru and Vocal, and the drums whole (kick and hats
+            // split with a little less run-up here than from the file).
+            for k in 1..4 {
+                worst = worst.max((stem(&live, k, i) - stem(&cached, k, i)).abs());
+            }
+            let drums = |st: &Stems| stem(st, 0, i) + stem(st, 4, i);
+            worst = worst.max((drums(&live) - drums(&cached)).abs());
+        }
+        println!("largest difference {worst:.5}");
+        assert!(worst < 3e-4, "{worst}");
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn stems_from_the_demucs_command_come_back_at_the_track_rate() {
+        let file =
+            std::env::temp_dir().join(format!("opendj-resample-{}.flac", std::process::id()));
+        let tone: Vec<f32> = (0..44_100).map(|i| (i as f32 * 0.03).sin() * 0.5).collect();
+        crate::recorder::write_flac(&file, 44_100, [&tone, &tone]).unwrap();
+        resample_flac(&file, 48_000).unwrap();
+        let audio = crate::decode::decode(&file).unwrap();
+        assert_eq!(audio.sample_rate, 48_000);
+        assert_eq!(audio.len(), 48_000);
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]

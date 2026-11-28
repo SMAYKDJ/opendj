@@ -28,6 +28,7 @@ pub mod dupes;
 pub mod fix_names;
 pub mod health;
 mod moves;
+pub mod pair_mixes;
 pub mod playlist_files;
 pub mod query;
 pub mod relocate;
@@ -53,9 +54,10 @@ pub const ID_BASE: usize = 1_000_000;
 /// 9 added `tracks.stage` (see [`stages`]).
 /// 10 added `tracks.grid_locked` and `grid_unsure`; imported grids start
 /// locked.
+/// 14 added `tracks.grid_mode`.
 /// 12 takes off the wanted list the streamed tracks imports used to put
 /// there: only the DJ puts tracks on it now.
-const VERSION: i32 = 13;
+const VERSION: i32 = 14;
 
 /// The `source` of grids, keys and markers found by this app's analysis.
 const ANALYSIS: &str = "analysis";
@@ -170,7 +172,7 @@ CREATE TABLE IF NOT EXISTS inbox_log (
 ";
 
 /// Columns added to `tracks` after version 1: name and definition.
-const ADDED_COLUMNS: [(&str, &str); 18] = [
+const ADDED_COLUMNS: [(&str, &str); 19] = [
     ("store", "store TEXT NOT NULL DEFAULT ''"),
     ("store_url", "store_url TEXT"),
     // Where the key came from: 'analysis', 'tags', or another app's name;
@@ -201,6 +203,9 @@ const ADDED_COLUMNS: [(&str, &str); 18] = [
     ("grid_locked", "grid_locked INTEGER NOT NULL DEFAULT 0"),
     // The analysed grid fits the beats poorly: worth a check (version 10).
     ("grid_unsure", "grid_unsure INTEGER NOT NULL DEFAULT 0"),
+    // How the grid follows the tempo, as `GridMode::name`; empty for the
+    // mode set in Settings (version 14).
+    ("grid_mode", "grid_mode TEXT NOT NULL DEFAULT ''"),
 ];
 
 /// Tracks the DJ linked as going well together: `track` links to `linked`. Created on every open rather than by
@@ -498,6 +503,9 @@ pub fn snapshot(from: &Path, to: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// A track in a list: its row id and when it was added (or played).
+type TrackEntry = (i64, Option<i64>);
+
 impl Library {
     /// Opens (creating if needed) the library at `path`.
     pub fn open(path: &Path) -> Result<Self, Error> {
@@ -596,6 +604,7 @@ impl Library {
         db.execute_batch(STREAM_MATCHES_SCHEMA)?;
         db.execute_batch(LIST_STREAMS_SCHEMA)?;
         db.execute_batch(WANTED_DISMISSED_SCHEMA)?;
+        db.execute_batch(pair_mixes::PAIR_MIXES_SCHEMA)?;
         // The import that put a wanted track there (its streamed tracks),
         // NULL for tracks the DJ went to buy.
         let has_wanted_source = db
@@ -750,7 +759,7 @@ impl Library {
                     comment, grouping, labels, play_count, grid, added, key_source,
                     remix, year, track_number, user1, user2, gain, last_played,
                     disc_number, label, composer, remixer, isrc, user_more, stage, grid_source,
-                    grid_locked, grid_unsure
+                    grid_locked, grid_unsure, grid_mode
              FROM tracks WHERE id NOT IN (SELECT track_id FROM removed) ORDER BY id",
         )?;
         let rows = q.query_map([], |r| {
@@ -792,6 +801,7 @@ impl Library {
                         grid_from: grid_source.unwrap_or_default(),
                         grid_locked: r.get(33)?,
                         grid_unsure: r.get(34)?,
+                        grid_mode: opendj_engine::GridMode::from_name(&r.get::<_, String>(35)?),
                         added: r.get(16)?,
                         missing: false,
                         key_detected: key_source.map(|s| s == "analysis"),
@@ -822,6 +832,11 @@ impl Library {
             if let Some(g) = grid.map(|g| BeatGrid::from_text(&g)) {
                 if !g.is_empty() {
                     t.set_grid(g);
+                    t.info.fixed_grid = true;
+                } else if t.info.grid_from == "user" {
+                    // The DJ cleared the grid: no beats, and analysis
+                    // leaves it so.
+                    t.bpm = 0.0;
                     t.info.fixed_grid = true;
                 }
             }
@@ -1147,6 +1162,21 @@ impl Library {
         Ok(())
     }
 
+    /// Keeps how a track's grid follows its tempo; None for the mode set in
+    /// Settings.
+    pub fn set_grid_mode(
+        &self,
+        id: usize,
+        mode: Option<opendj_engine::GridMode>,
+    ) -> Result<(), Error> {
+        let Some(row) = row_id(id) else { return Ok(()) };
+        self.db.execute(
+            "UPDATE tracks SET grid_mode = ?2 WHERE id = ?1",
+            params![row, mode.map_or("", |m| m.name())],
+        )?;
+        Ok(())
+    }
+
     /// Forgets a track's beat grid, edited or imported, so the next analysis
     /// (see [`Library::save_analysis`]) gives it one.
     pub fn clear_grid(&self, id: usize) -> Result<(), Error> {
@@ -1190,6 +1220,31 @@ impl Library {
         tx.commit()
     }
 
+    /// Sets one of a track's Automix points (`name` as an imported one:
+    /// "realStart" where it is mixed in, "fadeStart" where it is mixed
+    /// out), replacing any other of that name, or clears it.
+    pub fn set_automix_point(
+        &mut self,
+        id: usize,
+        name: &str,
+        seconds: Option<f64>,
+    ) -> Result<(), Error> {
+        let Some(row) = row_id(id) else { return Ok(()) };
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "DELETE FROM markers WHERE track_id = ?1 AND kind = 'automix' AND name = ?2",
+            params![row, name],
+        )?;
+        if let Some(s) = seconds {
+            tx.execute(
+                "INSERT INTO markers (track_id, kind, seconds, name, source)
+                 VALUES (?1, 'automix', ?2, ?3, 'user')",
+                params![row, s, name],
+            )?;
+        }
+        tx.commit()
+    }
+
     pub fn set_rating(&self, id: usize, rating: u8) -> Result<(), Error> {
         self.update(id, "rating", rating.min(5) as i64)
     }
@@ -1212,7 +1267,8 @@ impl Library {
             "UPDATE tracks SET title = ?2, artist = ?3, remix = ?4, album = ?5, year = ?6,
                     genre = ?7, track_number = ?8, grouping = ?9, key = ?10,
                     key_source = CASE WHEN key = ?10 THEN key_source ELSE 'user' END,
-                    rating = ?11, comment = ?12, gain = ?13, file_mtime = ?14
+                    rating = ?11, comment = ?12, gain = ?13, file_mtime = ?14,
+                    label = ?15, composer = ?16, isrc = ?17, disc_number = ?18
              WHERE id = ?1",
             params![
                 row,
@@ -1233,6 +1289,10 @@ impl Library {
                     Source::File(path) => mtime(path),
                     Source::Synth { .. } => 0,
                 },
+                t.info.label,
+                t.info.composer,
+                t.info.isrc,
+                t.info.disc_number as i64,
             ],
         )?;
         tags::write_track_tags(&self.db, row, &t.info.tags, None)
@@ -1496,6 +1556,45 @@ impl Library {
         Ok(())
     }
 
+    /// Puts collection track `track` in the place of streamed track
+    /// `stream_id` on `service` in every list it stands in, keeping its
+    /// place and when it was played or added. Returns the lists changed.
+    pub fn fill_streamed(
+        &mut self,
+        service: &str,
+        stream_id: &str,
+        track: usize,
+    ) -> Result<Vec<i64>, Error> {
+        let Some(row) = row_id(track) else {
+            return Ok(Vec::new());
+        };
+        let tx = self.db.transaction()?;
+        let places: Vec<(i64, i64, Option<i64>)> = tx
+            .prepare(
+                "SELECT playlist_id, position, played_at FROM list_streams
+                 WHERE service = ?1 AND stream_id = ?2",
+            )?
+            .query_map(params![service, stream_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (list, position, at) in &places {
+            tx.execute(
+                "DELETE FROM list_streams WHERE playlist_id = ?1 AND position = ?2",
+                params![list, position],
+            )?;
+            tx.execute(
+                "INSERT INTO playlist_tracks (playlist_id, position, track_id, played_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![list, position, row, at],
+            )?;
+        }
+        tx.commit()?;
+        let mut lists: Vec<i64> = places.into_iter().map(|(l, _, _)| l).collect();
+        lists.dedup();
+        Ok(lists)
+    }
+
     /// Appends tracks to a list. Tracks not in the library are skipped.
     pub fn add_to_playlist(&mut self, id: i64, tracks: &[usize]) -> Result<(), Error> {
         let tx = self.db.transaction()?;
@@ -1543,6 +1642,86 @@ impl Library {
                 "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND position = ?2",
                 params![id, p],
             )?;
+        }
+        tx.commit()
+    }
+
+    /// Gives a list the tracks `tracks`, in that order. A track it already
+    /// had keeps when it was added (or played); streamed entries keep their
+    /// place among the entries. A crate keeps each track once.
+    pub fn set_playlist_tracks(&mut self, id: i64, tracks: &[usize]) -> Result<(), Error> {
+        let tx = self.db.transaction()?;
+        let is_crate: bool = tx
+            .prepare("SELECT 1 FROM playlists WHERE id = ?1 AND kind = 5")?
+            .exists([id])?;
+        // Every entry as it is now: a track's row, or a streamed one's.
+        let mut entries: Vec<(i64, Option<TrackEntry>)> = tx
+            .prepare(
+                "SELECT position, track_id, played_at FROM playlist_tracks WHERE playlist_id = ?1",
+            )?
+            .query_map([id], |r| Ok((r.get(0)?, Some((r.get(1)?, r.get(2)?)))))?
+            .collect::<Result<_, _>>()?;
+        let streams: Vec<i64> = tx
+            .prepare("SELECT position FROM list_streams WHERE playlist_id = ?1")?
+            .query_map([id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        entries.extend(streams.iter().map(|&p| (p, None)));
+        entries.sort_by_key(|e| e.0);
+        // When each track it holds came in, to keep for the same track.
+        let mut kept: HashMap<i64, std::collections::VecDeque<Option<i64>>> = HashMap::new();
+        for (_, e) in &entries {
+            if let Some((track, at)) = e {
+                kept.entry(*track).or_default().push_back(*at);
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut order: Vec<Option<TrackEntry>> = tracks
+            .iter()
+            .filter_map(|&t| row_id(t))
+            .filter(|r| !is_crate || seen.insert(*r))
+            .map(|r| {
+                let at = kept
+                    .get_mut(&r)
+                    .and_then(|q| q.pop_front())
+                    .unwrap_or(Some(now()));
+                Some((r, at))
+            })
+            .collect();
+        // Streamed entries go back where they were, counted among all.
+        let mut stream_old = Vec::new();
+        for (i, (position, e)) in entries.iter().enumerate() {
+            if e.is_none() {
+                let at = i.min(order.len());
+                order.insert(at, None);
+                stream_old.push(*position);
+            }
+        }
+        tx.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [id])?;
+        // Out of the way first, as positions are unique in a list.
+        tx.execute(
+            "UPDATE list_streams SET position = -1 - position WHERE playlist_id = ?1",
+            [id],
+        )?;
+        let mut streams_left = stream_old.into_iter();
+        for (position, e) in order.into_iter().enumerate() {
+            match e {
+                Some((track, at)) => {
+                    tx.execute(
+                        "INSERT INTO playlist_tracks (playlist_id, position, track_id, played_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![id, position as i64, track, at],
+                    )?;
+                }
+                None => {
+                    if let Some(old) = streams_left.next() {
+                        tx.execute(
+                            "UPDATE list_streams SET position = ?3
+                              WHERE playlist_id = ?1 AND position = ?2",
+                            params![id, -1 - old, position as i64],
+                        )?;
+                    }
+                }
+            }
         }
         tx.commit()
     }
@@ -1751,6 +1930,61 @@ impl Library {
             .map(|r| r.map(track_id))
             .collect();
         ids
+    }
+
+    /// The most recent history session with a play in it, and when its
+    /// last track was played (Unix seconds), so a restart can carry on in
+    /// it.
+    pub fn last_session(&self) -> Result<Option<(i64, i64)>, Error> {
+        let ended = self
+            .meta("ended_session")
+            .and_then(|v| v.parse::<i64>().ok());
+        Ok(self
+            .db
+            .query_row(
+                "SELECT t.playlist_id, MAX(t.played_at) FROM playlist_tracks t
+                   JOIN playlists p ON p.id = t.playlist_id
+                  WHERE p.kind = 2 AND p.parent IS NOT NULL AND t.played_at IS NOT NULL
+                  GROUP BY t.playlist_id
+                  ORDER BY MAX(t.played_at) DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .filter(|&(s, _)| Some(s) != ended))
+    }
+
+    /// Marks a history session as ended by hand, so a restart doesn't carry
+    /// on in it.
+    pub fn end_session(&self, session: i64) -> Result<(), Error> {
+        self.set_meta("ended_session", &session.to_string())
+    }
+
+    /// The tracks played in a history session and when each was first
+    /// played there (Unix seconds).
+    pub fn session_plays(&self, session: i64) -> Result<Vec<(usize, i64)>, Error> {
+        let mut q = self.db.prepare(
+            "SELECT track_id, MIN(played_at) FROM playlist_tracks
+              WHERE playlist_id = ?1 AND played_at IS NOT NULL
+              GROUP BY track_id",
+        )?;
+        let plays = q
+            .query_map([session], |r| {
+                Ok((track_id(r.get::<_, i64>(0)?), r.get::<_, i64>(1)?))
+            })?
+            .collect();
+        plays
+    }
+
+    /// Takes a track out of a history session, as if it had not been
+    /// played there. Its play count stays.
+    pub fn unrecord_play(&self, session: i64, id: usize) -> Result<(), Error> {
+        let Some(row) = row_id(id) else { return Ok(()) };
+        self.db.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2",
+            params![session, row],
+        )?;
+        Ok(())
     }
 
     /// Deletes history sessions in which nothing was played.
@@ -3094,6 +3328,14 @@ mod tests {
             ("GBARL9600049", "Online Only")
         );
         assert_eq!(lib.streamed_without_isrc("tidal").unwrap(), ["1"]);
+        // Once the file is in, the track takes the placeholder's place.
+        let b = tracks.iter().find(|t| t.title == "Imported").unwrap().id;
+        let filled = lib.fill_streamed("tidal", "1", b).unwrap();
+        assert_eq!(filled, [id("Mixed").unwrap()]);
+        let entries = lib.playlist_entries(id("Mixed").unwrap()).unwrap();
+        assert!(matches!(entries[0], ListEntry::Track(t) if t == b));
+        assert_eq!(entries.len(), 4);
+        assert!(lib.fill_streamed("tidal", "nope", b).unwrap().is_empty());
         lib.remove_import("vdj", |_| false).unwrap();
         assert!(lib.wanted().unwrap().is_empty());
         assert!(!lib.has_streamed_entries().unwrap());
@@ -3227,6 +3469,40 @@ mod tests {
     }
 
     #[test]
+    fn an_automix_point_replaces_the_imported_one_and_clears() {
+        let mut lib = Library::in_memory().unwrap();
+        lib.sync(&[file_track("/m/a.mp3", "A")]).unwrap();
+        let id = lib.tracks(|_| true).unwrap()[0].id;
+        lib.db
+            .execute(
+                "INSERT INTO markers (track_id, kind, seconds, name, source)
+                 VALUES (?1, 'automix', 200.0, 'fadeStart', 'vdj')",
+                [row_id(id).unwrap()],
+            )
+            .unwrap();
+        let points = |lib: &Library| -> Vec<(String, f64, bool)> {
+            lib.tracks(|_| true).unwrap()[0]
+                .info
+                .markers
+                .iter()
+                .filter(|m| m.kind == MarkerKind::Automix)
+                .map(|m| (m.name.clone(), m.seconds, m.detected))
+                .collect()
+        };
+        lib.set_automix_point(id, "fadeStart", Some(180.0)).unwrap();
+        lib.set_automix_point(id, "realStart", Some(15.0)).unwrap();
+        assert_eq!(
+            points(&lib),
+            [
+                ("realStart".into(), 15.0, false),
+                ("fadeStart".into(), 180.0, false)
+            ]
+        );
+        lib.set_automix_point(id, "fadeStart", None).unwrap();
+        assert_eq!(points(&lib), [("realStart".into(), 15.0, false)]);
+    }
+
+    #[test]
     fn detected_phrases_replace_their_own_and_leave_imported_markers() {
         let mut lib = Library::in_memory().unwrap();
         lib.sync(&[file_track("/m/a.mp3", "A")]).unwrap();
@@ -3295,6 +3571,23 @@ mod tests {
         assert_eq!(t.grid, BeatGrid::constant(126.0, 0.1));
         assert!(!t.info.grid_unsure);
         assert!(t.info.grid_locked, "the lock stays");
+    }
+
+    #[test]
+    fn a_grid_mode_is_kept_and_searchable() {
+        use opendj_engine::GridMode;
+        let mut lib = Library::in_memory().unwrap();
+        lib.sync(&[file_track("/m/a.mp3", "A"), file_track("/m/b.mp3", "B")])
+            .unwrap();
+        let a = lib.tracks(|_| true).unwrap().remove(0);
+        assert_eq!(a.info.grid_mode, None);
+        lib.set_grid_mode(a.id, Some(GridMode::Flexible)).unwrap();
+        assert_eq!(
+            lib.tracks(|_| true).unwrap()[0].info.grid_mode,
+            Some(GridMode::Flexible)
+        );
+        lib.set_grid_mode(a.id, None).unwrap();
+        assert_eq!(lib.tracks(|_| true).unwrap()[0].info.grid_mode, None);
     }
 
     #[test]
@@ -3656,6 +3949,27 @@ mod tests {
         );
         lib.remove_from_playlist(friday, 1).unwrap();
         assert_eq!(lib.playlist_tracks(friday).unwrap(), [ids[2], ids[2]]);
+        // Rearranged as a whole, a streamed entry keeping its place.
+        lib.db
+            .execute(
+                "INSERT INTO list_streams (playlist_id, position, service, uri)
+                 VALUES (?1, 5, 'spotify', 'spotify:track:x')",
+                [friday],
+            )
+            .unwrap();
+        lib.set_playlist_tracks(friday, &[ids[1], ids[2], ids[0]])
+            .unwrap();
+        assert_eq!(
+            lib.playlist_tracks(friday).unwrap(),
+            [ids[1], ids[2], ids[0]]
+        );
+        let kinds: Vec<bool> = lib
+            .playlist_entries(friday)
+            .unwrap()
+            .iter()
+            .map(|e| matches!(e, ListEntry::Track(_)))
+            .collect();
+        assert_eq!(kinds, [true, true, false, true]);
         lib.rename_playlist(warmup, "Openers").unwrap();
         let names: Vec<String> = lib
             .playlists()
@@ -3669,6 +3983,12 @@ mod tests {
         let session = lib.start_session("2026-10-13 21:00").unwrap();
         lib.record_play(Some(session), ids[1]).unwrap();
         lib.record_play(Some(session), ids[1]).unwrap();
+        assert_eq!(lib.last_session().unwrap().map(|(s, _)| s), Some(session));
+        lib.end_session(session).unwrap();
+        assert_eq!(lib.last_session().unwrap(), None);
+        let plays = lib.session_plays(session).unwrap();
+        assert_eq!(plays.len(), 1);
+        assert_eq!(plays[0].0, ids[1]);
         let empty = lib.start_session("2026-10-14 21:00").unwrap();
         lib.drop_empty_sessions().unwrap();
         let tree = lib.playlists().unwrap();
@@ -3690,6 +4010,9 @@ mod tests {
             .find(|t| t.id == ids[1])
             .unwrap();
         assert_eq!(b.info.play_count, 2);
+        // Marked as not played: out of the session, its count kept.
+        lib.unrecord_play(session, ids[1]).unwrap();
+        assert!(lib.session_plays(session).unwrap().is_empty());
 
         // Deleting a folder deletes what is in it.
         lib.delete_playlist(sets).unwrap();

@@ -71,6 +71,9 @@ fn answer(plugin: &mut dyn Plugin, method: &str, p: &Value) -> Result<Value, Plu
                 let mut info = info_json(&s.info());
                 info["sites"] = json!(s.sites());
                 info["previews"] = json!(s.previews());
+                info["plays"] = json!(s.plays());
+                info["rail"] = json!(s.in_rail());
+                info["catalog"] = json!(s.catalog());
                 info
             });
             Ok(json!({
@@ -138,6 +141,7 @@ fn answer(plugin: &mut dyn Plugin, method: &str, p: &Value) -> Result<Value, Plu
                     source.stop_preview();
                     Ok(Value::Null)
                 }
+                "source.browse" => source.browse(&p["ask"]),
                 _ => Err(unsupported()),
             }
         }
@@ -154,6 +158,12 @@ struct Described {
     source: Option<SourceInfo>,
     sites: &'static [&'static str],
     previews: bool,
+    /// Its files play from a cache (see [`SearchSource::plays`]).
+    plays: bool,
+    /// It has a place in the rail (see [`SearchSource::in_rail`]).
+    rail: bool,
+    /// The service it browses for (see [`SearchSource::catalog`]).
+    catalog: Option<&'static str>,
 }
 
 fn described() -> &'static Mutex<HashMap<PathBuf, Described>> {
@@ -415,6 +425,18 @@ impl SearchSource for RemotePlugin {
     fn previews(&self) -> bool {
         self.described.previews
     }
+    fn plays(&self) -> bool {
+        self.described.plays
+    }
+    fn in_rail(&self) -> bool {
+        self.described.rail
+    }
+    fn catalog(&self) -> Option<&'static str> {
+        self.described.catalog
+    }
+    fn browse(&mut self, ask: &Value) -> Result<Value, PluginError> {
+        self.call("source.browse", json!({ "ask": ask }))
+    }
     fn preview(&mut self, id: &str, item: &Found) -> Result<(), PluginError> {
         self.call(
             "source.preview",
@@ -537,6 +559,13 @@ fn described_from(hello: &Value) -> Result<Described, PluginError> {
         sites: Box::leak(sites.into_boxed_slice()),
         // An add-on from before previews says nothing: none.
         previews: hello["source"]["previews"].as_bool().unwrap_or(false),
+        // Nor from before playing add-ons: it doesn't play.
+        plays: hello["source"]["plays"].as_bool().unwrap_or(false),
+        rail: hello["source"]["rail"].as_bool().unwrap_or(true),
+        catalog: hello["source"]["catalog"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .map(intern),
     })
 }
 
@@ -790,6 +819,15 @@ mod tests {
         let mut hello = hello;
         hello["source"]["previews"] = json!(true);
         assert!(described_from(&hello).unwrap().previews);
+        assert!(!described_from(&old).unwrap().plays);
+        hello["source"]["plays"] = json!(true);
+        assert!(described_from(&hello).unwrap().plays);
+        assert!(described_from(&old).unwrap().rail);
+        hello["source"]["rail"] = json!(false);
+        assert!(!described_from(&hello).unwrap().rail);
+        assert_eq!(described_from(&old).unwrap().catalog, None);
+        hello["source"]["catalog"] = json!("tidal");
+        assert_eq!(described_from(&hello).unwrap().catalog, Some("tidal"));
     }
 
     #[test]

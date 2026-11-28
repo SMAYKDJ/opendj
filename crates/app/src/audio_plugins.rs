@@ -16,12 +16,12 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, UNIX_EPOCH};
 
 use opendj_engine::plugins::{scan, scan_audio_units, Descriptor, Plugin, PluginEntry, ScanError};
-use opendj_engine::{AudioEngine, AVAILABLE_EFFECTS};
+use opendj_engine::{parameter_names, step_effect, AudioEngine, AVAILABLE_EFFECTS};
 use serde_json::{json, Value};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::settings;
-use crate::{AppWindow, EffectList, FxRow};
+use crate::{AppWindow, EffectList, FxGroup, FxRow};
 
 /// Settings keys: the folders looked through, and the effects shown.
 pub const FOLDERS: &str = "audio_plugin_folders";
@@ -41,7 +41,7 @@ pub struct Found {
     pub key: String,
     pub name: String,
     pub vendor: String,
-    /// "CLAP", "VST3" or "AU".
+    /// "CLAP", "VST3", "AU" or "Pd".
     pub format: &'static str,
     pub plugin: Plugin,
     /// What the plugin says it is (CLAP features, VST3 sub-categories).
@@ -176,6 +176,9 @@ impl AudioPlugins {
                 features: d.features.clone(),
             });
         }
+        if cfg!(feature = "pd") {
+            out.extend(pd_patches(&pd_folder(), keep));
+        }
         out.sort_by(|a, b| {
             (a.name.to_lowercase(), a.format).cmp(&(b.name.to_lowercase(), b.format))
         });
@@ -286,12 +289,20 @@ impl AudioPlugins {
         changed
     }
 
-    /// The ticked effects that are still there, in the FX lists' order.
+    /// The ticked effects that are still there, in the order the Plugins
+    /// tab shows them, so their numbers (after the built-in effects) step
+    /// in that order too.
     fn chosen(&self) -> Vec<Found> {
         let shown = self.shown();
-        self.effects()
+        let chosen: Vec<Found> = self
+            .effects()
             .into_iter()
             .filter(|f| shown.contains(&f.key))
+            .collect();
+        plugin_rows(&chosen, &list_names(&chosen))
+            .iter()
+            .filter(|row| row.index >= 0)
+            .map(|row| chosen[row.index as usize - AVAILABLE_EFFECTS.len()].clone())
             .collect()
     }
 
@@ -324,11 +335,41 @@ impl AudioPlugins {
                 .set_names(ModelRc::new(VecModel::from(names)));
             app.global::<EffectList>()
                 .set_builtin_count(AVAILABLE_EFFECTS.len() as i32);
+            // What each built-in effect's slider sets, named.
+            let params = app.global::<EffectList>().get_slider_params();
+            let labels: Vec<SharedString> = (0..AVAILABLE_EFFECTS.len())
+                .map(|i| {
+                    let p = params.row_data(i).unwrap_or(-1);
+                    usize::try_from(p)
+                        .ok()
+                        .and_then(|p| parameter_names((i + 1) as f64).get(p).copied())
+                        .unwrap_or("")
+                        .into()
+                })
+                .collect();
+            app.global::<EffectList>()
+                .set_slider_labels(ModelRc::new(VecModel::from(labels)));
+            let (previous, following) = neighbours(chosen.len());
+            app.global::<EffectList>()
+                .set_previous(ModelRc::new(VecModel::from(previous)));
+            app.global::<EffectList>()
+                .set_following(ModelRc::new(VecModel::from(following)));
             app.global::<EffectList>()
                 .set_plugin_rows(ModelRc::new(VecModel::from(plugin_rows(
                     &chosen,
                     &effect_names,
                 ))));
+            let (groups, group_rows) = plugin_groups(&chosen, &effect_names);
+            app.global::<EffectList>()
+                .set_plugin_groups(ModelRc::new(VecModel::from(groups)));
+            app.global::<EffectList>()
+                .set_plugin_group_rows(ModelRc::new(VecModel::from(group_rows)));
+            let maker_keys: Vec<SharedString> = chosen
+                .iter()
+                .map(|f| format!("m:{}", maker_name(f)).into())
+                .collect();
+            app.global::<EffectList>()
+                .set_plugin_maker_keys(ModelRc::new(VecModel::from(maker_keys)));
             let names: Vec<SharedString> = list_names(&instruments)
                 .iter()
                 .map(|n| SharedString::from(n.as_str()))
@@ -338,6 +379,20 @@ impl AudioPlugins {
             crate::instruments::show_plugins(&app, &instruments, &list_names(&instruments));
         }
     }
+}
+
+/// The effects either side of each one (by `loaded_effect`, from 1) in the
+/// order a controller's next and previous buttons step, with `plugins`
+/// plugins after the built-in effects: for the strip that shows the change.
+fn neighbours(plugins: usize) -> (Vec<i32>, Vec<i32>) {
+    (1..=AVAILABLE_EFFECTS.len() + plugins)
+        .map(|id| {
+            (
+                step_effect(id, -1, plugins) as i32,
+                step_effect(id, 1, plugins) as i32,
+            )
+        })
+        .unzip()
 }
 
 /// The kinds of effect the menu groups by, in its order.
@@ -356,12 +411,13 @@ const OTHER: usize = KINDS.len() - 1;
 /// The built-in effects' kinds, by name.
 fn builtin_kind(name: &str) -> usize {
     match name {
-        "Echo" | "Echo Out" | "Spiral" | "Filter Echo" => 0,
+        "Echo" | "Echo Out" | "Spiral" | "Filter Echo" | "Tape Echo" => 0,
         "Reverb" | "Hall" | "Rev Roll" => 1,
-        "Filter" | "Ladder" => 2,
+        "Filter" | "Ladder" | "Solo" => 2,
         "Flanger" | "Phaser" | "Chorus" => 3,
         "Bitcrusher" | "Drive" | "Noise" => 4,
-        "Gate" | "Roll" | "Brake" => 6,
+        "Ducker" => 5,
+        "Gate" | "Roll" | "Brake" | "Rhythm" => 6,
         _ => OTHER,
     }
 }
@@ -450,24 +506,49 @@ fn plugin_kind(features: &[String], name: &str) -> usize {
         .map_or(OTHER, |(kind, _)| *kind)
 }
 
+/// An effect in the menu: its label, its place in EffectList.names and its
+/// kind.
+type MenuItem = (String, usize, usize);
+
 /// Menu lines for `items` (a label, its place in EffectList.names and its
 /// kind): a heading per kind, in [`KINDS`] order, then its effects A to Z.
-fn grouped(items: Vec<(String, usize, usize)>) -> Vec<FxRow> {
-    let mut rows = Vec::new();
-    for (k, kind) in KINDS.iter().enumerate() {
-        let mut these: Vec<&(String, usize, usize)> =
-            items.iter().filter(|(_, _, i)| *i == k).collect();
+/// The kinds are split over two columns of about the same length, kept in
+/// order.
+fn grouped(items: Vec<MenuItem>) -> Vec<FxRow> {
+    let mut groups: Vec<(usize, Vec<&MenuItem>)> = Vec::new();
+    for k in 0..KINDS.len() {
+        let mut these: Vec<&MenuItem> = items.iter().filter(|(_, _, i)| *i == k).collect();
         if these.is_empty() {
             continue;
         }
         these.sort_by_key(|(label, _, _)| label.to_lowercase());
+        groups.push((k, these));
+    }
+    let total: usize = groups.iter().map(|(_, g)| g.len() + 1).sum();
+    let mut rows = Vec::new();
+    let mut first = 0;
+    let mut column = 0;
+    for (k, these) in groups {
+        let size = these.len() + 1;
+        if column == 0 && first > 0 && 2 * (first + size) > total + 1 {
+            column = 1;
+        }
+        if column == 0 {
+            first += size;
+        }
         rows.push(FxRow {
-            label: kind.to_uppercase().into(),
+            label: KINDS[k].into(),
             index: -1,
+            kind: k as i32,
+            column,
+            group: SharedString::new(),
         });
         rows.extend(these.into_iter().map(|(label, index, _)| FxRow {
             label: label.as_str().into(),
             index: *index as i32,
+            kind: k as i32,
+            column,
+            group: SharedString::new(),
         }));
     }
     rows
@@ -501,6 +582,147 @@ fn plugin_rows(chosen: &[Found], names: &[String]) -> Vec<FxRow> {
             })
             .collect(),
     )
+}
+
+/// A plugin's maker as the Plugins tab lists it.
+fn maker_name(f: &Found) -> String {
+    let v = f.vendor.trim();
+    if v.is_empty() {
+        "Other makers".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
+/// The Plugins tab's first column (its makers A to Z, then its kinds) and
+/// what each one opens in the second: the effects of that maker by kind
+/// (`group` "m:<maker>"), or of that kind (`group` "k:<kind>"). `chosen`
+/// and `names` are in the order of [`plugin_rows`].
+fn plugin_groups(chosen: &[Found], names: &[String]) -> (Vec<FxGroup>, Vec<FxRow>) {
+    let maker = maker_name;
+    let mut makers: Vec<String> = chosen.iter().map(maker).collect();
+    makers.sort_by_key(|m| m.to_lowercase());
+    makers.dedup();
+    let mut groups = Vec::new();
+    let mut rows = Vec::new();
+    for m in &makers {
+        let key = format!("m:{m}");
+        let items: Vec<MenuItem> = chosen
+            .iter()
+            .zip(names)
+            .enumerate()
+            .filter(|(_, (f, _))| maker(f) == *m)
+            .map(|(i, (f, n))| {
+                (
+                    n.clone(),
+                    AVAILABLE_EFFECTS.len() + i,
+                    plugin_kind(&f.features, &f.name),
+                )
+            })
+            .collect();
+        groups.push(FxGroup {
+            label: m.as_str().into(),
+            key: key.as_str().into(),
+            count: items.len() as i32,
+            kind: -1,
+        });
+        rows.extend(grouped(items).into_iter().map(|mut r| {
+            r.column = 0;
+            r.group = key.as_str().into();
+            r
+        }));
+    }
+    for (k, kind) in KINDS.iter().enumerate() {
+        let key = format!("k:{kind}");
+        let mut items: Vec<(String, usize)> = chosen
+            .iter()
+            .zip(names)
+            .enumerate()
+            .filter(|(_, (f, _))| plugin_kind(&f.features, &f.name) == k)
+            .map(|(i, (_, n))| (n.clone(), AVAILABLE_EFFECTS.len() + i))
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        items.sort_by_key(|(n, _)| n.to_lowercase());
+        groups.push(FxGroup {
+            label: (*kind).into(),
+            key: key.as_str().into(),
+            count: items.len() as i32,
+            kind: k as i32,
+        });
+        rows.extend(items.into_iter().map(|(n, i)| FxRow {
+            label: n.as_str().into(),
+            index: i as i32,
+            kind: k as i32,
+            column: 0,
+            group: key.as_str().into(),
+        }));
+    }
+    (groups, rows)
+}
+
+/// Where Pure Data patches are looked for (experimental, app feature `pd`):
+/// `OPENDJ_PD_DIR`, else "Pd" in openDJ's music folder.
+pub fn pd_folder() -> PathBuf {
+    std::env::var_os("OPENDJ_PD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            opendj_engine::scan::default_music_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("openDJ")
+                .join("Pd")
+        })
+}
+
+/// The `.pd` files in `folder` (one level of sub-folders, which hold
+/// abstractions as often as patches, is skipped) that `keep` accepts: an
+/// instrument when the patch reads notes or only plays, else an effect
+/// when it takes audio in. Reading a patch runs none of it.
+fn pd_patches(folder: &Path, keep: fn(&Descriptor) -> bool) -> Vec<Found> {
+    use opendj_engine::plugins::pd_patch::read_patch;
+    let Ok(dir) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for path in dir.flatten().map(|e| e.path()) {
+        if path.extension().and_then(|e| e.to_str()) != Some("pd") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let patch = read_patch(&text);
+        let kind = if patch.is_instrument() {
+            "instrument"
+        } else if patch.takes_audio {
+            "audio-effect"
+        } else {
+            continue;
+        };
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let d = Descriptor {
+            id: path.display().to_string(),
+            name: name.clone(),
+            vendor: "Pure Data".into(),
+            version: String::new(),
+            features: vec![kind.into()],
+        };
+        if keep(&d) {
+            out.push(Found {
+                key: format!("pd:{}", path.display()),
+                name,
+                vendor: d.vendor,
+                format: "Pd",
+                plugin: Plugin::Pd { file: path },
+                features: d.features,
+            });
+        }
+    }
+    out
 }
 
 /// The names to show in a chooser: a plugin ticked in more than one format
@@ -826,6 +1048,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_strip_shows_the_neighbours_in_list_order() {
+        let (previous, following) = neighbours(2);
+        assert_eq!(previous.len(), AVAILABLE_EFFECTS.len() + 2);
+        // Echo (1) is first in the list: its neighbour back is the last
+        // plugin, and Echo Out (9) comes next.
+        assert_eq!(following[0], 9);
+        let last_plugin = AVAILABLE_EFFECTS.len() + 2;
+        assert_eq!(previous[0], last_plugin as i32);
+        // The last plugin wraps round to Echo.
+        assert_eq!(following[last_plugin - 1], 1);
+    }
+
+    #[test]
     fn the_scan_note_names_effects_and_instruments() {
         assert_eq!(found_note(0, 0, 0), "No plugins found in these folders.");
         assert_eq!(found_note(1, 0, 0), "Found 1 effect.");
@@ -876,6 +1111,38 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn pd_patches_are_effects_or_instruments() {
+        let dir = std::env::temp_dir().join(format!("opendj-pd-list-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Echo.pd"),
+            "#X obj 0 0 adc~ 1 2;\n#X obj 0 0 dac~;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Synth.pd"),
+            "#X obj 0 0 notein;\n#X obj 0 0 dac~;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("helper.pd"), "#X obj 0 0 inlet~;\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "adc~").unwrap();
+        let effects = pd_patches(&dir, Descriptor::is_audio_effect);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].name, "Echo");
+        assert_eq!(effects[0].format, "Pd");
+        assert_eq!(
+            effects[0].plugin,
+            Plugin::Pd {
+                file: dir.join("Echo.pd")
+            }
+        );
+        let instruments = pd_patches(&dir, Descriptor::is_instrument);
+        assert_eq!(instruments.len(), 1);
+        assert_eq!(instruments[0].name, "Synth");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -896,8 +1163,20 @@ mod menu_tests {
         // Every built-in effect once, under a heading; none in Other.
         let items: Vec<_> = rows.iter().filter(|r| r.index >= 0).collect();
         assert_eq!(items.len(), AVAILABLE_EFFECTS.len());
-        assert_eq!(rows[0].label, "DELAY & ECHO");
-        assert!(rows.iter().all(|r| r.label != "OTHER"));
+        // The engine steps through the effects in this order.
+        assert_eq!(
+            items
+                .iter()
+                .map(|row| row.index as usize + 1)
+                .collect::<Vec<_>>(),
+            opendj_engine::EFFECT_MENU_ORDER
+        );
+        assert_eq!(rows[0].label, "Delay & Echo");
+        assert!(rows.iter().all(|r| r.label != "Other"));
+        // Two columns: Delay, Reverb and Filter first, the rest beside them.
+        let second = rows.iter().position(|r| r.column == 1).unwrap();
+        assert_eq!(rows[second].label, "Modulation");
+        assert!(rows[second..].iter().all(|r| r.column == 1));
         // A to Z within a kind: Echo, Echo Out, Filter Echo, Spiral.
         let first: Vec<&str> = rows[1..5].iter().map(|r| r.label.as_str()).collect();
         assert_eq!(first, ["Echo", "Echo Out", "Filter Echo", "Spiral"]);

@@ -9,10 +9,15 @@
 //! tracks on decks over a wait-free queue as soon as their files are open,
 //! then decode and analyse them while they play.
 
+// Checking that HTDemucs on the GPU (burn over wgpu) can be kept in a static
+// (`separation::GPU_MODEL`) goes deeper than the default 128.
+#![recursion_limit = "256"]
+
 pub mod analysis;
 pub mod arp;
 mod auto_trim;
 pub mod background;
+pub mod bandwidth;
 pub mod beats;
 pub mod beatthis;
 pub mod cache;
@@ -23,7 +28,7 @@ pub mod decode;
 pub mod dsp;
 mod effects;
 pub mod engine;
-mod gridfit;
+pub mod gridfit;
 pub mod groove;
 pub mod groove_dice;
 pub mod groove_fills;
@@ -33,8 +38,11 @@ pub mod import;
 pub mod inputs;
 pub mod key;
 pub mod keynet;
-mod keyshift;
+/// Time-stretching a source to any speed and key (Signalsmith Stretch);
+/// openDJ Studio's audio clips play through it too.
+pub mod keyshift;
 pub mod kits;
+pub mod latch;
 pub mod link;
 pub mod live_wave;
 pub mod loader;
@@ -51,13 +59,22 @@ pub mod plugins;
 pub mod preview;
 pub mod process;
 pub mod recorder;
+pub mod room_eq;
 pub mod sampler;
 pub mod scale;
 pub mod scan;
 pub mod separation;
+pub mod seq;
+pub mod set_chapters;
+pub mod set_checks;
+pub mod set_fixes;
+pub mod set_render;
+pub mod set_timeline;
+pub mod stem_file;
 pub mod stems;
 pub mod synth;
 pub mod tags;
+mod tap_tempo;
 pub mod track;
 mod visual;
 pub mod vocals;
@@ -78,13 +95,22 @@ pub use controls::{
     NUM_EFFECT_UNITS, NUM_HOTCUES, XFADER_CUT_IN,
 };
 pub use effects::{
-    color_fx_name, effect_name, parameter_names, plugin_index, InstrumentView, NoteInput,
-    PluginLink, AVAILABLE_EFFECTS, COLOR_FX, DEFAULT_EFFECTS, MAX_BUTTON_PARAMETERS,
-    MAX_PARAMETERS, MAX_PLUGINS, PLUGIN_BASE, SCOPE_BINS,
+    color_fx_name, effect_name, parameter_names, plugin_index, step_effect, InstrumentView,
+    NoteInput, PluginLink, AVAILABLE_EFFECTS, COLOR_FX, DEFAULT_EFFECTS, EFFECT_MENU_ORDER,
+    MAX_BUTTON_PARAMETERS, MAX_PARAMETERS, MAX_PLUGINS, PLUGIN_BASE, SCOPE_BINS,
 };
+/// The Remix deck's effect and scene names, as its controls number them.
+pub mod remix {
+    pub use crate::effects::remix::{
+        ISOLATE_EFFECTS, LEVER_EFFECTS, PAD_NAMES, ROLL_RATES, SCENES_DOWN, SCENES_UP,
+    };
+    pub use crate::kits::KITS;
+}
+pub use gridfit::GridMode;
 pub use output::{
-    channel_names, deck_outputs_split, default_output_device, input_devices, output_devices,
-    AudioSetup, InputRole, InputRoute, OutputDevice, Role, Route, BUFFER_SIZES, SAMPLE_RATES,
+    channel_names, deck_outputs_split, default_output_device, devices_generation, devices_scanning,
+    input_devices, is_asio, output_devices, rescan_devices, scan_devices, AudioSetup, DeviceScan,
+    InputRole, InputRoute, OutputDevice, Role, Route, BUFFER_SIZES, SAMPLE_RATES,
 };
 pub use recorder::{RecordFormat, RecordSettings, Recorder};
 pub use synth::sample_library;
@@ -150,13 +176,31 @@ pub struct AudioEngine {
     broadcast_feed: Mutex<Option<recorder::Feed>>,
     /// The master for Battle Live, until it takes it.
     live_feed: Mutex<Option<recorder::Feed>>,
+    /// The main output as it leaves, for the Room EQ page's spectrum.
+    spectrum_feed: Mutex<Option<recorder::Feed>>,
     /// Picks the outputs MIDI clock goes to.
     midi_clock: midi_clock::MidiClock,
+    beat_clock: Arc<midi_clock::BeatClock>,
 }
 
 /// The master output, for broadcasting: a copy of what the speakers get,
 /// after the limiter. The audio thread only copies while it is active.
 pub struct MasterFeed(recorder::Feed);
+
+/// The main output as it leaves the engine, copied only while switched on.
+pub struct OutputFeed(recorder::Feed);
+
+impl OutputFeed {
+    /// Moves every sample waiting (interleaved stereo) onto the end of `out`.
+    pub fn drain_into(&mut self, out: &mut Vec<f32>) {
+        self.0.drain_into(out);
+    }
+
+    /// Starts or stops the copying; it costs nothing while off.
+    pub fn set_active(&self, on: bool) {
+        self.0.set_active(on);
+    }
+}
 
 impl MasterFeed {
     /// Moves every sample waiting (interleaved stereo, at the engine's
@@ -209,6 +253,7 @@ impl AudioEngine {
         );
         let broadcast_feed = engine.take_broadcast_feed();
         let live_feed = engine.take_live_feed();
+        let spectrum_feed = engine.take_spectrum_feed();
         let preview = engine.take_preview_input().expect("preview input");
         let samplers = engine.take_sampler_input().expect("sampler input");
         let visual = engine.visual_positions();
@@ -231,8 +276,9 @@ impl AudioEngine {
             NUM_DECKS,
             rate,
         );
+        let beat_clock = engine.beat_clock();
         let midi_clock = midi_clock::start(
-            engine.beat_clock(),
+            beat_clock.clone(),
             engine.clock_in(),
             engine.link_handle(),
             &registry,
@@ -270,13 +316,31 @@ impl AudioEngine {
             groove_hits: Mutex::new(Some(groove_hits)),
             broadcast_feed: Mutex::new(broadcast_feed),
             live_feed: Mutex::new(live_feed),
+            spectrum_feed: Mutex::new(spectrum_feed),
             midi_clock,
+            beat_clock,
         }
     }
 
     /// MIDI clock out: which outputs it sends to.
     pub fn midi_clock(&self) -> midi_clock::MidiClock {
         self.midi_clock.clone()
+    }
+
+    /// The master deck's beat and tempo as each buffer is heard (tempo 0
+    /// while no deck plays), for the Session to follow.
+    pub fn beat_clock(&self) -> Arc<midi_clock::BeatClock> {
+        self.beat_clock.clone()
+    }
+
+    /// Plays the Session (openDJ Studio's clips) from `source` on its own
+    /// channel, `[Session1]`, or nothing. Returns the source it played
+    /// before.
+    pub fn set_session(
+        &self,
+        source: Option<Box<dyn inputs::SessionSource>>,
+    ) -> Option<Box<dyn inputs::SessionSource>> {
+        self.output.borrow().set_session(source)
     }
 
     /// The master output for broadcasting; there is only one, so later
@@ -290,6 +354,12 @@ impl AudioEngine {
     /// one, so later calls get `None`.
     pub fn take_live_feed(&self) -> Option<MasterFeed> {
         self.live_feed.lock().ok()?.take().map(MasterFeed)
+    }
+
+    /// The main output as it leaves the engine, after Room EQ, for drawing
+    /// its spectrum; there is only one.
+    pub fn take_output_feed(&self) -> Option<OutputFeed> {
+        self.spectrum_feed.lock().ok()?.take().map(OutputFeed)
     }
 
     /// The rate the engine runs at, in Hz.
@@ -340,12 +410,31 @@ impl AudioEngine {
         }
     }
 
+    /// The playing instrument's display file for the deck (see
+    /// `opendj_plugin_host::display`); none while no instrument plays.
+    pub fn instrument_display(&self) -> Option<std::path::PathBuf> {
+        self.plugins.as_ref()?.instrument_display()
+    }
+
+    /// Effect slot `slot` of unit `unit`'s display file and plugin name.
+    pub fn slot_display(&self, unit: usize, slot: usize) -> Option<(std::path::PathBuf, String)> {
+        self.plugins.as_ref()?.slot_display(unit, slot)
+    }
+
     /// The playing instrument's parameter names, for its knobs
     /// (`[Instrument1],parameterN` is the N-th); empty while none plays.
     pub fn instrument_parameters(&self) -> Vec<String> {
         self.plugins
             .as_ref()
             .map_or_else(Vec::new, |p| p.instrument_parameters())
+    }
+
+    /// A name for each page of 8 of the playing instrument's knobs, from
+    /// its maker ("" for none); empty while none plays or it names none.
+    pub fn instrument_pages(&self) -> Vec<String> {
+        self.plugins
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.instrument_pages())
     }
 
     /// Every parameter of the playing instrument, (id, name), to pick
@@ -395,6 +484,21 @@ impl AudioEngine {
         if let Some(p) = &self.plugins {
             p.shut_down();
         }
+    }
+
+    /// Closes the audio devices and the MIDI clock's ports for quitting,
+    /// while every thread is still alive: the engine itself is often still
+    /// held by the window's handlers when the app returns, and dropping its
+    /// streams at the very end of the process panics or hangs. Afterwards
+    /// nothing plays and no device opens again. Whether every thread it
+    /// waited on finished: one stuck in a driver is left behind.
+    pub fn close_devices(&self) -> bool {
+        // The sound first, then the clock's MIDI ports.
+        let outputs = self.output.borrow_mut().close();
+        let clock = self
+            .midi_clock
+            .shut_down_within(std::time::Duration::from_secs(2));
+        outputs && clock
     }
 
     /// Where notes for the Instrument input go in, from any thread.
@@ -481,6 +585,27 @@ impl AudioEngine {
                         }
                         Err(e) => eprintln!("can't preview {}: {e}", path.display()),
                     },
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("could not start the preview: {e}");
+        }
+    }
+
+    /// Streams the file at `path` into the preview player from `from`
+    /// seconds, playing if `play`: decoded a few seconds ahead of the
+    /// playhead, so a long recording is never held whole. Seek by calling it
+    /// again; the old stream stops.
+    pub fn preview_stream(&self, path: std::path::PathBuf, from: f64, play: bool) {
+        let generation = self.preview_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let input = self.preview.clone();
+        let current = self.preview_generation.clone();
+        let spawned = std::thread::Builder::new()
+            .name("preview".into())
+            .spawn(move || {
+                let latest = || current.load(Ordering::Acquire) == generation;
+                if let Err(e) = stream_preview(&path, from, play, &input, latest) {
+                    eprintln!("can't play {}: {e}", path.display());
                 }
             });
         if let Err(e) = spawned {
@@ -733,7 +858,34 @@ impl AudioEngine {
         }
         let loaded = self.loaded.clone();
         let file = path.clone();
-        stems::separate(path, move |result| {
+        let live = {
+            let (loaded, registry, file) =
+                (self.loaded.clone(), self.registry.clone(), path.clone());
+            // The decks with the track, a playing one first, and where
+            // each plays.
+            move || {
+                let decks = loaded.read().unwrap();
+                let mut live: Vec<(bool, Arc<Audio>, usize)> = decks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(d, t)| {
+                        let t = t.as_ref()?;
+                        if !matches!(&t.source, Source::File(p) if *p == file) {
+                            return None;
+                        }
+                        let audio = t.audio.clone()?;
+                        let group = controls::deck_group(d);
+                        let get = |key: &str| registry.get(&group, key).map_or(0.0, |c| c.get());
+                        let at =
+                            (get("playposition").clamp(0.0, 1.0) * audio.len() as f64) as usize;
+                        Some((get("play") > 0.0, audio, at))
+                    })
+                    .collect();
+                live.sort_by_key(|(playing, _, _)| !playing);
+                live.into_iter().map(|(_, a, at)| (a, at)).collect()
+            }
+        };
+        stems::separate(path, live, move |result| {
             let source = match result {
                 Ok(s) => s,
                 Err(e) => {
@@ -778,4 +930,110 @@ fn loaded_paths(tracks: &[Arc<Track>]) -> Vec<std::path::PathBuf> {
             _ => None,
         })
         .collect()
+}
+
+/// Decodes `path` from `from` seconds into a ring the preview player reads,
+/// for [`AudioEngine::preview_stream`]; returns once `latest` turns false,
+/// the player lets the stream go, or the file ends.
+fn stream_preview(
+    path: &std::path::Path,
+    from: f64,
+    play: bool,
+    input: &Mutex<preview::PreviewInput>,
+    latest: impl Fn() -> bool,
+) -> Result<(), String> {
+    /// Seconds decoded ahead of the playhead.
+    const AHEAD: usize = 4;
+    let mut decoder = decode::Decoder::open(path)?;
+    let rate = decoder.audio().sample_rate.max(1);
+    let total = decoder
+        .seconds()
+        .map_or(0, |s| (s * rate as f64).round() as usize);
+    let from = from.clamp(0.0, (total as f64 / rate as f64 - 0.05).max(0.0));
+    let mut skip = decoder.seek(from)?;
+    let start = (from * rate as f64).round() as usize;
+    let (mut tx, frames) = rtrb::RingBuffer::new(rate as usize * AHEAD);
+    let mut stream = Some(preview::Stream {
+        frames,
+        start,
+        total: total.max(start + 1),
+        rate,
+    });
+    // Sent once half a second is ready, so it starts without a gap.
+    let ready = rate as usize / 2;
+    let send = |stream: &mut Option<preview::Stream>| {
+        if let Some(s) = stream.take() {
+            if latest() {
+                if let Ok(mut p) = input.lock() {
+                    p.send_stream(s, play);
+                }
+            }
+        }
+    };
+    let result = decoder.stream(|_, packet| {
+        for f in packet.as_chunks::<2>().0 {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            while tx.is_full() {
+                if stream.is_some() {
+                    send(&mut stream);
+                }
+                if !latest() || tx.is_abandoned() {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _ = tx.push([f[0], f[1]]);
+        }
+        if stream.is_some() && tx.slots() + ready <= rate as usize * AHEAD {
+            send(&mut stream);
+        }
+        latest() && !tx.is_abandoned()
+    });
+    // A short file: sent once decoded.
+    send(&mut stream);
+    match result {
+        Err(e) if e.ends_with("decoding cancelled") => Ok(()),
+        r => r.map(|_| ()),
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn streams_a_file_from_the_second_asked_for() {
+        let dir = std::env::temp_dir().join(format!("opendj-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("set.wav");
+        // 3 s at 8 kHz, each sample its frame number / 8.
+        let samples: Vec<i16> = (0..24_000).map(|i| (i / 8) as i16).collect();
+        decode::tests::write_wav(&path, 8000, 1, &samples);
+        let reg = ControlRegistry::new();
+        let (mut player, input) = preview::Preview::new(&reg, 8000.0);
+        let input = Mutex::new(input);
+        // The ring holds 4 s, more than the file, so it decodes in one go.
+        stream_preview(&path, 1.5, true, &input, || true).unwrap();
+        player.update();
+        let at = reg
+            .get(preview::PREVIEW_GROUP, "playposition")
+            .unwrap()
+            .get();
+        assert!((at - 0.5).abs() < 1e-6, "{at}");
+        // Past the start ramp, it hears frame 12000 onwards.
+        let mut last = [0.0; 2];
+        for _ in 0..4000 {
+            last = player.next();
+        }
+        let expected = ((12_000 + 3998) / 8) as f32 / 32768.0;
+        assert!(
+            (last[0] - expected).abs() < 0.002,
+            "{} vs {expected}",
+            last[0]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

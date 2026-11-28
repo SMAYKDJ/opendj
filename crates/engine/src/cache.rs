@@ -17,12 +17,13 @@ use flate2::Compression;
 
 use crate::analysis::Analysis;
 use crate::beats::{BeatGrid, GridMarker};
+use crate::gridfit::GridMode;
 use crate::key::{Detector, Key};
 use crate::loudness::Loudness;
 use crate::track::{Chroma, OverviewSlice, Waveform, WaveformBin};
 
 /// Changes whenever the analysis or this format changes, so old entries are ignored.
-const MAGIC: &[u8; 8] = b"MXRSAN07";
+const MAGIC: &[u8; 8] = b"MXRSAN08";
 
 /// Starts each stored overview, followed by the analysis's own [`MAGIC`],
 /// so overviews of an older analysis are made again too.
@@ -31,9 +32,15 @@ const OVERVIEW_MAGIC: &[u8; 8] = b"ODJOVW02";
 /// Slices in a stored overview: the library's mini waveforms.
 pub const OVERVIEW_SLICES: usize = 256;
 
-/// Where tests keep their cache, instead of the user's.
+/// Where tests keep their cache, instead of the user's: one folder for the
+/// whole test run, so a test never stores in one and loads from another.
 #[cfg(test)]
-pub(crate) static TEST_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+pub(crate) fn test_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::temp_dir().join(format!("opendj-test-cache-{}", std::process::id()))
+    })
+}
 
 /// Where tests keep a mock external volume root, instead of the real system volumes.
 #[cfg(test)]
@@ -43,17 +50,18 @@ pub(crate) static TEST_VOLUME_ROOT: std::sync::RwLock<Option<PathBuf>> =
 /// openDJ's cache folder (`OPENDJ_CACHE` overrides it).
 pub fn cache_dir() -> Option<PathBuf> {
     #[cfg(test)]
-    if let Some(dir) = TEST_DIR.get() {
-        return Some(dir.clone());
+    return Some(test_dir().to_path_buf());
+    #[cfg(not(test))]
+    {
+        if let Some(dir) = std::env::var_os("OPENDJ_CACHE") {
+            return Some(PathBuf::from(dir));
+        }
+        let base = crate::paths::cache_base()?;
+        let name = crate::paths::app_folder_name();
+        static MOVED: std::sync::Once = std::sync::Once::new();
+        MOVED.call_once(|| move_old_folder(&base, name));
+        Some(base.join(name))
     }
-    if let Some(dir) = std::env::var_os("OPENDJ_CACHE") {
-        return Some(PathBuf::from(dir));
-    }
-    let base = crate::paths::cache_base()?;
-    let name = crate::paths::app_folder_name();
-    static MOVED: std::sync::Once = std::sync::Once::new();
-    MOVED.call_once(|| move_old_folder(&base, name));
-    Some(base.join(name))
 }
 
 /// Renames the folder an earlier version kept its files in (`mixxx-rs`)
@@ -103,6 +111,50 @@ pub fn clear_analysis() -> usize {
         .flatten()
         .filter(|e| fs::remove_file(e.path()).is_ok())
         .count()
+}
+
+/// Deletes stored analyses (and their overviews) that belong to none of
+/// `keep` as the files are now: files deleted, moved or out of the
+/// collection. Ones touched in the last `days` days stay, in case their
+/// drive is only away for now. Returns how many went and the bytes freed.
+pub fn clear_unused_analysis(keep: &[PathBuf], days: u64) -> (usize, u64) {
+    let Some(dir) = analysis_dir() else {
+        return (0, 0);
+    };
+    let wanted: std::collections::HashSet<PathBuf> = keep.iter().filter_map(|p| entry(p)).collect();
+    clear_unused_in(&dir, &wanted, days)
+}
+
+fn clear_unused_in(
+    dir: &Path,
+    wanted: &std::collections::HashSet<PathBuf>,
+    days: u64,
+) -> (usize, u64) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let recent = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(days * 86_400))
+        .unwrap_or(UNIX_EPOCH);
+    let (mut n, mut bytes) = (0, 0);
+    for e in entries.flatten() {
+        let path = e.path();
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() || wanted.contains(&path) {
+            continue;
+        }
+        if meta.modified().is_ok_and(|m| m > recent) {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            n += 1;
+            bytes += meta.len();
+            if let Some(o) = overview_file(&path) {
+                let _ = fs::remove_file(o);
+            }
+        }
+    }
+    (n, bytes)
 }
 
 /// If `path` is located on an external / removable volume, returns `(volume_root, relative_path)`.
@@ -199,7 +251,6 @@ fn hash_bytes(path_bytes: &[u8], len: u64, modified_nanos: u128) -> String {
     format!("{h:016x}")
 }
 
-/// Where `path`'s analysis is kept, or None if the file can't be read.
 /// Where the analysis of `path` is kept, named for the file as it is now.
 pub(crate) fn entry_path(path: &Path) -> Option<PathBuf> {
     entry(path)
@@ -536,8 +587,10 @@ fn encode(a: &Analysis) -> Vec<u8> {
         out.extend_from_slice(&m.seconds.to_le_bytes());
         out.extend_from_slice(&m.bpm.to_le_bytes());
     }
-    // Grid flags: unsure, then from Beat This!.
-    let flags = u64::from(a.grid_unsure) | u64::from(a.neural_beats) << 1;
+    // Grid flags: unsure, then from Beat This!, then the grid mode (two bits).
+    let flags = u64::from(a.grid_unsure)
+        | u64::from(a.neural_beats) << 1
+        | u64::from(a.grid_mode.id()) << 2;
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&(finest.len() as u64).to_le_bytes());
     for b in finest {
@@ -550,6 +603,13 @@ fn encode(a: &Analysis) -> Vec<u8> {
     out.extend_from_slice(&(chroma.steps.len() as u64).to_le_bytes());
     for s in &chroma.steps {
         out.extend_from_slice(s);
+    }
+    // Beat This!'s beats and downbeats after it, likewise.
+    for times in [&a.beats, &a.downbeats] {
+        out.extend_from_slice(&(times.len() as u64).to_le_bytes());
+        for &t in times {
+            out.extend_from_slice(&(t as f32).to_le_bytes());
+        }
     }
     out
 }
@@ -595,7 +655,9 @@ fn decode(data: &[u8]) -> Option<Analysis> {
     let (bins, after) = rest.split_at(bytes);
     let finest: Vec<WaveformBin> = bins.as_chunks::<8>().0.to_vec();
     let mut waveform = Waveform::from_finest(bins_per_second, finest);
-    waveform.chroma = decode_chroma(after).unwrap_or_default();
+    let (chroma, after) = decode_chroma(after).unwrap_or_default();
+    waveform.chroma = chroma;
+    let (beats, downbeats) = decode_beats(after).unwrap_or_default();
     Some(Analysis {
         waveform,
         key,
@@ -605,24 +667,80 @@ fn decode(data: &[u8]) -> Option<Analysis> {
         grid: BeatGrid::new(grid),
         grid_unsure: flags & 1 != 0,
         neural_beats: flags & 2 != 0,
+        grid_mode: GridMode::from_id((flags >> 2 & 3) as u8).unwrap_or_default(),
+        beats,
+        downbeats,
         loudness,
     })
 }
 
-/// The chroma stored after the waveform; None for entries from before.
-fn decode_chroma(data: &[u8]) -> Option<Chroma> {
+/// The chroma stored after the waveform, and what follows it; None for
+/// entries from before.
+fn decode_chroma(data: &[u8]) -> Option<(Chroma, &[u8])> {
     let (rate, rest) = data.split_first_chunk::<8>()?;
     let (len, rest) = rest.split_first_chunk::<8>()?;
     let len = u64::from_le_bytes(*len) as usize;
-    let (steps, _) = rest.as_chunks::<12>();
-    (steps.len() == len).then(|| Chroma {
+    let bytes = len.checked_mul(12).filter(|&b| b <= rest.len())?;
+    let (steps, after) = rest.split_at(bytes);
+    let chroma = Chroma {
         per_second: f64::from_le_bytes(*rate),
-        steps: steps.to_vec(),
-    })
+        steps: steps.as_chunks::<12>().0.to_vec(),
+    };
+    Some((chroma, after))
+}
+
+/// The beats and downbeats stored after the chroma; None for entries from
+/// before.
+fn decode_beats(data: &[u8]) -> Option<(Vec<f64>, Vec<f64>)> {
+    let mut rest = data;
+    let mut times = || -> Option<Vec<f64>> {
+        let (len, r) = rest.split_first_chunk::<8>()?;
+        let len = u64::from_le_bytes(*len) as usize;
+        let bytes = len.checked_mul(4).filter(|&b| b <= r.len())?;
+        let (values, after) = r.split_at(bytes);
+        rest = after;
+        Some(
+            values
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f64::from(f32::from_le_bytes(*b)))
+                .collect(),
+        )
+    };
+    let beats = times()?;
+    let downbeats = times()?;
+    Some((beats, downbeats))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unused_old_analyses_go() {
+        let root = std::env::temp_dir().join(format!("opendj-unused-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("analysis");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(root.join("overviews")).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        for name in ["kept", "gone", "new"] {
+            fs::write(dir.join(name), vec![0u8; 100]).unwrap();
+            fs::write(root.join("overviews").join(name), b"o").unwrap();
+            if name != "new" {
+                let f = fs::File::options()
+                    .write(true)
+                    .open(dir.join(name))
+                    .unwrap();
+                f.set_modified(old).unwrap();
+            }
+        }
+        let wanted = [dir.join("kept")].into_iter().collect();
+        assert_eq!(clear_unused_in(&dir, &wanted, 30), (1, 100));
+        assert!(dir.join("kept").exists() && dir.join("new").exists());
+        assert!(!dir.join("gone").exists() && !root.join("overviews").join("gone").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_stems_used_longest_ago_go_first() {
         let root = std::env::temp_dir().join(format!("opendj-stems-trim-{}", std::process::id()));
@@ -676,12 +794,27 @@ mod tests {
         assert!(!a.waveform.chroma.steps.is_empty());
         assert_eq!(b.waveform.chroma, a.waveform.chroma);
         // Cut short inside the waveform: nothing; without the chroma (an
-        // entry from before it was kept): the rest, without one.
-        let chroma_bytes = 16 + 12 * a.waveform.chroma.steps.len();
+        // entry from before it was kept): the rest, without one. (Two empty
+        // lists of beats follow it.)
+        let chroma_bytes = 16 + 12 * a.waveform.chroma.steps.len() + 16;
         assert!(decode(&data[..data.len() - chroma_bytes - 3]).is_none());
         let old = decode(&data[..data.len() - chroma_bytes]).unwrap();
         assert_eq!(old.waveform.levels, a.waveform.levels);
         assert!(old.waveform.chroma.steps.is_empty());
+
+        // Beat This!'s beats and the grid mode; entries from before them
+        // load without.
+        a.beats = vec![0.5, 1.0, 1.5];
+        a.downbeats = vec![0.5];
+        a.grid_mode = crate::gridfit::GridMode::Flexible;
+        let data = encode(&a);
+        let b = decode(&data).unwrap();
+        assert_eq!((&b.beats, &b.downbeats), (&a.beats, &a.downbeats));
+        assert_eq!(b.grid_mode, a.grid_mode);
+        assert_eq!(b.waveform.chroma, a.waveform.chroma);
+        let before_beats = decode(&data[..data.len() - 16 - 4 * 4]).unwrap();
+        assert!(before_beats.beats.is_empty());
+        assert_eq!(before_beats.waveform.chroma, a.waveform.chroma);
 
         // Which detector found the key, and keys from before there was a choice.
         a.key_detector = Detector::Neural;

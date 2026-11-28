@@ -402,13 +402,12 @@ PioneerDDJFLX4.beatFxSelectShiftPressed = function(_channel, _control, value) {
     engine.setValue(PioneerDDJFLX4.beatFxSlot, "prev_effect", 0);
 };
 
-// Halves (-1) or doubles (+1) the effect's length, 1/16 to 4 beats; effects
-// without one (beats 0) stay as they are.
+// Halves (-1) or doubles (+1) the effect's length, within the effect's
+// own limits; effects without a length stay as they are.
 PioneerDDJFLX4.changeBeatFxBeats = function(direction) {
-    const beats = engine.getValue(PioneerDDJFLX4.beatFxSlot, "beats");
-    if (beats <= 0) { return; }
-    const next = Math.min(4, Math.max(1 / 16, direction > 0 ? beats * 2 : beats / 2));
-    engine.setValue(PioneerDDJFLX4.beatFxSlot, "beats", next);
+    const key = direction > 0 ? "beats_double" : "beats_halve";
+    engine.setValue(PioneerDDJFLX4.beatFxSlot, key, 1);
+    engine.setValue(PioneerDDJFLX4.beatFxSlot, key, 0);
 };
 
 PioneerDDJFLX4.pushBeatFxUnit = function(key) {
@@ -610,7 +609,7 @@ PioneerDDJFLX4.cycleTempoRange = function(_channel, _control, value, _status, gr
 // Jog wheels
 //
 
-PioneerDDJFLX4.jogTurn = function(channel, _control, value, _status, group) {
+PioneerDDJFLX4.jogTurn = function(channel, control, value, _status, group) {
     const deckNum = channel + 1;
     // wheel center at 64; <64 rew >64 fwd
     let newVal = value - 64;
@@ -630,7 +629,9 @@ PioneerDDJFLX4.jogTurn = function(channel, _control, value, _status, group) {
         }
     }
 
-    if (engine.isScratching(deckNum)) {
+    // openDJ: the rim (0x21) always bends, even while the deck is still
+    // easing back from a scratch, so twisting it never scratches.
+    if (control !== 0x21 && engine.isScratching(deckNum)) {
         engine.scratchTick(deckNum, newVal);
     } else {
         // openDJ: the rim (and the platter when not touched) bends the
@@ -643,7 +644,9 @@ PioneerDDJFLX4.jogTurn = function(channel, _control, value, _status, group) {
 
 PioneerDDJFLX4.jogSearch = function(_channel, _control, value, _status, group) {
     const newVal = (value - 64) * PioneerDDJFLX4.fastSeekScale;
-    engine.setValue(group, "jog", newVal);
+    // openDJ: SHIFT + turn moves the position (jog_search); plain jog bends
+    // the speed as in Mixxx.
+    engine.setValue(group, "jog_search", newVal);
 };
 
 PioneerDDJFLX4.jogTouch = function(channel, _control, value) {

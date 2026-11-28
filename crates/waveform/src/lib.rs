@@ -9,8 +9,15 @@
 //!
 //! This follows the approach of Mixxx's `allshader` renderers
 //! (`src/waveform/renderers/allshader`), on wgpu instead of OpenGL.
+//!
+//! Zoomed right in, a scrolling view given the track's audio (see
+//! [`WaveformView::set_samples`]) draws the real wave instead (see
+//! [`detail`]).
 
 use std::sync::Arc;
+
+pub mod detail;
+pub use detail::Samples;
 
 use bytemuck::{Pod, Zeroable};
 pub use wgpu;
@@ -32,14 +39,86 @@ pub enum Style {
     /// One shape in blue, lighter where the highs are loud (rekordbox's
     /// Blue).
     Blue,
-    /// Each stem in its own colour, the loudest at the back, from the
-    /// stem levels a [`GpuTrack`] has (see [`Extras`]); [`Style::Rgb`] for a
-    /// track without them.
+    /// Each stem in its own colour, laid out as [`StemLayout`] says, from
+    /// the stem levels a [`GpuTrack`] has (see [`Extras`]); [`Style::Rgb`]
+    /// for a track without them.
     Stems,
 }
 
 /// Stems a waveform draws at most, as the engine plays them.
 pub const MAX_STEMS: usize = 5;
+
+/// How [`Style::Stems`] lays the stems out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StemLayout {
+    /// One waveform, the track's own shape, cut into a layer per stem that
+    /// sit one on the other from the line out (see [`StemRole`]), so no
+    /// stem hides another.
+    #[default]
+    Stacked,
+    /// A scrolling view split into three thin waveforms, from the top:
+    /// drums, music (bass and the rest) and vocals, each stacked as above.
+    /// Overviews stay [`StemLayout::Stacked`].
+    Lanes,
+}
+
+/// What a stem is, which places it: its lane in [`StemLayout::Lanes`] and
+/// its layer in [`StemLayout::Stacked`], in this order from the line out
+/// (kick and bass at the core, hats on the outside, as the highs are in the
+/// 3-Band look).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StemRole {
+    /// The kick, or all the drums in one stem.
+    Kick,
+    Bass,
+    /// Anything else: chords, synths, guitars ("other", "instrumental").
+    Music,
+    Vocal,
+    /// Hi-hats, cymbals and the rest of the drums above the kick.
+    Hats,
+}
+
+impl StemRole {
+    /// The role a stem's name suggests (as NI STEM files, Demucs and the
+    /// engine name them); [`StemRole::Music`] for any other name.
+    pub fn from_name(name: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
+        if has(&["vocal", "voice", "vox", "acapella"]) {
+            Self::Vocal
+        } else if has(&["hat", "cymbal", "perc", "snare"]) {
+            Self::Hats
+        } else if has(&["kick", "drum", "beat"]) {
+            Self::Kick
+        } else if has(&["bass", "sub"]) {
+            Self::Bass
+        } else {
+            Self::Music
+        }
+    }
+
+    /// The lane it takes in [`StemLayout::Lanes`]: 0 drums, 1 music, 2 vocals.
+    pub fn lane(self) -> u32 {
+        match self {
+            Self::Kick | Self::Hats => 0,
+            Self::Bass | Self::Music => 1,
+            Self::Vocal => 2,
+        }
+    }
+}
+
+/// Each stem's lane and layer (from the line out) for the shader, from
+/// their roles: stems with the same role keep their order.
+fn stem_places(roles: &[StemRole]) -> [[f32; 4]; MAX_STEMS] {
+    let n = roles.len().min(MAX_STEMS);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&k| (roles[k], k));
+    let mut places = [[0.0; 4]; MAX_STEMS];
+    for (layer, &k) in order.iter().enumerate() {
+        places[k] = [roles[k].lane() as f32, layer as f32, 0.0, 0.0];
+    }
+    places
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -78,6 +157,60 @@ pub struct Frame {
     /// deck, which shows the leading deck's phrases, a thin strip along
     /// the top as well).
     pub phrases: Vec<(f64, PhraseKind)>,
+    /// Tempo labels, earliest first. The scrolling waveform draws a tab
+    /// with the BPM at each; one on or within [`TEMPO_MERGE_BEATS`] of a
+    /// phrase start drawn this frame joins that phrase's flag instead
+    /// ("DROP · 124"). The overview draws a tick along its top at each.
+    /// At most [`MAX_TEMPOS`].
+    pub tempos: Vec<TempoLabel>,
+}
+
+/// Tempo labels the shader draws at once: those in and around the view.
+pub const MAX_TEMPOS: usize = 16;
+
+/// How near a phrase start, in beats, a tempo label joins its flag.
+pub const TEMPO_MERGE_BEATS: f64 = 2.0;
+
+/// A tempo label: where it is and the BPM it shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoLabel {
+    pub seconds: f64,
+    pub bpm: f64,
+    /// Shown to a tenth of a BPM (while the grid is edited); else whole.
+    pub tenths: bool,
+}
+
+impl TempoLabel {
+    /// The value the shader draws: tenths of a BPM, with the top bit set
+    /// to show the tenth.
+    fn code(self) -> u32 {
+        let tenths = (self.bpm.clamp(0.0, 999.9) * 10.0).round() as u32;
+        if self.tenths {
+            tenths | 1 << 31
+        } else {
+            // Whole BPM, rounded as the whole number would be.
+            self.bpm.clamp(0.0, 999.0).round() as u32 * 10
+        }
+    }
+}
+
+/// Which phrase each tempo label joins (an index into `phrases`), if any:
+/// the nearest start within [`TEMPO_MERGE_BEATS`] of it.
+pub fn tempo_phrases(phrases: &[(f64, PhraseKind)], tempos: &[TempoLabel]) -> Vec<Option<usize>> {
+    tempos
+        .iter()
+        .map(|t| {
+            let reach = TEMPO_MERGE_BEATS * 60.0 / t.bpm.max(1.0) + 1e-3;
+            phrases
+                .iter()
+                .take(MAX_PHRASES)
+                .enumerate()
+                .map(|(i, (s, _))| (i, (s - t.seconds).abs()))
+                .filter(|&(_, d)| d <= reach)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        })
+        .collect()
 }
 
 /// Phrases the shader draws at once: far more than a track has, as a phrase
@@ -215,7 +348,10 @@ struct Params {
     grid_edit: u32,
     /// Scrolling: where the play line is, as a fraction of the width.
     needle: f32,
-    _pad: [u32; 2],
+    /// 1: the detail texture holds this frame's columns of real audio.
+    detail: f32,
+    /// 1 / the track's loudest sample, as the summary is scaled.
+    detail_scale: f32,
     /// Bit `n` set: lane `n` (from the bottom) is tinted.
     lane_tint: [u32; 4],
     mark_color: [f32; 4],
@@ -232,6 +368,19 @@ struct Params {
     /// how many stems (0: not drawn).
     stems: [f32; 4],
     stem_colors: [[f32; 4]; MAX_STEMS],
+    /// The tempo a phrase's flag shows after its name (see
+    /// [`TempoLabel::code`]), 0 for none.
+    phrase_tempo: [[u32; 4]; MAX_PHRASES / 4],
+    /// Each tempo label drawn on its own: where it is, in slices, and its
+    /// value; `tempo_count[0]` of them.
+    tempo_at: [[f32; 4]; MAX_TEMPOS / 4],
+    tempo_value: [[u32; 4]; MAX_TEMPOS / 4],
+    tempo_count: [u32; 4],
+    /// Each stem's lane (0 drums, 1 music, 2 vocals) and its layer from
+    /// the line out (see [`StemRole`]).
+    stem_place: [[f32; 4]; MAX_STEMS],
+    /// How the stems are laid out: 0 stacked, 1 in lanes.
+    stem_layout: [f32; 4],
 }
 
 /// The colours [`MarkKind::Level`]'s `color` 1 to 8 picks, as sRGB hex.
@@ -313,7 +462,8 @@ pub struct Lanes {
 /// far more than any overview needs.
 const MAX_LEVELS: usize = 16;
 
-/// Band colours; by default bass red, mids amber, highs blue.
+/// Band colours; by default dark to light: bass deep red, mids amber,
+/// highs ice blue, so brightness follows the sound (darker = heavier).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
     pub low: [f32; 4],
@@ -325,9 +475,10 @@ pub struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Self {
-            low: [1.0, 0.22, 0.16, 1.0],
-            mid: [1.0, 0.72, 0.12, 1.0],
-            high: [0.30, 0.62, 1.0, 1.0],
+            // Dark to light: deep red, amber, ice blue (RGB's first palette).
+            low: RGB_PALETTES[0][0],
+            mid: RGB_PALETTES[0][1],
+            high: RGB_PALETTES[0][2],
             background: [0.05, 0.05, 0.055, 1.0],
         }
     }
@@ -351,7 +502,27 @@ pub const BAND_PALETTES: [[[f32; 4]; 3]; 2] = [
     [rgb(0xB69CFF), rgb(0x22C7E0), rgb(0xF4FBFF)],
 ];
 
+/// The palettes RGB ([`Style::Rgb`]) comes in, as low, mid and high: deep
+/// red, amber and ice blue (the default, dark to light); and red, green and
+/// blue, the classic additive look.
+pub const RGB_PALETTES: [[[f32; 4]; 3]; 2] = [
+    [rgb(0xC8372D), rgb(0xF0A830), rgb(0xB4E4FF)],
+    [rgb(0xE8322A), rgb(0x3CD25A), rgb(0x3C82FF)],
+];
+
 impl Palette {
+    /// The default background with one of [`RGB_PALETTES`] (the first if
+    /// out of range).
+    pub fn rgb(index: usize) -> Self {
+        let [low, mid, high] = RGB_PALETTES[if index < RGB_PALETTES.len() { index } else { 0 }];
+        Self {
+            low,
+            mid,
+            high,
+            ..Self::default()
+        }
+    }
+
     /// The default background with one of [`BAND_PALETTES`] (the first if
     /// out of range).
     pub fn bands(index: usize) -> Self {
@@ -422,6 +593,16 @@ impl WaveformRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -479,6 +660,7 @@ pub struct GpuTrack {
     /// there are, finest-level slices per level, and how many stems.
     stems: [f32; 4],
     stem_colors: [[f32; 4]; MAX_STEMS],
+    stem_place: [[f32; 4]; MAX_STEMS],
 }
 
 /// What a [`GpuTrack`] can carry beside its waveform.
@@ -495,6 +677,9 @@ pub struct Extras<'a> {
     pub stem_rate: f64,
     /// Each stem's colour as `0xRRGGBB`; as many as there are stems.
     pub stem_colors: &'a [u32],
+    /// What each stem is, which places it (see [`StemRole`]); a stem
+    /// without one is [`StemRole::Music`].
+    pub stem_roles: &'a [StemRole],
 }
 
 impl GpuTrack {
@@ -591,6 +776,11 @@ impl GpuTrack {
             stem_colors: std::array::from_fn(|k| {
                 extras.stem_colors.get(k).map_or([0.0; 4], |&c| rgb(c))
             }),
+            stem_place: stem_places(
+                &(0..stem_count)
+                    .map(|k| extras.stem_roles.get(k).copied().unwrap_or(StemRole::Music))
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -691,6 +881,8 @@ fn write_bins(queue: &wgpu::Queue, texture: &wgpu::Texture, data: &[[u8; 4]]) {
 pub struct WaveformView {
     mode: Mode,
     style: Style,
+    /// How [`Style::Stems`] lays the stems out.
+    stem_layout: StemLayout,
     palette: Palette,
     /// Drawn from the bottom up (see [`WaveformView::set_half`]).
     half: bool,
@@ -711,6 +903,11 @@ pub struct WaveformView {
     grid_edit: bool,
     /// Lanes of marks over the waveform (see [`WaveformView::set_lanes`]).
     lanes: Option<Lanes>,
+    /// The real wave's columns (scrolling views), and the texture they go
+    /// to: [`DETAIL_ROW`] columns a row, a row for 1×1 on overviews.
+    detail: detail::Columns,
+    detail_texture: wgpu::Texture,
+    detail_upload: Vec<[f32; 2]>,
 }
 
 impl WaveformView {
@@ -722,9 +919,14 @@ impl WaveformView {
             mapped_at_creation: false,
         });
         let empty = bins_texture(device, 1);
+        let detail_texture = match mode {
+            Mode::Scrolling => detail_texture(device, DETAIL_ROW, DETAIL_ROWS),
+            Mode::Overview => detail_texture(device, 1, 1),
+        };
         Self {
             mode,
             style: Style::default(),
+            stem_layout: StemLayout::default(),
             palette: Palette::default(),
             half: false,
             needle: 0.5,
@@ -738,11 +940,27 @@ impl WaveformView {
             live: false,
             grid_edit: false,
             lanes: None,
+            detail: detail::Columns::default(),
+            detail_texture,
+            detail_upload: Vec::new(),
         }
+    }
+
+    /// The track's audio, for drawing the real wave when a scrolling view
+    /// is zoomed right in (a screen pixel a millisecond or less); none for
+    /// the summary alone. Set it with the track: the audio must be the one
+    /// the view's [`GpuTrack`] was made from.
+    pub fn set_samples(&mut self, samples: Option<Arc<dyn Samples>>) {
+        self.detail.set_samples(samples);
     }
 
     pub fn set_style(&mut self, style: Style) {
         self.style = style;
+    }
+
+    /// How [`Style::Stems`] lays the stems out; overviews always stack them.
+    pub fn set_stem_layout(&mut self, layout: StemLayout) {
+        self.stem_layout = layout;
     }
 
     /// The band colours, keeping the background.
@@ -836,7 +1054,13 @@ impl WaveformView {
                 if matches!(&self.track, Some((cur, _)) if Arc::ptr_eq(cur, t)) {
                     return;
                 }
-                let bind = bind_group(device, renderer, &self.params, &t.texture);
+                let bind = bind_group(
+                    device,
+                    renderer,
+                    &self.params,
+                    &t.texture,
+                    &self.detail_texture,
+                );
                 self.track = Some((t.clone(), bind));
             }
         }
@@ -910,7 +1134,8 @@ impl WaveformView {
             } else {
                 0.5
             },
-            _pad: [0; 2],
+            detail: 0.0,
+            detail_scale: 1.0,
             lane_tint: [0; 4],
             mark_color: [0.0; 4],
             lit_color: [0.0; 4],
@@ -919,10 +1144,19 @@ impl WaveformView {
             vocal: [0.0; 4],
             stems: [0.0; 4],
             stem_colors: [[0.0; 4]; MAX_STEMS],
+            phrase_tempo: [[0; 4]; MAX_PHRASES / 4],
+            tempo_at: [[0.0; 4]; MAX_TEMPOS / 4],
+            tempo_value: [[0; 4]; MAX_TEMPOS / 4],
+            tempo_count: [0; 4],
+            stem_place: [[0.0; 4]; MAX_STEMS],
+            stem_layout: [0.0; 4],
         };
         if let (Some(t), Style::Stems) = (track, self.style) {
             params.stems = t.stems;
             params.stem_colors = t.stem_colors;
+            params.stem_place = t.stem_place;
+            let lanes = self.stem_layout == StemLayout::Lanes && self.mode == Mode::Scrolling;
+            params.stem_layout[0] = lanes as u32 as f32;
         }
         if let (Some(t), true) = (track, self.show_vocals) {
             if t.vocal[1] > 0.0 && t.vocal[2] > 0.0 {
@@ -980,6 +1214,29 @@ impl WaveformView {
                 params.phrase_kind[i / 4][i % 4] = *kind as u32;
                 params.phrase_count = i as u32 + 1;
             }
+            // The overview marks each label with a tick along its top.
+            if self.mode == Mode::Overview {
+                for (n, t) in f.tempos.iter().take(MAX_TEMPOS).enumerate() {
+                    params.tempo_at[n / 4][n % 4] = to_bin(t.seconds);
+                    params.tempo_value[n / 4][n % 4] = t.code();
+                    params.tempo_count[0] = n as u32 + 1;
+                }
+            } else {
+                let joins = tempo_phrases(&f.phrases, &f.tempos);
+                let mut n = 0;
+                for (t, join) in f.tempos.iter().zip(joins) {
+                    match join {
+                        Some(i) => params.phrase_tempo[i / 4][i % 4] = t.code(),
+                        None if n < MAX_TEMPOS => {
+                            params.tempo_at[n / 4][n % 4] = to_bin(t.seconds);
+                            params.tempo_value[n / 4][n % 4] = t.code();
+                            n += 1;
+                        }
+                        None => {}
+                    }
+                }
+                params.tempo_count[0] = n as u32;
+            }
             if let Some(l) = &self.lanes {
                 for (i, m) in l.marks.iter().take(MAX_MARKS).enumerate() {
                     params.marks[i] =
@@ -990,6 +1247,7 @@ impl WaveformView {
             if f.duration > 60.0 && self.style != Style::Mono {
                 params.minute_bins = to_bin(60.0);
             }
+            self.detail_columns(queue, &mut params, bins_per_second);
         }
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
 
@@ -997,7 +1255,13 @@ impl WaveformView {
         let bind = match &self.track {
             Some((_, bind)) => bind,
             None => {
-                fallback = bind_group(device, renderer, &self.params, &self.empty);
+                fallback = bind_group(
+                    device,
+                    renderer,
+                    &self.params,
+                    &self.empty,
+                    &self.detail_texture,
+                );
                 &fallback
             }
         };
@@ -1030,6 +1294,86 @@ impl WaveformView {
         }
         queue.submit(Some(encoder.finish()));
     }
+}
+
+impl WaveformView {
+    /// Zoomed right in on a scrolling view with the track's audio: works
+    /// out the real wave's columns on screen and hands them to the shader.
+    fn detail_columns(&mut self, queue: &wgpu::Queue, params: &mut Params, bins_per_second: f64) {
+        let stems = self.style == Style::Stems && params.stems[3] > 0.5;
+        let top = self
+            .detail
+            .samples()
+            .and_then(|s| s.top())
+            .filter(|t| *t > 0.0);
+        let w = params.bins_per_pixel;
+        let Some(top) = top.filter(|_| {
+            self.mode == Mode::Scrolling
+                && self.style != Style::Bands
+                && !stems
+                && w < DETAIL_FROM_BINS_PER_PIXEL
+                && w > 0.0
+        }) else {
+            return;
+        };
+        // The column at the left edge, as the shader's view_bin() snaps
+        // the picture (WGSL's round() rounds halves to even).
+        let cx = params.size[0] * params.needle;
+        let first = (params.play_bin / w - cx).round_ties_even() as i64;
+        let count = (self.size.0 as usize).min((DETAIL_ROW * DETAIL_ROWS) as usize);
+        let cols = self.detail.update(first, count, w, bins_per_second);
+        let rows = count.div_ceil(DETAIL_ROW as usize);
+        self.detail_upload.clear();
+        self.detail_upload.extend_from_slice(cols);
+        self.detail_upload
+            .resize(rows * DETAIL_ROW as usize, detail::UNKNOWN);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.detail_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&self.detail_upload),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(DETAIL_ROW * 8),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: DETAIL_ROW,
+                height: rows as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        params.detail = 1.0;
+        params.detail_scale = 1.0 / top;
+    }
+}
+
+/// Columns a row of the detail texture; matches `DETAIL_ROW` in the shader.
+const DETAIL_ROW: u32 = 2048;
+/// Rows of it: enough for the widest view (see [`WaveformView::resize`]).
+const DETAIL_ROWS: u32 = 4;
+/// The real wave is drawn below this many slices a pixel, fading in to
+/// 1 (`close_zoom` in the shader).
+const DETAIL_FROM_BINS_PER_PIXEL: f32 = 4.0;
+
+fn detail_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("waveform detail"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rg32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
 }
 
 fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
@@ -1077,8 +1421,10 @@ fn bind_group(
     renderer: &WaveformRenderer,
     params: &wgpu::Buffer,
     bins: &wgpu::Texture,
+    detail: &wgpu::Texture,
 ) -> wgpu::BindGroup {
     let view = bins.create_view(&wgpu::TextureViewDescriptor::default());
+    let detail = detail.create_view(&wgpu::TextureViewDescriptor::default());
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("waveform"),
         layout: &renderer.layout,
@@ -1098,6 +1444,10 @@ fn bind_group(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(&renderer.digits.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&detail),
             },
         ],
     })
@@ -1323,6 +1673,34 @@ fn text_field() -> TextField {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stem_roles_from_names() {
+        let roles: Vec<_> = [
+            "Kick", "HiHat", "Bass", "Instru", "Vocal", "Drums", "other", "Vocals",
+        ]
+        .iter()
+        .map(|n| StemRole::from_name(n))
+        .collect();
+        use StemRole::*;
+        assert_eq!(roles, [Kick, Hats, Bass, Music, Vocal, Kick, Music, Vocal]);
+    }
+
+    #[test]
+    fn stems_stack_kick_first_hats_last_and_share_lanes() {
+        // The engine's order: kick, bass, other, vocals, then hats split
+        // from the drums.
+        use StemRole::*;
+        let p = stem_places(&[Kick, Bass, Music, Vocal, Hats]);
+        let layer: Vec<f32> = p.iter().map(|x| x[1]).collect();
+        let lane: Vec<f32> = p.iter().map(|x| x[0]).collect();
+        assert_eq!(layer, [0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(lane, [0.0, 1.0, 1.0, 2.0, 0.0]);
+        // NI's order (drums, bass, other, vocals) and two of a role.
+        let p = stem_places(&[Vocal, Music, Kick, Music]);
+        let layer: Vec<f32> = p.iter().take(4).map(|x| x[1]).collect();
+        assert_eq!(layer, [3.0, 1.0, 0.0, 2.0]);
+    }
     use super::*;
 
     #[test]

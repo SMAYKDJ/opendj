@@ -27,11 +27,11 @@ use opendj_engine::{
 use opendj_library::Library;
 use opendj_plugins::source::{QueryKind, SourceQuery};
 use opendj_waveform::{
-    steady_grid, wgpu, Extras, Frame, GpuTrack, GridSection, Mode, Palette, PhraseKind,
-    WaveformRenderer, WaveformView, GRID_SECTIONS,
+    steady_grid, wgpu, Extras, Frame, GpuTrack, GridSection, Mode, Palette, PhraseKind, TempoLabel,
+    WaveformRenderer, WaveformView, GRID_SECTIONS, MAX_TEMPOS,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
-use smooth::SmoothClock;
+use smooth::{FrameStats, FrameTimer, SmoothClock};
 
 slint::include_modules!();
 
@@ -53,18 +53,23 @@ mod controller_editor;
 mod cover_scan;
 mod coverart;
 mod diagnostics;
+mod dupe_scan;
 mod file_drop;
 mod files;
+mod graphics;
 mod groove_box;
 mod inbox;
 mod instrument_art;
 mod instrument_knobs;
 mod instrument_midi;
+mod instrument_seq;
 mod instruments;
+mod karaoke_look;
 mod keep_going;
 mod lastfm;
 mod layouts;
 mod list_picker;
+mod list_text;
 mod live_trace;
 mod lookup;
 mod lrclib;
@@ -85,6 +90,7 @@ mod now_playing;
 mod now_playing_view;
 mod osc;
 mod osc_events;
+mod plugin_display;
 mod prefs;
 mod prep_click;
 mod presets;
@@ -96,12 +102,17 @@ mod live_b2b;
 mod license;
 mod security;
 mod remote;
+mod room_eq;
 mod sampler;
 mod scrobble;
+mod session;
 mod settings;
 mod shortcuts;
+mod shutdown;
+mod single_instance;
 mod sleep_timer;
 mod smooth;
+mod sound_scan;
 mod soundcloud;
 mod sources;
 mod spotify;
@@ -114,17 +125,24 @@ mod tidal;
 mod tour;
 mod track_end;
 mod transport;
+mod tree_navigation;
 mod tutorials;
 mod ui_font;
+mod ui_load;
+mod ui_scale;
 mod update;
 mod vocal_pass;
+mod wall_clock;
 mod wave_look;
+mod wave_samples;
 mod waveform_height;
 mod waveform_zoom;
 mod waves;
 
 /// Fills the master and headphone output menus and switches devices when
-/// one is picked. The menus list the devices present when they open.
+/// one is picked. The menus list the devices as last scanned (see
+/// [`opendj_engine::scan_devices`]): opening one loads no driver, and
+/// looks at the system's own devices again in the background.
 /// The settings page's output table: shows the routes in use and applies
 /// changes to them.
 fn install_audio_settings(app: &AppWindow, engine: Rc<AudioEngine>) {
@@ -298,6 +316,11 @@ fn install_audio_settings(app: &AppWindow, engine: Rc<AudioEngine>) {
             *devices.borrow_mut() = output_devices();
             *default_device.borrow_mut() = default_output_device();
             show();
+            // A device menu opening (or Settings › Audio): the system's
+            // devices are looked at again in the background, so one plugged
+            // in since start-up shows up moments later. No ASIO driver is
+            // loaded, and a scan moments ago isn't repeated.
+            opendj_engine::rescan_devices(opendj_engine::DeviceScan::System);
         }
     });
     let change = {
@@ -340,6 +363,7 @@ fn install_audio_settings(app: &AppWindow, engine: Rc<AudioEngine>) {
     g.on_set_device({
         let change = change.clone();
         let devices = devices.clone();
+        let default_device = default_device.clone();
         move |row, device| {
             let name = match device {
                 0 => String::new(),
@@ -349,12 +373,22 @@ fn install_audio_settings(app: &AppWindow, engine: Rc<AudioEngine>) {
                     .map(|d| d.name.clone())
                     .unwrap_or_default(),
             };
-            change(&|s| {
-                if let Some(r) = s.routes.get_mut(row as usize) {
-                    r.device = name.clone();
-                    r.pair = 0;
-                }
-            })
+            // Channels of the device called `name` ("" the default), 2 when
+            // unknown.
+            let channels = |name: &str| {
+                let default = default_device.borrow();
+                let name = if name.is_empty() {
+                    default.as_deref().unwrap_or_default()
+                } else {
+                    name
+                };
+                devices
+                    .borrow()
+                    .iter()
+                    .find(|d| d.name == name)
+                    .map_or(2, |d| d.channels)
+            };
+            change(&|s| move_to_device(s, row as usize, &name, channels(&name)))
         }
     });
     g.on_set_pair({
@@ -453,6 +487,76 @@ fn install_audio_settings(app: &AppWindow, engine: Rc<AudioEngine>) {
             s.routes.push(Route { role, device, pair });
         })
     });
+}
+
+/// Moves output `row` of `s` to `device` (with `channels` channels), on the
+/// first pair no other output plays there: a controller's headphones row
+/// lands on its second pair, not on top of the master. Moving the master
+/// to a device with a pair to spare takes the headphones along when they
+/// were on the master's old device, as a DJ plugging in a controller
+/// expects its headphone socket to play the cue.
+fn move_to_device(s: &mut AudioSetup, row: usize, device: &str, channels: u16) {
+    let Some(old) = s.routes.get(row).map(|r| (r.role, r.device.clone())) else {
+        return;
+    };
+    let pairs = (channels / 2).max(1);
+    let free_pair = |s: &AudioSetup, skip: &[usize]| {
+        (0..pairs).find(|&p| {
+            !s.routes.iter().enumerate().any(|(i, r)| {
+                !skip.contains(&i) && s.in_use(r) && r.device == device && r.pair == p
+            })
+        })
+    };
+    let pair = free_pair(s, &[row]).unwrap_or(0);
+    s.routes[row].device = device.to_string();
+    s.routes[row].pair = pair;
+    if old.0 != Role::Master || old.1 == device {
+        return;
+    }
+    let follows: Vec<usize> = s
+        .routes
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.role == Role::Headphones && r.device == old.1)
+        .map(|(i, _)| i)
+        .collect();
+    for i in follows {
+        if let Some(p) = free_pair(s, &[i]) {
+            s.routes[i].device = device.to_string();
+            s.routes[i].pair = p;
+        }
+    }
+}
+
+/// `cover` cropped to a square in the middle and scaled to `size` pixels,
+/// as a JPEG for a controller's screen; empty if it can't be made.
+fn cover_jpeg(cover: &opendj_engine::cover::Cover, size: u32) -> Vec<u8> {
+    use image::{imageops, ImageBuffer, Rgba};
+    let Some(img) =
+        ImageBuffer::<Rgba<u8>, _>::from_raw(cover.width, cover.height, cover.rgba.clone())
+    else {
+        return Vec::new();
+    };
+    let side = cover.width.min(cover.height);
+    if side == 0 || size == 0 {
+        return Vec::new();
+    }
+    let square = imageops::crop_imm(
+        &img,
+        (cover.width - side) / 2,
+        (cover.height - side) / 2,
+        side,
+        side,
+    )
+    .to_image();
+    let scaled = imageops::resize(&square, size, size, imageops::FilterType::Triangle);
+    let rgb = image::DynamicImage::ImageRgba8(scaled).to_rgb8();
+    let mut out = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 75);
+    match rgb.write_with_encoder(encoder) {
+        Ok(()) => out,
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The rows Settings › Audio shows with an external mixer, in order.
@@ -560,52 +664,70 @@ fn fit_to_screen(app: &AppWindow) {
     });
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let arg1 = std::env::args().nth(1);
     if arg1.as_deref() == Some("--list-controls") {
         list_controls();
-        return Ok(());
+        return;
+    }
+    // Before the log opens: a second openDJ would start a new log over the
+    // running one's, then fight it for the audio interface.
+    if !single_instance::check() {
+        return;
     }
     if arg1.as_deref() == Some("--machine-id") {
         println!("{}", license::get_machine_id());
-        return Ok(());
+        return;
     }
     if arg1.as_deref() == Some("--keygen") {
-        let (pkcs8, pubkey) = license::generate_keypair().map_err(|e| e.to_string())?;
-        use base64::Engine;
-        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pubkey);
-        let priv_b64 = base64::engine::general_purpose::STANDARD.encode(&pkcs8);
-        println!("=== NOVO PAR DE CHAVES ED25519 GERADO ===");
-        println!("Public Key (32 bytes): {pub_b64}");
-        println!("Private Key (PKCS#8): {priv_b64}");
-        return Ok(());
+        if let Ok((pkcs8, pubkey)) = license::generate_keypair() {
+            use base64::Engine;
+            let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pubkey);
+            let priv_b64 = base64::engine::general_purpose::STANDARD.encode(&pkcs8);
+            println!("=== NOVO PAR DE CHAVES ED25519 GERADO ===");
+            println!("Public Key (32 bytes): {pub_b64}");
+            println!("Private Key (PKCS#8): {priv_b64}");
+        }
+        return;
     }
     if arg1.as_deref() == Some("--create-license") {
         let email = std::env::args().nth(2).unwrap_or_else(|| "dj@smayk.com".into());
         let machine_id = std::env::args().nth(3).unwrap_or_else(license::get_machine_id);
         let tier = std::env::args().nth(4).unwrap_or_else(|| "TIKTOK_PRO".into());
-        let (pkcs8, pubkey) = license::generate_keypair().map_err(|e| e.to_string())?;
-        let payload = license::LicensePayload {
-            email: email.clone(),
-            machine_id: machine_id.clone(),
-            tier: tier.clone(),
-            issued_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-            expires_at: None,
-        };
-        let key = license::create_signed_license(&payload, &pkcs8).map_err(|e| e.to_string())?;
-        use base64::Engine;
-        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pubkey);
-        println!("=== LICENÇA GERADA COM SUCESSO ===");
-        println!("Email: {email}");
-        println!("Machine ID: {machine_id}");
-        println!("Plano: {tier}");
-        println!("Chave de Licença:\n{key}");
-        println!("\nChave Pública correspondente (Base64):\n{pub_b64}");
-        return Ok(());
+        if let Ok((pkcs8, pubkey)) = license::generate_keypair() {
+            let payload = license::LicensePayload {
+                email: email.clone(),
+                machine_id: machine_id.clone(),
+                tier: tier.clone(),
+                issued_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                expires_at: None,
+            };
+            if let Ok(key) = license::create_signed_license(&payload, &pkcs8) {
+                use base64::Engine;
+                let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pubkey);
+                println!("=== LICENÇA GERADA COM SUCESSO ===");
+                println!("Email: {email}");
+                println!("Machine ID: {machine_id}");
+                println!("Plano: {tier}");
+                println!("Chave de Licença:\n{key}");
+                println!("\nChave Pública correspondente (Base64):\n{pub_b64}");
+            }
+        }
+        return;
     }
     diagnostics::install();
+    // Picked before the window opens, from what happened last time.
+    let graphics = Rc::new(graphics::choose(settings::config_dir().as_deref()));
+    if let Err(e) = run(graphics.clone()) {
+        diagnostics::startup_failed(&e, graphics.pending());
+        std::process::exit(1);
+    }
+}
+
+fn run(graphics: Rc<graphics::Choice>) -> Result<(), Box<dyn std::error::Error>> {
     // Before any thread starts: Beat This! takes a few cores, not all.
     opendj_engine::background::configure();
     // Windows wakes sleeping threads only every 15.6 ms unless asked for
@@ -616,6 +738,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         windows_sys::Win32::Media::timeBeginPeriod(1);
     }
+    // The audio devices, found while the window gets ready and before any
+    // output opens: listing ASIO devices loads each installed driver in
+    // turn, which takes a while and can cut off a Windows Audio stream
+    // already playing through the same interface. Settings and the menus
+    // read what this finds.
+    let device_scan = std::thread::Builder::new()
+        .name("opendj-device-scan".into())
+        .spawn(|| opendj_engine::scan_devices(opendj_engine::DeviceScan::All));
     // A restore picked in Settings goes in before anything reads the
     // settings or opens the library.
     let restored =
@@ -623,8 +753,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before anything is saved: no settings yet means a first start, which
     // gets the guided tour.
     let first_run = settings::load().as_object().is_none_or(|m| m.is_empty());
-    let backend =
-        slint::BackendSelector::new().require_wgpu_30(slint::wgpu_30::WGPUConfiguration::default());
+    let backend = slint::BackendSelector::new().require_wgpu_30(graphics.backend.configuration());
     // On macOS the app draws under a hidden title bar: only
     // the traffic lights stay, over the top bar.
     #[cfg(target_os = "macos")]
@@ -643,6 +772,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui_family = ui_font::install();
 
     let registry = ControlRegistry::new();
+    // Not found yet (or the thread didn't start), the device lists are
+    // scanned the first time they are read instead.
+    if let Ok(scan) = device_scan {
+        let _ = scan.join();
+    }
     let engine = Rc::new(AudioEngine::start(
         registry.clone(),
         &settings::audio_setup(),
@@ -692,9 +826,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         instrument_art::install(&app, move || std::mem::take(&mut *dropped.borrow_mut()));
         // Dark, Light or Match system, as last picked.
         appearance::install(&app);
+        list_text::install(&app);
         let theme_app = app.as_weak();
         app.window().on_winit_window_event(move |window, event| {
             file_drop.window_event(window, event);
+            // Moved to a screen with another scale: the interface scale
+            // goes back on top of it.
+            if let slint::winit_030::winit::event::WindowEvent::ScaleFactorChanged { .. } = event {
+                if let Some(app) = theme_app.upgrade() {
+                    ui_scale::screen_changed(&app);
+                }
+            }
             if let slint::winit_030::winit::event::WindowEvent::ThemeChanged(theme) = event {
                 if let Some(app) = theme_app.upgrade() {
                     appearance::system_changed(&app, *theme);
@@ -768,9 +910,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // saved again as it changes.
     groove_box::install(&app);
     instruments::install(&app);
+    session::install(&app, engine.clone(), registry.clone());
     mixer_picker::install(&app, engine.clone());
     presets::install(&app, engine.clone(), registry.clone());
     instrument_knobs::install(&app, engine.clone());
+    let _knob_page = instrument_knobs::follow_page(&app, &registry);
+    let _preset_keys = presets::follow_controllers(&app);
+    instrument_seq::install(&app, registry.clone());
     let groove_keeper = RefCell::new(groove_box::Keeper::new(&registry));
     // The Mixer's channels as they were left, saved again as they change.
     let mixer_keeper = RefCell::new(mixer_keeper::Keeper::new(&registry));
@@ -911,6 +1057,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     let sources = sources::Sources::install(&app, library_path.clone());
+    browser.borrow_mut().play_sites = sources.borrow().playing_sites();
+    // An add-on that browses TIDAL's catalog signs in for the TIDAL source,
+    // so one sign-in lists, searches and plays.
+    if let Some(catalog) = sources.borrow().catalog("tidal") {
+        browser.borrow_mut().use_catalog("tidal", catalog);
+    }
     {
         // Spotify's "Open in Browser" and "Add to Downloads", the latter
         // when an add-on source searches Spotify links.
@@ -1065,7 +1217,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for key in settings::controllers_scaled() {
         opendj_controllers::pickup::set_scale(&key, true);
     }
+    for (key, feel) in settings::controller_jog_feel() {
+        opendj_controllers::jog_feel::set_feel(&key, feel);
+    }
     opendj_controllers::routing::load_deck_choices(settings::controller_decks());
+    // Controllers with screens (the DDJ-FLX10's jogs) draw the decks' waveforms.
+    {
+        let loaded = engine.loaded_tracks();
+        opendj_controllers::waves::set_source(Some(std::sync::Arc::new(
+            move |deck, per_second| {
+                let track = loaded
+                    .read()
+                    .ok()
+                    .and_then(|l| l.get(deck).cloned().flatten());
+                track.map_or_else(Vec::new, |t| {
+                    let w = &t.waveform;
+                    w.levels.first().map_or_else(Vec::new, |finest| {
+                        opendj_controllers::waves::resample(finest, w.bins_per_second, per_second)
+                    })
+                })
+            },
+        )));
+        // And their cover art, as a small JPEG.
+        let loaded = engine.loaded_tracks();
+        opendj_controllers::waves::set_cover_source(Some(std::sync::Arc::new(
+            move |deck, size| {
+                let track = loaded
+                    .read()
+                    .ok()
+                    .and_then(|l| l.get(deck).cloned().flatten());
+                track
+                    .and_then(|t| t.cover.clone())
+                    .map_or_else(Vec::new, |c| cover_jpeg(&c, size))
+            },
+        )));
+    }
     let controllers = match opendj_controllers::default_mappings_dir() {
         Some(dir) => Some(Rc::new(opendj_controllers::Controllers::start(
             registry.clone(),
@@ -1078,6 +1264,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    // Bug reports name the controllers plugged in, and the mapping each runs.
+    if let Some(c) = &controllers {
+        let c = Rc::downgrade(c);
+        diagnostics::set_controllers(move || {
+            let Some(c) = c.upgrade() else {
+                return Vec::new();
+            };
+            c.ports()
+                .into_iter()
+                .filter(|p| !opendj_controllers::is_system_port(&p.name))
+                .map(|p| match p.running {
+                    Some(m) if m != p.name => format!("{} ({m})", p.name),
+                    _ => p.name,
+                })
+                .collect()
+        });
+    }
     // MIDI keyboards (devices with no mapping) play the Instrument input.
     if let Some(c) = &controllers {
         let notes = engine.note_input();
@@ -1086,6 +1289,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 n.send(data);
             }
         })));
+    }
+    // The instrument deck's pitch bend and mod wheel strips.
+    {
+        let ui = app.global::<InstrumentsUi>();
+        let notes = engine.note_input();
+        ui.on_bend(move |v| {
+            if let Ok(mut n) = notes.lock() {
+                n.send(instruments::bend_message(v));
+            }
+        });
+        let notes = engine.note_input();
+        ui.on_modwheel(move |v| {
+            if let Ok(mut n) = notes.lock() {
+                n.send(instruments::modwheel_message(v));
+            }
+        });
     }
 
     // Start with two sample tracks loaded so the screen is not empty, but
@@ -1109,6 +1328,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let controller_editor = controller_editor::Editor::install(&app, controllers.clone());
     let map_mode = map_mode::Mapper::install(&app, controllers.clone());
     prefs::apply_saved(&registry);
+    room_eq::apply_saved(&registry);
+    let _room_eq = room_eq::install(&app, registry.clone(), &engine);
     let _levels = prefs::remember_levels(registry.clone());
     if let Some(note) = restored {
         engine.alert(note);
@@ -1124,6 +1345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (weak, view) = (app.as_weak(), engine.instrument_view());
         let mut last_held = u128::MAX;
         let mut quiet = false;
+        let mut last_choice = (false, false);
         instrument_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(40),
@@ -1138,13 +1360,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let keys: Vec<bool> = (36..84).map(|n| held >> n & 1 == 1).collect();
                     ui.set_held(slint::ModelRc::from(keys.as_slice()));
                 }
+                let (freq, post) = (ui.get_scope_freq(), ui.get_scope_post());
+                view.set_post(post);
                 let scope = view.scope();
                 let silent = scope.iter().all(|&(lo, hi)| lo == 0.0 && hi == 0.0);
-                if silent && quiet {
+                if silent && quiet && (freq, post) == last_choice {
                     return;
                 }
                 quiet = silent;
-                ui.set_scope(scope_path(&scope).into());
+                last_choice = (freq, post);
+                let path = if freq {
+                    spectrum_path(&view.spectrum(64))
+                } else {
+                    scope_path(&scope)
+                };
+                ui.set_scope(path.into());
             },
         );
     }
@@ -1152,6 +1382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let (weak, engine) = (app.as_weak(), engine.clone());
         let mut param_names: Vec<String> = Vec::new();
+        let mut page_names: Vec<String> = Vec::new();
         let mut knobs = Default::default();
         players_timer.start(
             slint::TimerMode::Repeated,
@@ -1180,10 +1411,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_param_names(slint::ModelRc::from(model.as_slice()));
                     param_names = names;
                 }
+                let pages = engine.instrument_pages();
+                if pages != page_names {
+                    let model: Vec<slint::SharedString> =
+                        pages.iter().map(|n| n.as_str().into()).collect();
+                    ui.set_page_names(slint::ModelRc::from(model.as_slice()));
+                    page_names = pages;
+                }
                 instrument_knobs::show(&app, &engine, &mut knobs);
             },
         );
     }
+    // The instrument's own display on its deck (a Pd patch's Lua displays).
+    let _display_timer = plugin_display::install(&app, engine.clone());
     // Automatic backups: at start, then checked every hour.
     backup::run_if_due();
     let backup_timer = slint::Timer::default();
@@ -1334,6 +1574,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it. Waveforms are drawn just before Slint renders each frame, so their
     // play position is as close as possible to when the frame is shown.
     let gpu: Rc<RefCell<Option<Gpu>>> = Rc::new(RefCell::new(None));
+    let graphics_choice = graphics.clone();
     {
         let gpu = gpu.clone();
         let app_weak = app.as_weak();
@@ -1355,6 +1596,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     slint::RenderingState::RenderingSetup,
                     slint::GraphicsAPI::WGPU30 { device, queue, .. },
                 ) => {
+                    let info = device.adapter_info();
+                    eprintln!(
+                        "graphics: {} ({:?}, {:?}), driver {} {}",
+                        info.name, info.backend, info.device_type, info.driver, info.driver_info
+                    );
+                    diagnostics::set_graphics(format!("{} ({:?})", info.name, info.backend));
                     let renderer = WaveformRenderer::new(device, queue);
                     let make = |mode| WaveformView::new(device, mode, 1, 1);
                     *gpu.borrow_mut() = Some(Gpu {
@@ -1364,8 +1611,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         scrolling: std::array::from_fn(|_| make(Mode::Scrolling)),
                         overview: std::array::from_fn(|_| make(Mode::Overview)),
                         tracks: Default::default(),
+                        samples: Default::default(),
                         phrases: Default::default(),
+                        tempos: Default::default(),
                         clocks: Default::default(),
+                        frame_timer: Default::default(),
+                        frame_stats: Default::default(),
                         live: live.take(),
                         instrument: instrument.clone(),
                         steps: steps.take(),
@@ -1381,14 +1632,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
                 (slint::RenderingState::BeforeRendering, _) => {
+                    ui_load::render_start();
                     let mut gpu = gpu.borrow_mut();
                     let (Some(app), Some(gpu)) = (app_weak.upgrade(), gpu.as_mut()) else {
                         return;
                     };
                     let tracks = loaded.read().unwrap().clone();
+                    let start = Instant::now();
                     gpu.render(&app, &decks, &tracks, &visual);
+                    let Gpu {
+                        frame_stats,
+                        frame_timer,
+                        clocks,
+                        moving,
+                        ..
+                    } = gpu;
+                    let scale = app.window().scale_factor();
+                    frame_stats.frame(
+                        start,
+                        start.elapsed(),
+                        *moving,
+                        scale,
+                        frame_timer,
+                        clocks,
+                        ui_load::take_report,
+                    );
                 }
                 (slint::RenderingState::AfterRendering, _) => {
+                    ui_load::render_end();
+                    // The first frame is on screen: these graphics work here.
+                    graphics.drew();
                     // While a deck moves, draw again as soon as the display
                     // can show it, rather than on the UI timer, which beats
                     // against the display's refresh and makes motion uneven.
@@ -1410,13 +1683,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_ref()
                 .and_then(|g| g.as_ref()?.phrases.get(d as usize)?.as_ref());
             cached
-                .and_then(|(t, p)| phrase_tip(p, t.duration, t.bpm, seconds as f64))
+                .and_then(|(t, p)| phrase_tip(p, t, seconds as f64))
                 .unwrap_or_default()
         });
     }
 
     // A newer release: checked once per start, offered while nothing plays.
     update::install_model_fetch();
+    // High-quality stems' GPU kernels, compiled once the app has settled,
+    // so the first track prepared starts playing them seconds sooner.
+    let _ = std::thread::Builder::new()
+        .name("stems-warm-up".into())
+        .spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            opendj_engine::stems::warm_up_when_idle();
+        });
     let update_check = update::check();
     let update: Rc<RefCell<Option<update::Release>>> = Default::default();
     let installing: Rc<RefCell<Option<std::sync::mpsc::Receiver<update::Progress>>>> =
@@ -1460,6 +1741,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let start = Instant::now();
+    let twenty_four_hour = wall_clock::system_uses_24_hour();
     let timer = slint::Timer::default();
     let covers: RefCell<[CoverImage; NUM_DECKS]> = Default::default();
     let qualities: RefCell<quality::Qualities> = Default::default();
@@ -1507,8 +1789,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let positions = engine.visual_positions();
     // Recordings finished so far, to add the next one's files to Mixed Sets.
     let recordings_seen = Cell::new(recorder.finished().0);
+    // A controller's pad mode buttons ask every deck's pads through
+    // `pad_tab` and `pad_panel`. The skin has more than one set of pads
+    // (one per layout), so none of them takes the request back: it is put
+    // back to -1 here, a few frames later, once each has seen it.
+    let pad_requests: Vec<(ControlHandle, Cell<u8>)> = (0..NUM_DECKS)
+        .flat_map(|d| {
+            let g = opendj_engine::deck_group(d);
+            ["pad_tab", "pad_panel"]
+                .into_iter()
+                .filter_map(|k| registry.get(&g, k))
+                .collect::<Vec<_>>()
+        })
+        .map(|h| (h, Cell::new(0)))
+        .collect();
     let finished_recorder = recorder.clone();
     let quitting_engine = engine.clone();
+    let quitting_controllers = controllers.clone();
     {
         let app_weak = app.as_weak();
         timer.start(
@@ -1518,8 +1815,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some(app) = app_weak.upgrade() else {
                     return;
                 };
+                ui_load::tick_start();
                 // The skin reads controls through `tick`; moving it makes
                 // every one of them look again, so only when one changed.
+                for (h, frames) in &pad_requests {
+                    if h.get() < 0.0 {
+                        frames.set(0);
+                    } else if frames.get() >= 3 {
+                        h.set(-1.0);
+                        frames.set(0);
+                    } else {
+                        frames.set(frames.get() + 1);
+                    }
+                }
                 let version = controls_version();
                 let controls_changed = shown_controls.replace(version) != version;
                 if controls_changed {
@@ -1627,7 +1935,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         browser.borrow_mut().show_in_prep();
                     }
                 }
+                ui_load::lap("start of tick");
                 browser.borrow_mut().poll_controllers(&app);
+                ui_load::lap("browser.poll_controllers");
                 // A recording that just stopped shows in Mixed Sets.
                 let (finished, files) = finished_recorder.finished();
                 if finished != recordings_seen.get() {
@@ -1635,10 +1945,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     browser.borrow_mut().add_recordings(&files);
                 }
                 browser.borrow_mut().poll_mix_export(&app);
+                ui_load::lap("browser.poll_mix_export");
+                browser.borrow_mut().poll_mixed_set(&app);
+                ui_load::lap("browser.poll_mixed_set");
                 browser.borrow_mut().poll_streams();
+                ui_load::lap("browser.poll_streams");
                 browser.borrow_mut().poll_stores(&app);
+                ui_load::lap("browser.poll_stores");
                 for track in sources.borrow_mut().poll() {
                     browser.borrow_mut().add_imported(track);
+                }
+                for update in sources.borrow_mut().take_play_updates() {
+                    browser.borrow_mut().stream_update(update);
+                }
+                let plays = browser.borrow_mut().take_stream_plays();
+                for play in plays {
+                    sources.borrow_mut().play_link(play);
                 }
                 for path in sources.borrow_mut().take_loads() {
                     browser.borrow_mut().load_cached(&path);
@@ -1647,24 +1969,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     browser.borrow().preview_download(action);
                 }
                 browser.borrow_mut().poll_art();
+                ui_load::lap("browser.poll_art");
                 browser.borrow_mut().poll_waves();
+                ui_load::lap("browser.poll_waves");
                 browser.borrow_mut().poll_analysis();
+                ui_load::lap("browser.poll_analysis");
+                browser.borrow_mut().poll_tasks();
+                ui_load::lap("browser.poll_tasks");
                 browser.borrow_mut().poll_usb_export();
+                ui_load::lap("browser.poll_usb_export");
                 browser.borrow_mut().poll_playlist_files();
+                ui_load::lap("browser.poll_playlist_files");
+                browser.borrow_mut().poll_stem_files();
+                ui_load::lap("browser.poll_stem_files");
                 browser.borrow_mut().poll_inbox_albums();
+                ui_load::lap("browser.poll_inbox_albums");
                 browser.borrow_mut().poll_rekordbox_xml();
+                ui_load::lap("browser.poll_rekordbox_xml");
                 browser.borrow_mut().poll_covers();
+                ui_load::lap("browser.poll_covers");
+                browser.borrow_mut().poll_sounds();
+                ui_load::lap("browser.poll_sounds");
+                browser.borrow_mut().poll_dupe_files();
+                ui_load::lap("browser.poll_dupe_files");
                 browser.borrow_mut().poll_located();
+                ui_load::lap("browser.poll_located");
                 browser.borrow_mut().poll_cleanup();
+                ui_load::lap("browser.poll_cleanup");
                 browser.borrow_mut().poll_files();
+                ui_load::lap("browser.poll_files");
                 sampler.borrow_mut().poll();
+                ui_load::lap("sampler.poll");
                 prefs.borrow_mut().poll();
+                ui_load::lap("prefs.poll");
                 tour.borrow_mut().poll();
+                ui_load::lap("tour.poll");
                 controller_editor.borrow_mut().poll();
+                ui_load::lap("controller_editor.poll");
                 map_mode.borrow_mut().poll();
+                ui_load::lap("map_mode.poll");
                 prep_click
                     .borrow_mut()
                     .tick(app.get_layout() == PREP_LAYOUT);
+                ui_load::lap("prep_click.tick");
                 if let Some(c) = &controllers {
                     let names: Vec<String> = c.connected().into_iter().map(|c| c.port).collect();
                     let status = if names.is_empty() {
@@ -1681,8 +2028,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         settings.set_controllers(status.into());
                     }
                 }
+                ui_load::lap("controllers status");
                 let tracks = loaded.read().unwrap().clone();
                 put_back.borrow_mut().tick(&app, &tracks);
+                ui_load::lap("put_back.tick");
                 let camelot = app.global::<KeyNotation>().get_camelot();
                 let mut b = browser.borrow_mut();
                 b.set_camelot(camelot);
@@ -1695,10 +2044,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &app,
                     std::array::from_fn(|d| tracks[d].as_ref().map(|t| t.id)),
                 );
+                ui_load::lap("browser.set_loaded");
                 b.learn_deck_phrases(&tracks);
+                ui_load::lap("browser.learn_deck_phrases");
                 b.learn_analysis(&tracks);
+                ui_load::lap("browser.learn_analysis");
+                let fetches = b.deck_fetches();
+                b.show_row_fetches();
+                ui_load::lap("browser.show_row_fetches");
                 b.poll_prep();
+                ui_load::lap("browser.poll_prep");
                 b.keep(&tracks, 0.016);
+                ui_load::lap("browser.keep");
                 let mut host = browser::AutomixHost {
                     browser: &mut b,
                     engine: &engine,
@@ -1719,7 +2076,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if host.browser.take_keep_going_automix() {
                     automix.borrow_mut().set_enabled(true);
                 }
+                ui_load::lap("keep_going");
                 automix.borrow_mut().tick(&mut host, &tracks, dt.min(0.1));
+                ui_load::lap("automix.tick");
                 remote.borrow_mut().tick(
                     &app,
                     &mut automix.borrow_mut(),
@@ -1730,9 +2089,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 quick
                     .borrow_mut()
                     .tick(&app, &mut automix.borrow_mut(), &mut b, &tracks);
+                ui_load::lap("remote + quick");
                 automix.borrow().show(&app, &tracks);
                 let automix_spans = automix.borrow().spans(&tracks);
                 drop(b);
+                ui_load::lap("automix.show");
                 // Row by row and only when it differs: a whole new model
                 // would make everything on the decks lay out and draw again.
                 for (d, track) in tracks.iter().enumerate() {
@@ -1752,6 +2113,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info.automix_from = round(from);
                         info.automix_to = round(to);
                     }
+                    // A streamed track downloading to load here shows its
+                    // own name, and how it goes over the waveform.
+                    if let Some(f) = &fetches[d] {
+                        info.title = f.title.as_str().into();
+                        info.artist = f.artist.as_str().into();
+                        info.fetching = true;
+                        info.fetch_note = f.note.as_str().into();
+                        info.fetch_progress = f.progress;
+                        info.fetch_failed = f.failed;
+                    }
                     if !deck_rows
                         .row_data(d)
                         .is_some_and(|old| same_deck_info(&old, &info))
@@ -1759,8 +2130,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         deck_rows.set_row_data(d, info);
                     }
                 }
-                let t = start.elapsed().as_secs();
-                let clock = format!("{:02}:{:02}", t / 60 % 60, t % 60);
+                ui_load::lap("deck rows");
+                let clock = wall_clock::format(chrono::Local::now().time(), twenty_four_hour);
                 if app.get_clock() != clock.as_str() {
                     app.set_clock(clock.into());
                 }
@@ -1783,6 +2154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if controls_changed || moved || loaded_changed {
                     app.window().request_redraw();
                 }
+                ui_load::tick_end();
             },
         );
     }
@@ -1814,17 +2186,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timer
     };
 
+    // Until the first frame is drawn, a crash counts against these graphics.
+    graphics_choice.arm();
     app.show()?;
+    // The DJ's interface scale, once the window knows its screen.
+    ui_scale::install(&app, first_run);
     fit_to_screen(&app);
     app.run()?;
-    // Keeps each plugin's sound (tweaks made in its window) for next time:
-    // the engine isn't always dropped on the way out.
-    quitting_engine.shut_down_plugins();
+    // The window's handlers still hold the engine and the controllers, so
+    // nothing here is dropped until the very end of the process, when
+    // Windows has already ended the other threads: a driver let go of then
+    // panics or hangs, leaving openDJ running without a window and holding
+    // its audio and MIDI devices. So each is let go of now, in order.
+    let quit = shutdown::Shutdown::start();
+    // Keeps each plugin's sound (tweaks made in its window) for next time.
+    quit.step("saving plugin sounds", || {
+        quitting_engine.shut_down_plugins()
+    });
     // Finishes the files, with the cue sheet, if the DJ quits mid-recording.
-    recorder.stop();
+    quit.step("finishing the recording", || recorder.stop());
     if let Some(b) = &broadcast {
-        b.shut_down();
+        quit.step("ending the broadcast", || b.shut_down());
     }
+    // The sound stops first, so the room goes quiet as soon as Quit is
+    // confirmed, whatever follows.
+    quit.step("closing audio devices", || {
+        if !quitting_engine.close_devices() {
+            quit.abandon("an audio or MIDI clock thread, stuck in a driver");
+        }
+    });
+    // The mappings turn their lights off. The device thread can be stuck
+    // asking a MIDI service that stopped answering, so it gets 2 s.
+    if let Some(c) = &quitting_controllers {
+        quit.step("disconnecting controllers", || {
+            if !c.shut_down_within(Duration::from_secs(2)) {
+                quit.abandon("the controller thread, stuck in a MIDI or USB call");
+            }
+        });
+    }
+    quit.finish();
     Ok(())
 }
 
@@ -2044,7 +2444,7 @@ fn short_port_name(port: &str) -> &str {
 
 /// Prints every control openDJ has, aliases included, as sorted `[Group],key`
 /// lines. The website's controller pages use this list to mark mapping lines
-/// that don't do anything in openDJ yet (website/book/supported-controls.txt).
+/// that don't do anything in openDJ yet (website/docs/supported-controls.txt).
 fn list_controls() {
     print!("{}", control_list());
 }
@@ -2163,14 +2563,50 @@ mod control_list_tests {
     fn website_list_is_up_to_date() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../website/book/supported-controls.txt"
+            "/../../website/docs/supported-controls.txt"
         );
         let saved = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
         assert!(
             saved == super::control_list(),
-            "website/book/supported-controls.txt is out of date; regenerate it with \
-             `cargo run -q -p opendj -- --list-controls > website/book/supported-controls.txt`"
+            "website/docs/supported-controls.txt is out of date; regenerate it with \
+             `cargo run -q -p opendj -- --list-controls > website/docs/supported-controls.txt`"
         );
+    }
+}
+
+#[cfg(test)]
+mod phrase_tip_tests {
+    use super::{phrase_bars, Source, Track};
+    use std::sync::Arc;
+
+    fn track(bpm: f64, first_beat: f64) -> Track {
+        Track {
+            id: 0,
+            artist: String::new(),
+            title: String::new(),
+            album: String::new(),
+            genre: String::new(),
+            rating: 0,
+            bpm,
+            key: String::new(),
+            duration: 240.0,
+            first_beat,
+            grid: Default::default(),
+            source: Source::Synth { seed: 0 },
+            waveform: Arc::default(),
+            audio: None,
+            cover: None,
+            info: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_intro_counts_from_bar_one() {
+        // Bar 1 half a second in: the intro runs from 0:00 to bar 17.
+        let t = track(96.57, 0.5);
+        let bar = 240.0 / 96.57;
+        assert_eq!(phrase_bars(&t, 0.0, 0.5 + 16.0 * bar), 16.0);
+        assert_eq!(phrase_bars(&t, 0.5 + 16.0 * bar, 0.5 + 48.0 * bar), 32.0);
     }
 }
 
@@ -2421,7 +2857,7 @@ impl Decks {
             cover: Default::default(),
             has_cover: false,
             bpm: if t.bpm > 0.0 {
-                format!("{:.2}", h.bpm.get())
+                format!("{:.1}", h.bpm.get())
             } else {
                 "--".into()
             }
@@ -2459,14 +2895,19 @@ impl Decks {
                 Source::File(path) => {
                     matches!(
                         stems::separation(path),
-                        Some(stems::Separation::Running | stems::Separation::Done)
+                        Some(
+                            stems::Separation::Waiting
+                                | stems::Separation::Running
+                                | stems::Separation::Done
+                        )
                     ) && !stems.is_some_and(|s| s.playing_quality() == stems::Quality::High)
                 }
                 _ => false,
             },
-            // How far the HQ separation is (0..1), -1 while it waits its turn.
             stem_progress: match &t.source {
-                Source::File(path) => stems::separation_progress(path).unwrap_or(-1.0),
+                Source::File(path) => stems::separating()
+                    .filter(|(p, _)| p == path)
+                    .map_or(-1.0, |(_, done)| done),
                 _ => -1.0,
             },
             can_prepare_hq: match &t.source {
@@ -2474,7 +2915,11 @@ impl Decks {
                     !stems.is_some_and(|s| s.playing_quality() == stems::Quality::High)
                         && !matches!(
                             stems::separation(path),
-                            Some(stems::Separation::Running | stems::Separation::Done)
+                            Some(
+                                stems::Separation::Waiting
+                                    | stems::Separation::Running
+                                    | stems::Separation::Done
+                            )
                         )
                 }
                 _ => false,
@@ -2515,6 +2960,11 @@ impl Decks {
             // Filled in by the caller, which reads each file once.
             quality: Default::default(),
             lossless: false,
+            // Filled in by the caller, while a streamed track downloads.
+            fetching: false,
+            fetch_note: Default::default(),
+            fetch_progress: 0.0,
+            fetch_failed: false,
         }
     }
 
@@ -2557,6 +3007,7 @@ impl Decks {
             slip: Some(h.slip_position.get()).filter(|&s| s >= 0.0),
             gain: wave_look::gain_scale(h.pregain.get()),
             phrases,
+            tempos: Vec::new(),
         }
     }
 }
@@ -2618,6 +3069,10 @@ fn same_deck_info(old: &DeckInfo, new: &DeckInfo) -> bool {
 /// Where each phrase starts and its kind, as the waveforms draw them.
 type Phrases = Vec<(f64, PhraseKind)>;
 
+/// A track's tempo labels: where each is and its tempo (see
+/// `BeatGrid::tempo_labels`).
+type TempoLabels = Arc<[(f64, f64)]>;
+
 /// A track on the GPU, with the waveform, vocal levels and stem levels it
 /// came from.
 type Uploaded = (
@@ -2640,11 +3095,20 @@ struct Gpu {
     /// being analysed its waveform grows, and each new version is uploaded
     /// again, as it is once its vocals are found.
     tracks: [Option<Uploaded>; NUM_DECKS],
+    /// Each deck's decoded audio, for the real wave when zoomed right in.
+    samples: [Option<Arc<wave_samples::DeckSamples>>; NUM_DECKS],
     /// Each deck's phrases and the track they were found for, found again
     /// when the track changes (a new analysis or a grid edit replaces it).
     phrases: [Option<(Arc<Track>, Phrases)>; NUM_DECKS],
+    /// Each deck's tempo labels, the track and whether its grid was being
+    /// edited when they were picked (every marker then).
+    tempos: [Option<(Arc<Track>, bool, TempoLabels)>; NUM_DECKS],
     /// Each deck's drawn position, steadier than the engine's as read.
     clocks: [SmoothClock; NUM_DECKS],
+    /// When each frame will show, steadier than when it is drawn.
+    frame_timer: FrameTimer,
+    /// How smoothly frames come, for the log.
+    frame_stats: FrameStats,
     /// The sound of decks playing live, and each one's waveform on the GPU.
     live: Option<live_trace::LiveTraces>,
     /// The notes the Instrument input holds, for its deck's note roll.
@@ -2723,6 +3187,7 @@ impl Gpu {
             slip: None,
             gain: 1.0,
             phrases,
+            tempos: Vec::new(),
         };
         self.scrolling[d].set_lanes(w.lanes);
         self.scrolling[d].set_track(&self.device, &self.renderer, Some(&gpu));
@@ -2752,8 +3217,10 @@ impl Gpu {
                 (wave_look::style(), wave_look::palette(), wave_look::half());
             let vocals = wave_look::show_vocals();
             let needle = wave_look::needle();
+            let stem_layout = wave_look::stem_layout();
             for v in self.scrolling.iter_mut().chain(self.overview.iter_mut()) {
                 v.set_style(style);
+                v.set_stem_layout(stem_layout);
                 v.set_palette(palette);
                 v.set_half(half);
                 v.set_needle(needle);
@@ -2784,6 +3251,7 @@ impl Gpu {
             app.global::<PhraseView>().get_visible() && app.get_layout() != PLAYER_LAYOUT;
         // Phrase flags on the scrolling waveforms, live decks' included.
         let show_flags = app.global::<PhraseView>().get_waveform_visible();
+        let player = app.get_layout() == PLAYER_LAYOUT;
         let overview_background = if app.get_layout() == PLAYER_LAYOUT {
             PLAYER_OVERVIEW_BACKGROUND
         } else {
@@ -2791,9 +3259,19 @@ impl Gpu {
         };
         // Every deck's drawn position first: a live deck draws the leading
         // deck's beats.
+        // Worked out for when the frame will show, not when it is drawn.
+        if self.frame_timer.wants_refresh_rate(now) {
+            use slint::winit_030::WinitWindowAccessor;
+            let hz = app
+                .window()
+                .with_winit_window(|w| w.current_monitor()?.refresh_rate_millihertz());
+            self.frame_timer
+                .set_refresh_rate(hz.flatten().map(|mhz| mhz as f64 / 1000.0));
+        }
+        let shown_at = self.frame_timer.next(now);
         let clocks: [(f64, f64); NUM_DECKS] = std::array::from_fn(|d| {
-            let (position, speed) = visual.position(d, now);
-            (self.clocks[d].next(position, speed, now), speed)
+            let (position, speed) = visual.position(d, shown_at);
+            (self.clocks[d].next(position, speed, shown_at), speed)
         });
         // Decks playing an input, an instrument or the Groove Box.
         let live: [bool; NUM_DECKS] = std::array::from_fn(|d| {
@@ -2890,6 +3368,7 @@ impl Gpu {
                             stems: stems.as_deref().map_or(&[], |s| s.levels.as_slice()),
                             stem_rate: stem_levels::RATE,
                             stem_colors: stems.as_deref().map_or(&[], |s| s.colors.as_slice()),
+                            stem_roles: stems.as_deref().map_or(&[], |s| s.roles.as_slice()),
                         },
                     )),
                     t.waveform.clone(),
@@ -2907,7 +3386,24 @@ impl Gpu {
                 Some(t) if show_phrases || show_flags => self.phrases(d, t),
                 _ => Vec::new(),
             };
-            self.beat_count(app, d, track, play_seconds, speed != 0.0, &phrases);
+            // The phase meter: this deck against the leading deck.
+            let fader = |x: usize| {
+                let h = &decks.0[x];
+                crate::speed(&h.rate, &h.rate_range, &h.rate_dir)
+            };
+            let phase = match (tracks[d].as_ref(), leader) {
+                (Some(_), Some(l)) if l == d => PhaseMeter::Master,
+                (Some(t), Some(l)) => tracks[l]
+                    .as_ref()
+                    .and_then(|r| {
+                        beat_counter::phase((t, play_seconds, fader(d)), (r, clocks[l].0, fader(l)))
+                    })
+                    .map_or(PhaseMeter::None, |p| {
+                        PhaseMeter::Follower(p, decks.0[d].rate_dir.get() < 0.0)
+                    }),
+                _ => PhaseMeter::None,
+            };
+            self.beat_count(app, d, track, play_seconds, speed != 0.0, &phrases, phase);
             let flags = if show_flags {
                 phrases.clone()
             } else {
@@ -2993,8 +3489,8 @@ impl Gpu {
             // Grid edit mode (Prep's deck 1 always), while the grid is unlocked.
             let prep_deck = prep_shown && d == 0;
             let h = &decks.0[d];
-            self.scrolling[d]
-                .set_grid_edit((h.beats_edit.get_bool() || prep_deck) && !h.bpmlock.get_bool());
+            let grid_edit = (h.beats_edit.get_bool() || prep_deck) && !h.bpmlock.get_bool();
+            self.scrolling[d].set_grid_edit(grid_edit);
             if window.is_none() {
                 self.scrolling[d].set_lanes(None);
             }
@@ -3004,16 +3500,37 @@ impl Gpu {
                 continue;
             }
             // The overview's phrase bar, or the scrolling waveform's flags.
+            // With the scrolling waveform's tempo labels, where they show.
+            let tempos = match track {
+                Some(t) if wave_look::tempo_labels() => self.tempos(d, t, grid_edit),
+                _ => Arc::from([]),
+            };
             let scrolling_frame = frame.as_ref().map(|f| Frame {
                 phrases: flags,
+                tempos: tempo_labels_near(&tempos, f, f.visible_seconds, grid_edit),
                 ..f.clone()
             });
             // Size follows gain sizes the large waveform only: the overview
             // keeps its height.
             let overview_frame = frame.as_ref().map(|f| Frame {
                 gain: 1.0,
+                // Not on the Player's scrubber, nor while editing.
+                tempos: if grid_edit || player {
+                    Vec::new()
+                } else {
+                    tempo_labels_near(&tempos, f, f64::INFINITY, false)
+                },
                 ..f.clone()
             });
+            // The decoded audio, for the real wave up close.
+            let audio = track.and_then(|t| t.audio.as_ref());
+            let samples = match (audio, &self.samples[d]) {
+                (Some(a), Some(s)) if Arc::ptr_eq(a, s.audio()) => Some(s.clone()),
+                (Some(a), _) => Some(wave_samples::DeckSamples::new(a.clone())),
+                (None, _) => None,
+            };
+            self.samples[d] = samples.clone();
+            self.scrolling[d].set_samples(samples.map(|s| s as Arc<dyn opendj_waveform::Samples>));
             for (view, frame) in [
                 (&mut self.scrolling[d], scrolling_frame.as_ref()),
                 (&mut self.overview[d], overview_frame.as_ref()),
@@ -3039,9 +3556,61 @@ impl Gpu {
     }
 }
 
+/// What a deck's phase meter shows.
+enum PhaseMeter {
+    /// Nothing to compare with: a muted line.
+    None,
+    /// The deck the others are compared with: a muted line marked MASTER.
+    Master,
+    /// Against the leading deck, and whether its tempo fader speeds up
+    /// going down (so the tempo guide's arrow points down for faster).
+    Follower(beat_counter::Phase, bool),
+}
+
+impl PhaseMeter {
+    fn fill(&self, c: &mut BeatCount) {
+        match *self {
+            PhaseMeter::None => c.phase = 0,
+            PhaseMeter::Master => c.phase = 1,
+            PhaseMeter::Follower(p, down_faster) => {
+                c.phase = 2;
+                c.phase_fine = p.fine as f32;
+                let ms = p.ms.round() as i64;
+                // Only whole beats off read as text; the marker and its
+                // color show the fine offset.
+                c.phase_text = if p.beats != 0 {
+                    format!(
+                        "{:+} {}",
+                        p.beats,
+                        if p.beats.abs() == 1 { "BEAT" } else { "BEATS" }
+                    )
+                    .replace('-', "−")
+                } else {
+                    String::new()
+                }
+                .into();
+                c.phase_tone = if p.beats != 0 || ms.abs() >= 35 {
+                    2
+                } else if ms.abs() >= 10 {
+                    1
+                } else {
+                    0
+                };
+                // Up lights when the fader must go up.
+                c.tempo_arrow = match (p.tempo, down_faster) {
+                    (0, _) => 0,
+                    (t, true) => -t as i32,
+                    (t, false) => t as i32,
+                };
+            }
+        }
+    }
+}
+
 impl Gpu {
     /// Updates deck `d`'s beat counter from the same smoothed position the
     /// waveforms are drawn at, so its squares change on the beat.
+    #[allow(clippy::too_many_arguments)]
     fn beat_count(
         &mut self,
         app: &AppWindow,
@@ -3050,6 +3619,7 @@ impl Gpu {
         seconds: f64,
         playing: bool,
         drawn: &Phrases,
+        phase: PhaseMeter,
     ) {
         let global = app.global::<BeatCounter>();
         let mode = global.get_mode();
@@ -3086,7 +3656,7 @@ impl Gpu {
             }
             _ => None,
         };
-        let shown = match count {
+        let mut shown = match count {
             None => BeatCount::default(),
             Some(c) => BeatCount {
                 shown: true,
@@ -3101,8 +3671,15 @@ impl Gpu {
                     .map_or(slint::Color::from_rgb_u8(0x9e, 0x9e, 0xa3), |k| {
                         slint::Color::from_argb_encoded(0xff00_0000 | beat_counter::kind_color(k))
                     }),
+                kind_name: c.kind.map_or("BEAT", beat_counter::kind_name).into(),
+                has_kind: c.kind.is_some(),
+                kind_color: c.kind.map_or(slint::Color::default(), |k| {
+                    slint::Color::from_argb_encoded(0xff00_0000 | beat_counter::kind_color(k))
+                }),
+                ..Default::default()
             },
         };
+        phase.fill(&mut shown);
         let model = global.get_decks();
         if model.row_data(d).as_ref() != Some(&shown) {
             model.set_row_data(d, shown);
@@ -3112,6 +3689,19 @@ impl Gpu {
     /// Deck `d`'s phrases for the waveforms, found once per track: the
     /// library's until its waveform is ready, then found from the waveform
     /// and the grid as they are now.
+    /// Deck `d`'s tempo labels for `t`, every marker while `editing`;
+    /// picked again when the track or editing changes.
+    fn tempos(&mut self, d: usize, t: &Arc<Track>, editing: bool) -> TempoLabels {
+        match &self.tempos[d] {
+            Some((cached, e, l)) if Arc::ptr_eq(cached, t) && *e == editing => l.clone(),
+            _ => {
+                let l: TempoLabels = t.grid.tempo_labels(t.duration, editing).into();
+                self.tempos[d] = Some((t.clone(), editing, l.clone()));
+                l
+            }
+        }
+    }
+
     fn phrases(&mut self, d: usize, t: &Arc<Track>) -> Phrases {
         match &self.phrases[d] {
             Some((cached, p)) if Arc::ptr_eq(cached, t) => p.clone(),
@@ -3124,12 +3714,34 @@ impl Gpu {
     }
 }
 
+/// The tempo labels within `reach` seconds of the play position, at most
+/// as many as a waveform draws; to a tenth of a BPM while the grid is
+/// `editing`.
+fn tempo_labels_near(
+    labels: &[(f64, f64)],
+    f: &Frame,
+    reach: f64,
+    editing: bool,
+) -> Vec<TempoLabel> {
+    let (from, to) = (f.play_seconds - reach, f.play_seconds + reach);
+    labels
+        .iter()
+        .filter(|(s, _)| (from..to).contains(s))
+        .take(MAX_TEMPOS)
+        .map(|&(seconds, bpm)| TempoLabel {
+            seconds,
+            bpm,
+            tenths: editing,
+        })
+        .collect()
+}
+
 /// The tooltip for the phrase at `seconds`: its kind, then its length in
 /// bars and where it starts and ends.
-fn phrase_tip(phrases: &Phrases, duration: f64, bpm: f64, seconds: f64) -> Option<PhraseTip> {
+fn phrase_tip(phrases: &Phrases, track: &Track, seconds: f64) -> Option<PhraseTip> {
     let i = phrases.iter().rposition(|(start, _)| *start <= seconds)?;
     let (start, kind) = phrases[i];
-    let end = phrases.get(i + 1).map_or(duration, |(s, _)| *s);
+    let end = phrases.get(i + 1).map_or(track.duration, |(s, _)| *s);
     let title = match kind {
         PhraseKind::Intro => "INTRO",
         PhraseKind::Build => "BUILD-UP",
@@ -3144,8 +3756,8 @@ fn phrase_tip(phrases: &Phrases, duration: f64, bpm: f64, seconds: f64) -> Optio
         format!("{}:{:02}", s / 60, s % 60)
     };
     let range = format!("{} – {}", mmss(start), mmss(end));
-    let bars = ((end - start) * bpm / 240.0).round();
-    let body = if bpm > 0.0 && bars >= 1.0 {
+    let bars = phrase_bars(track, start, end);
+    let body = if track.bpm > 0.0 && bars >= 1.0 {
         format!("{bars} bars · {range}")
     } else {
         range
@@ -3154,6 +3766,18 @@ fn phrase_tip(phrases: &Phrases, duration: f64, bpm: f64, seconds: f64) -> Optio
         title: title.into(),
         body: body.into(),
     })
+}
+
+/// How many bars a phrase from `start` to `end` (seconds) spans, counted
+/// on the track's grid from bar 1: the first phrase starts at 0:00, so the
+/// beats before bar 1's line (a pickup) don't make it a bar longer.
+fn phrase_bars(track: &Track, start: f64, end: f64) -> f64 {
+    if track.bpm <= 0.0 {
+        return 0.0;
+    }
+    let bar_one = (track.beat_at(0.0) / 4.0 - 1e-6).ceil() * 4.0;
+    let from = track.beat_at(start).max(bar_one);
+    ((track.beat_at(end) - from) / 4.0).round().max(0.0)
 }
 
 /// Where a track's grid came from, as the grid menu says it.
@@ -3214,4 +3838,96 @@ fn scope_path(bins: &[(f32, f32)]) -> String {
     }
     out.push('Z');
     out
+}
+
+/// Path commands for the instrument's spectrum in the scope's 128 by 32
+/// box: an area rising from the bottom, low notes on the left.
+fn spectrum_path(bands: &[f32]) -> String {
+    use std::fmt::Write;
+    let last = bands.len().saturating_sub(1).max(1) as f32;
+    let mut out = String::with_capacity(bands.len() * 16 + 16);
+    out.push_str("M 0 32 ");
+    for (i, &v) in bands.iter().enumerate() {
+        let _ = write!(
+            out,
+            "L {:.1} {:.1} ",
+            i as f32 * 128.0 / last,
+            32.0 - 31.0 * v.clamp(0.0, 1.0)
+        );
+    }
+    out.push_str("L 128 32 Z");
+    out
+}
+
+#[cfg(test)]
+mod output_device_tests {
+    use super::{move_to_device, AudioSetup, Role, Route};
+
+    #[test]
+    fn covers_become_square_jpegs() {
+        let cover = opendj_engine::cover::Cover {
+            width: 40,
+            height: 20,
+            rgba: vec![200; 40 * 20 * 4],
+        };
+        let jpeg = super::cover_jpeg(&cover, 32);
+        assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF]);
+        let back = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!((back.width(), back.height()), (32, 32));
+    }
+
+    fn route(role: Role, device: &str, pair: u16) -> Route {
+        Route {
+            role,
+            device: device.into(),
+            pair,
+        }
+    }
+
+    #[test]
+    fn a_controller_takes_the_master_and_the_headphones_together() {
+        // First start: both on the system default.
+        let mut s = AudioSetup {
+            routes: vec![route(Role::Master, "", 0), route(Role::Headphones, "", 1)],
+            ..AudioSetup::default()
+        };
+        move_to_device(&mut s, 0, "DDJ-FLX10", 4);
+        assert_eq!(s.routes[0], route(Role::Master, "DDJ-FLX10", 0));
+        assert_eq!(s.routes[1], route(Role::Headphones, "DDJ-FLX10", 1));
+    }
+
+    #[test]
+    fn headphones_on_their_own_device_stay_there() {
+        let mut s = AudioSetup {
+            routes: vec![
+                route(Role::Master, "", 0),
+                route(Role::Headphones, "USB Phones", 0),
+            ],
+            ..AudioSetup::default()
+        };
+        move_to_device(&mut s, 0, "DDJ-FLX10", 4);
+        assert_eq!(s.routes[1], route(Role::Headphones, "USB Phones", 0));
+    }
+
+    #[test]
+    fn a_row_moved_to_the_masters_device_takes_the_free_pair() {
+        let mut s = AudioSetup {
+            routes: vec![
+                route(Role::Master, "DDJ-FLX10", 0),
+                route(Role::Headphones, "MacBook Pro Speakers", 0),
+            ],
+            ..AudioSetup::default()
+        };
+        move_to_device(&mut s, 1, "DDJ-FLX10", 4);
+        assert_eq!(s.routes[1], route(Role::Headphones, "DDJ-FLX10", 1));
+        // A two-channel device has no pair to spare: the master stays put
+        // and the headphones go on its only pair, as before.
+        move_to_device(&mut s, 1, "MacBook Pro Speakers", 2);
+        assert_eq!(
+            s.routes[1],
+            route(Role::Headphones, "MacBook Pro Speakers", 0)
+        );
+        move_to_device(&mut s, 0, "MacBook Pro Speakers", 2);
+        assert_eq!(s.routes[0], route(Role::Master, "MacBook Pro Speakers", 0));
+    }
 }

@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use opendj_waveform::{
-    steady_grid, wgpu, Extras, Frame, GpuTrack, Mode, Palette, PhraseKind, Style, WaveformRenderer,
-    WaveformView,
+    steady_grid, wgpu, Extras, Frame, GpuTrack, Mode, Palette, PhraseKind, StemLayout, StemRole,
+    Style, TempoLabel, WaveformRenderer, WaveformView,
 };
 
 /// Builds the coarser levels the way the analyser does (peaks by maximum;
@@ -107,6 +107,7 @@ fn renders_scrolling_and_overview() {
                 hotcues: [Some(5.0), None, None, None, None, None, None, Some(60.0)],
                 slip: None,
                 gain: 1.0,
+                tempos: Vec::new(),
                 phrases: vec![
                     (0.0, PhraseKind::Intro),
                     (20.0, PhraseKind::Drop),
@@ -159,6 +160,7 @@ fn long_tracks_fall_back_to_a_coarser_level() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: Vec::new(),
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -208,6 +210,7 @@ fn draws_beat_grid() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: Vec::new(),
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -263,6 +266,7 @@ fn draws_bar_numbers() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: Vec::new(),
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -323,6 +327,7 @@ fn draws_phrase_bars() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: vec![(0.0, PhraseKind::Intro), (50.0, PhraseKind::Drop)],
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -392,6 +397,7 @@ fn short_overview_draws_no_phrase_bar() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: vec![(0.0, PhraseKind::Intro), (50.0, PhraseKind::Drop)],
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -441,6 +447,7 @@ fn draws_mono_played_rest_and_mix() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: Vec::new(),
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -539,6 +546,7 @@ fn draws_live_lanes() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: Vec::new(),
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -622,6 +630,7 @@ fn draws_knob_levels() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: Vec::new(),
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -690,6 +699,7 @@ fn draws_phrase_flags() {
         slip: None,
         gain: 1.0,
         // The drop starts at x = 768 (2 s right of the middle, 128 px a second).
+        tempos: Vec::new(),
         phrases: vec![(40.0, PhraseKind::Build), (52.0, PhraseKind::Drop)],
     };
     let draw = |view: &mut WaveformView, frame: &Frame| {
@@ -786,6 +796,7 @@ fn peaks_keep_their_height_between_pixels() {
             hotcues: [None; 8],
             slip: None,
             gain: 1.0,
+            tempos: Vec::new(),
             phrases: Vec::new(),
         };
         view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -923,6 +934,7 @@ fn tints_the_sung_parts() {
             hotcues: [None; 8],
             slip: None,
             gain: 1.0,
+            tempos: Vec::new(),
             phrases: Vec::new(),
         };
         view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -980,6 +992,7 @@ fn draws_each_stem_in_its_color() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: Vec::new(),
     };
     let draw = |track: &Arc<GpuTrack>| {
@@ -1026,6 +1039,89 @@ fn draws_each_stem_in_its_color() {
     assert!(px[i..i + 3].iter().any(|&c| c > 60), "drawn without stems");
 }
 
+/// Stems in three lanes: the drums in the top lane, the vocals in the
+/// bottom one, nothing in a lane whose stems are silent; stacked, the
+/// layers sit one on the other from the line out.
+#[test]
+fn lays_stems_out_in_lanes_or_stacked() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let renderer = WaveformRenderer::new(&device, &queue);
+    let base: Vec<[u8; 8]> = (0..20_000)
+        .map(|_| [200, 120, 60, 220, 160, 100, 50, 180])
+        .collect();
+    // Kick, hats, bass, other, vocals: drums and vocals loud, the music
+    // lane silent.
+    let stems: Vec<[u8; 5]> = (0..200).map(|_| [230, 0, 0, 0, 230]).collect();
+    let colors = [0xD01010, 0x10D0D0, 0x101010, 0x101010, 0x10D010];
+    let roles = [
+        StemRole::Kick,
+        StemRole::Hats,
+        StemRole::Bass,
+        StemRole::Music,
+        StemRole::Vocal,
+    ];
+    let track = Arc::new(GpuTrack::with_extras(
+        &device,
+        &queue,
+        &renderer,
+        1,
+        &levels(base),
+        1000.0,
+        Extras {
+            stems: &stems,
+            stem_rate: 10.0,
+            stem_colors: &colors,
+            stem_roles: &roles,
+            ..Extras::default()
+        },
+    ));
+    let (w, h) = (256u32, 90u32);
+    let frame = Frame {
+        play_seconds: 10.0,
+        visible_seconds: 8.0,
+        duration: 20.0,
+        first_bar_beat: 0.0,
+        grid: steady_grid(0.0, 0.0),
+        cue: None,
+        loop_range: None,
+        loop_marking: None,
+        hotcues: [None; 8],
+        slip: None,
+        gain: 1.0,
+        tempos: Vec::new(),
+        phrases: Vec::new(),
+    };
+    let draw = |layout: StemLayout| {
+        let mut view = WaveformView::new(&device, Mode::Scrolling, w, h);
+        view.set_style(Style::Stems);
+        view.set_stem_layout(layout);
+        view.set_track(&device, &renderer, Some(&track));
+        view.render(&device, &queue, &renderer, Some(&frame), 1.0);
+        read_back(&device, &queue, &view)
+    };
+    let at = |px: &[u8], y: u32| {
+        let i = ((y * w + w / 3) * 4) as usize;
+        (px[i] as i32, px[i + 1] as i32, px[i + 2] as i32)
+    };
+    let px = draw(StemLayout::Lanes);
+    // Lanes 30 pixels tall (less the gaps): drums, music, vocals.
+    let (r, g, _) = at(&px, 14);
+    assert!(r > g + 60, "drums lane: r {r} g {g}");
+    let (r, g, b) = at(&px, 45);
+    assert!(r.max(g).max(b) < 60, "music lane empty: {r} {g} {b}");
+    let (r, g, _) = at(&px, 75);
+    assert!(g > r + 60, "vocal lane: r {r} g {g}");
+    let px = draw(StemLayout::Stacked);
+    // The kick at the line, the vocals out from it.
+    let (r, g, _) = at(&px, h / 2);
+    assert!(r > g + 60, "kick at the line: r {r} g {g}");
+    let (r, g, _) = at(&px, h / 2 - 25);
+    assert!(g > r + 60, "vocals further out: r {r} g {g}");
+}
+
 /// 3-Band layers as rekordbox does: equal bands draw the lows widest, the
 /// overlap of low and mids in a darker mid, and the highs as a small core
 /// on top rather than the whole shape.
@@ -1064,6 +1160,7 @@ fn three_band_keeps_the_highs_small() {
         hotcues: [None; 8],
         slip: None,
         gain: 1.0,
+        tempos: Vec::new(),
         phrases: vec![],
     };
     view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -1090,6 +1187,78 @@ fn three_band_keeps_the_highs_small() {
         highs * 3 < rows.len(),
         "highs a small core: {highs} of {}",
         rows.len()
+    );
+}
+
+/// The 3-Band overview stacks the bands at their real loudness, as
+/// rekordbox's does: a loud stretch leaves headroom instead of filling the
+/// height, and a quiet one sits well below it.
+#[test]
+fn three_band_overview_follows_loudness() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let renderer = WaveformRenderer::new(&device, &queue);
+    // A quiet first half, a loud second half.
+    let base = (0..20_000)
+        .map(|i| {
+            if i < 10_000 {
+                [90, 90, 90, 100, 60, 60, 60, 70]
+            } else {
+                [200, 200, 200, 220, 130, 130, 130, 150]
+            }
+        })
+        .collect();
+    let track = Arc::new(GpuTrack::new(
+        &device,
+        &queue,
+        &renderer,
+        1,
+        &levels(base),
+        1000.0,
+    ));
+    let (w, h) = (256u32, 100u32);
+    let mut view = WaveformView::new(&device, Mode::Overview, w, h);
+    view.set_style(Style::Bands);
+    view.set_palette(Palette::bands(0));
+    view.set_half(true);
+    view.set_track(&device, &renderer, Some(&track));
+    let frame = Frame {
+        play_seconds: 0.0,
+        visible_seconds: 8.0,
+        duration: 20.0,
+        first_bar_beat: 0.0,
+        grid: steady_grid(120.0, 0.0),
+        cue: None,
+        loop_range: None,
+        loop_marking: None,
+        hotcues: [None; 8],
+        slip: None,
+        gain: 1.0,
+        tempos: Vec::new(),
+        phrases: vec![],
+    };
+    view.render(&device, &queue, &renderer, Some(&frame), 1.0);
+    let px = read_back(&device, &queue, &view);
+    // How tall column `x` is drawn, in rows from the bottom.
+    let tall = |x: u32| -> u32 {
+        (0..h)
+            .find(|&y| {
+                let i = ((y * w + x) * 4) as usize;
+                px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32 > 120
+            })
+            .map_or(0, |y| h - y)
+    };
+    let (quiet, loud) = (tall(w / 4), tall(3 * w / 4));
+    assert!(loud < h * 9 / 10, "loud leaves headroom: {loud} of {h}");
+    assert!(quiet * 2 < loud, "quiet sits lower: {quiet} vs {loud}");
+    // The lows are the base: the bottom row is blue.
+    let i = (((h - 2) * w + 3 * w / 4) * 4) as usize;
+    assert!(
+        px[i + 2] > 150 && px[i] < 60,
+        "low at the base: {:?}",
+        &px[i..i + 3]
     );
 }
 
@@ -1172,6 +1341,7 @@ fn scrolling_stays_crisp_in_every_look() {
                 hotcues: [None; 8],
                 slip: None,
                 gain: 1.0,
+                tempos: Vec::new(),
                 phrases: Vec::new(),
             };
             view.render(&device, &queue, &renderer, Some(&frame), 1.0);
@@ -1204,6 +1374,210 @@ fn scrolling_stays_crisp_in_every_look() {
                 nearest < 0.01,
                 "{style:?} (half {half}) {t} px on: {:.1}% off a whole-pixel frame",
                 100.0 * nearest
+            );
+        }
+    }
+}
+
+/// Tempo labels on the scrolling waveform: a grey tab with the BPM where
+/// one stands alone, and the BPM after the name in a phrase's flag when it
+/// is within two beats of the phrase start.
+#[test]
+fn draws_tempo_labels_alone_and_in_phrase_flags() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let renderer = WaveformRenderer::new(&device, &queue);
+    let track = Arc::new(GpuTrack::new(
+        &device,
+        &queue,
+        &renderer,
+        1,
+        &levels(vec![[0; 8]; 100_000]),
+        1000.0,
+    ));
+    let (w, h) = (512u32, 80u32);
+    let mut view = WaveformView::new(&device, Mode::Scrolling, w, h);
+    view.set_track(&device, &renderer, Some(&track));
+    // 8 s across 512 pixels around 30 s: 64 pixels a second, 30 s at 256.
+    let label = |seconds, bpm| TempoLabel {
+        seconds,
+        bpm,
+        tenths: false,
+    };
+    let frame = |tempos: Vec<TempoLabel>| Frame {
+        play_seconds: 30.0,
+        visible_seconds: 8.0,
+        duration: 100.0,
+        first_bar_beat: 0.0,
+        grid: steady_grid(120.0, 0.0),
+        cue: None,
+        loop_range: None,
+        loop_marking: None,
+        hotcues: [None; 8],
+        slip: None,
+        gain: 1.0,
+        phrases: vec![(0.0, PhraseKind::Intro), (32.0, PhraseKind::Drop)],
+        tempos,
+    };
+    let mut draw = |tempos| {
+        view.render(&device, &queue, &renderer, Some(&frame(tempos)), 1.0);
+        read_back(&device, &queue, &view)
+    };
+    let px = |data: &[u8], x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        [data[i], data[i + 1], data[i + 2]]
+    };
+    // The drop's tab along its row: how far its rose colour reaches.
+    let tab_end = |data: &[u8]| {
+        (384..w)
+            .take_while(|&x| {
+                let c = px(data, x, 17);
+                c[0] > c[2] + 30 || c[0] > 200
+            })
+            .last()
+            .unwrap_or(384)
+    };
+    let plain = draw(Vec::new());
+    let grey_at = px(&plain, 196, 17);
+    assert!(grey_at[0] < 40, "no tab before a label: {grey_at:?}");
+    // 29 s stands alone (64 px before 30 s); 32.5 s is one beat after the drop.
+    let both = draw(vec![label(29.0, 124.0), label(32.5, 126.0)]);
+    let grey = px(&both, 194, 17);
+    assert!(
+        (70..110).contains(&grey[0]) && grey[0].abs_diff(grey[2]) < 12,
+        "a grey tab at 29 s: {grey:?}"
+    );
+    // White figures in it.
+    let ink = (196..230).map(|x| px(&both, x, 21)[1]).max().unwrap();
+    assert!(ink > 200, "BPM figures in the tab: {ink}");
+    // The drop's flag grows by the BPM, with no grey tab of its own.
+    let (short, long) = (tab_end(&plain), tab_end(&both));
+    assert!(long > short + 20, "flag {short} -> {long} with its BPM");
+    for x in 384..long {
+        let c = px(&both, x, 17);
+        assert!(
+            !(c[0] < 110 && c[0] > 70 && c[0].abs_diff(c[2]) < 12),
+            "no grey in the flag at {x}"
+        );
+    }
+    // Shown to a tenth: wider than the whole number.
+    let tenth = draw(vec![TempoLabel {
+        tenths: true,
+        ..label(32.5, 126.0)
+    }]);
+    assert!(tab_end(&tenth) > long + 4, "the tenth widens the flag");
+}
+
+/// A 50 Hz sine of 48 000 frames a second at full scale, for the real wave.
+struct Sine;
+
+impl opendj_waveform::Samples for Sine {
+    fn sample_rate(&self) -> f64 {
+        48_000.0
+    }
+    fn len(&self) -> usize {
+        48_000 * 60
+    }
+    fn ready(&self) -> usize {
+        self.len()
+    }
+    fn min_max(&self, from: usize, to: usize) -> [f32; 2] {
+        (from..to)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 50.0 / 48_000.0).sin() as f32)
+            .fold([f32::MAX, f32::MIN], |[lo, hi], v| [lo.min(v), hi.max(v)])
+    }
+    fn top(&self) -> Option<f32> {
+        Some(1.0)
+    }
+}
+
+/// Zoomed right in, the real wave swings above and below the centre line
+/// with the audio, where the summary is mirrored; zoomed out (or without
+/// the audio) it stays mirrored.
+#[test]
+fn draws_the_real_wave_zoomed_right_in() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let renderer = WaveformRenderer::new(&device, &queue);
+    // A summary of a loud steady tone: every slice at full level.
+    let track = Arc::new(GpuTrack::new(
+        &device,
+        &queue,
+        &renderer,
+        1,
+        &levels(vec![[200, 120, 60, 255, 140, 80, 40, 180]; 60_000]),
+        1000.0,
+    ));
+    let (w, h) = (1024u32, 120u32);
+    // How much ink there is above and below the centre line, in the column
+    // at `x`.
+    let halves = |px: &[u8], x: u32| -> (f64, f64) {
+        let ink = |y: u32| -> f64 {
+            let i = ((y * w + x) * 4) as usize;
+            (0..3).map(|c| px[i + c].abs_diff(px[c]) as f64).sum()
+        };
+        let above = (2..h / 2 - 3).map(ink).sum();
+        let below = (h / 2 + 3..h - 2).map(ink).sum();
+        (above, below)
+    };
+    let frame = |visible: f64| Frame {
+        play_seconds: 30.0,
+        visible_seconds: visible,
+        duration: 60.0,
+        first_bar_beat: 0.0,
+        grid: steady_grid(0.0, 0.0),
+        cue: None,
+        loop_range: None,
+        loop_marking: None,
+        hotcues: [None; 8],
+        slip: None,
+        gain: 1.0,
+        tempos: Vec::new(),
+        phrases: Vec::new(),
+    };
+    for style in [Style::Rgb, Style::Blue, Style::Mono] {
+        let mut view = WaveformView::new(&device, Mode::Scrolling, w, h);
+        view.set_style(style);
+        view.set_track(&device, &renderer, Some(&track));
+        view.set_samples(Some(Arc::new(Sine)));
+        // 0.4 s across: 20 cycles, about 51 pixels each. A column where
+        // the wave is high draws above the line only, one where it is low
+        // below only.
+        view.render(&device, &queue, &renderer, Some(&frame(0.4)), 1.0);
+        let px = read_back(&device, &queue, &view);
+        let (mut up, mut down) = (0, 0);
+        for x in 0..w {
+            let (a, b) = halves(&px, x);
+            if a > 4.0 * b.max(1.0) {
+                up += 1;
+            } else if b > 4.0 * a.max(1.0) {
+                down += 1;
+            }
+        }
+        assert!(up > 300 && down > 300, "{style:?}: {up} up, {down} down");
+        // 30 s across: the summary, mirrored about the line.
+        view.render(&device, &queue, &renderer, Some(&frame(30.0)), 1.0);
+        let px = read_back(&device, &queue, &view);
+        for x in (0..w).step_by(37) {
+            let (a, b) = halves(&px, x);
+            assert!(
+                (a - b).abs() <= 0.05 * a.max(b),
+                "{style:?} at {x}: {a} {b}"
+            );
+        }
+        // Zoomed in without the audio: the summary too.
+        view.set_samples(None);
+        view.render(&device, &queue, &renderer, Some(&frame(0.4)), 1.0);
+        let px = read_back(&device, &queue, &view);
+        for x in (0..w).step_by(37) {
+            let (a, b) = halves(&px, x);
+            assert!(
+                (a - b).abs() <= 0.05 * a.max(b),
+                "{style:?} at {x}: {a} {b}"
             );
         }
     }

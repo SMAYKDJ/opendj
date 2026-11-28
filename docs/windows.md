@@ -27,6 +27,27 @@ of updating the first.
   the previous run in `opendj.1.log`, crash reports as `crash-*.txt`).
 - Analysis cache and stems: `%LOCALAPPDATA%\openDJ`.
 
+Paste `%APPDATA%\openDJ\logs` into the File Explorer address bar to open the
+logs. A crash inside a driver (graphics or audio) writes a `crash-*.txt`
+too, naming the DLL it happened in.
+
+## If openDJ doesn't open
+
+openDJ draws with DirectX 12 on Windows. Some graphics drivers (older
+Intel drivers, laptops with both Intel and NVIDIA graphics) can still close
+openDJ while it sets up the GPU, before the window shows. openDJ notices at
+the next start and tries another graphics mode: DirectX 12, then Vulkan,
+then OpenGL.
+The one that works is kept in `%APPDATA%\openDJ\graphics.txt`, so opening
+openDJ two or three times gets past a driver that crashes.
+
+To pick one by hand, set the environment variable `OPENDJ_GRAPHICS` to
+`dx12`, `vulkan` or `gl` (in Command Prompt:
+`set OPENDJ_GRAPHICS=dx12 && "%LOCALAPPDATA%\Programs\openDJ\openDJ.exe"`).
+`OPENDJ_GRAPHICS=auto` goes back to the default and forgets the kept one.
+Updating the graphics driver from Intel's or the laptop maker's site
+often fixes the crash itself.
+
 ## Audio
 
 The Settings > Audio device lists show Windows Audio (WASAPI, shared mode)
@@ -34,6 +55,14 @@ devices and, after them, ASIO drivers as `ASIO: <driver name>`. Pick an
 ASIO driver for the lowest latency with a DJ controller or audio interface
 that ships one; the buffer size is usually set in the driver's own control
 panel. ASIO4ALL works for devices without an ASIO driver.
+
+openDJ looks for devices once, at start-up. Listing ASIO drivers loads each
+installed one in turn, which takes a few seconds when several are installed
+for hardware that isn't plugged in, and can briefly interrupt a Windows
+Audio stream on the same interface. So opening Settings > Audio looks again
+only for Windows Audio devices; press **Refresh devices** there for an ASIO
+device plugged in after openDJ started. While a deck plays, Refresh devices
+asks for a second press first.
 
 The build downloads Steinberg's ASIO SDK (GPLv3) through cpal's `asio`
 feature, which also needs LLVM (libclang) for bindgen; the GitHub Windows

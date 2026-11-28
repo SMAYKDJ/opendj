@@ -19,8 +19,11 @@ opendj-control = { path = "../control" }
 opendj-controllers = { path = "../controllers" }
 opendj-script = { path = "../script" }
 opendj-engine = { path = "../engine" }
+# The Session: openDJ Studio's clips on a channel of their own, without
+# Ableton Link (it follows the master deck).
+opendj-studio-engine = { path = "../studio-engine", default-features = false }
 rtrb = "0.4"
-opendj-library = { version = "0.6.0", path = "../library" }
+opendj-library = { version = "0.9.5", path = "../library" }
 opendj-export = { path = "../export" }
 opendj-plugins = { path = "../plugins" }
 opendj-live = { path = "../live" }
@@ -77,7 +80,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 [target.'cfg(windows)'.dependencies]
 # The system's own Open dialog (macOS and Linux ask osascript and zenity).
 rfd = { version = "0.17", default-features = false }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 slint-build = "~1.18"
@@ -88,3 +91,9 @@ winresource = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 hound = "3"
+
+[features]
+# Experimental: list Pure Data patches from the Pd folder as effects and
+# instruments. Needs the plugin helper built with its `pd` feature:
+# `cargo build -p opendj-plugin-host --features pd`.
+pd = []

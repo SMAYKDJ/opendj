@@ -13,7 +13,7 @@
 //! on or off.
 
 use std::f32::consts::{PI, TAU};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use opendj_control::{Behavior, ControlHandle, ControlRegistry};
@@ -23,11 +23,12 @@ use crate::controls::{
     deck_group, effect_group, effect_unit_group, Edge, BEAT_FX_UNIT, EFFECTS_PER_UNIT, MIC_FX_UNIT,
     NUM_DECKS, NUM_EFFECT_UNITS,
 };
-use crate::dsp::Svf;
+use crate::dsp::{Isolator, Svf};
 use crate::inputs::{input_group, MICROPHONE, NUM_INPUTS};
+use crate::tap_tempo::{tap_time, TapTempo};
 
 /// Mixxx's built-in effects that this engine implements, in `loaded_effect` order.
-pub const AVAILABLE_EFFECTS: [&str; 18] = [
+pub const AVAILABLE_EFFECTS: [&str; 22] = [
     "Echo",
     "Reverb",
     "Filter",
@@ -46,7 +47,41 @@ pub const AVAILABLE_EFFECTS: [&str; 18] = [
     "Hall",
     "Rev Roll",
     "Filter Echo",
+    "Tape Echo",
+    "Ducker",
+    "Rhythm",
+    "Solo",
 ];
+
+/// The built-in effects' `loaded_effect` numbers in the order the effect
+/// list shows them: by kind (delay and echo, reverb, filter, modulation,
+/// distortion, rhythm), then A to Z. `next_effect`, `prev_effect` and
+/// `effect_selector` step through them in this order, then through the
+/// plugins; the numbers themselves never change.
+pub const EFFECT_MENU_ORDER: [usize; 22] = [
+    1, 9, 18, 12, 19, 16, 17, 2, 3, 15, 22, 14, 4, 6, 5, 13, 11, 20, 10, 7, 21, 8,
+];
+
+/// The effect `step` places from `current` in list order, over the built-in
+/// effects and then `plugins` plugins, wrapping at either end. An empty slot
+/// (or an unknown number) steps to the first or the last.
+pub fn step_effect(current: usize, step: i32, plugins: usize) -> usize {
+    let n = EFFECT_MENU_ORDER.len() + plugins;
+    let position = EFFECT_MENU_ORDER
+        .iter()
+        .position(|&id| id == current)
+        .or_else(|| (current > EFFECT_MENU_ORDER.len() && current <= n).then(|| current - 1));
+    let next = match position {
+        Some(position) => (position as i32 + step).rem_euclid(n as i32) as usize,
+        None if step > 0 => 0,
+        None => n - 1,
+    };
+    if next < EFFECT_MENU_ORDER.len() {
+        EFFECT_MENU_ORDER[next]
+    } else {
+        next + 1
+    }
+}
 
 /// Parameter knobs (`parameterK`) and buttons (`button_parameterK`) per slot.
 pub const MAX_PARAMETERS: usize = 4;
@@ -69,10 +104,6 @@ pub const DEFAULT_EFFECTS: [[usize; EFFECTS_PER_UNIT]; NUM_EFFECT_UNITS] = [
 
 /// How long a released effect's tail rings on, in beats (see `release`).
 const RELEASE_BEATS: f32 = 8.0;
-/// Taps further apart than this, in seconds, start a new tap tempo.
-pub(crate) const TAP_GAP: f64 = 2.0;
-/// Tap intervals averaged into the tapped tempo.
-pub(crate) const TAPS: usize = 4;
 
 /// `loaded_effect` values from here on are plugins: `PLUGIN_BASE + i` is
 /// plugin `i` of the list the app hands the plugin host (see
@@ -168,14 +199,21 @@ pub(crate) fn instance_indices() -> (Indices, usize) {
 
 /// Longest echo, in seconds; it sizes the pool's long buffers.
 const ECHO_MAX_SECONDS: f32 = 2.0;
+/// Longest Beat FX echo or roll, in seconds: 16 beats down to about 70 BPM.
+/// It sizes the pool's huge buffers.
+const BEAT_FX_ECHO_SECONDS: f32 = 14.0;
 const FLANGER_MAX_SECONDS: f32 = 0.02;
 
 /// Buffers in the rack's pool, of each size. More effects than this sounding
 /// at once (each on each of its targets) is far beyond any real set: four
 /// decks with three echoes each, plus the Beat FX on two decks and pad FX,
 /// is about 20. An effect that finds the pool empty stays off.
-const LONG_BUFFERS: usize = 32;
+const LONG_BUFFERS: usize = 30;
 const SHORT_BUFFERS: usize = 32;
+/// The Beat FX's echoes and rolls: on two decks at once, plus one tail
+/// ringing out after a change of route. With none left they use a long
+/// buffer, up to its two seconds.
+const HUGE_BUFFERS: usize = 3;
 
 /// The delay memory an effect needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -185,12 +223,33 @@ enum Memory {
     Short,
     /// Two seconds of stereo: [`long_size`].
     Long,
+    /// The Beat FX's echoes and rolls, up to 16 beats: [`huge_size`].
+    Huge,
 }
 
 /// Floats in a long buffer: Echo's stereo delay line, which Roll, Brake,
 /// Echo Out and Spiral use too.
+/// Puts `notes` in order of frame, keeping the order of those on the same
+/// frame (an insertion sort: it never allocates, and they come nearly in
+/// order).
+fn sort_by_frame(notes: &mut [Midi]) {
+    for i in 1..notes.len() {
+        let mut j = i;
+        while j > 0 && notes[j - 1].frame > notes[j].frame {
+            notes.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
 fn long_size(sample_rate: f32) -> usize {
     2 * Echo::new(sample_rate).len
+}
+
+/// Floats in a huge buffer: a stereo delay line of
+/// [`BEAT_FX_ECHO_SECONDS`].
+fn huge_size(sample_rate: f32) -> usize {
+    2 * ((BEAT_FX_ECHO_SECONDS * sample_rate) as usize + 4)
 }
 
 /// Floats in a short buffer: the reverb's tank, or the flanger's lines.
@@ -204,24 +263,29 @@ fn short_size(sample_rate: f32) -> usize {
 /// Delay buffers waiting to be lent to an instance. Both stacks are created
 /// with room for every buffer, so giving one back never allocates.
 struct Pool {
+    huge: Vec<Box<[f32]>>,
     long: Vec<Box<[f32]>>,
     short: Vec<Box<[f32]>>,
+    huge_size: usize,
     long_size: usize,
     short_size: usize,
 }
 
 impl Pool {
-    fn new(sample_rate: f32, long: usize, short: usize) -> Self {
+    fn new(sample_rate: f32, huge: usize, long: usize, short: usize) -> Self {
+        let huge_size = huge_size(sample_rate);
         let long_size = long_size(sample_rate);
         let short_size = short_size(sample_rate);
         let make = |n: usize, size: usize| {
-            let mut v = Vec::with_capacity(long + short);
+            let mut v = Vec::with_capacity(huge + long + short);
             v.extend((0..n).map(|_| vec![0.0f32; size].into_boxed_slice()));
             v
         };
         Self {
+            huge: make(huge, huge_size),
             long: make(long, long_size),
             short: make(short, short_size),
+            huge_size,
             long_size,
             short_size,
         }
@@ -234,6 +298,7 @@ impl Pool {
             Memory::None => None,
             Memory::Short => self.short.pop().or_else(|| self.long.pop()),
             Memory::Long => self.long.pop(),
+            Memory::Huge => self.huge.pop().or_else(|| self.long.pop()),
         }
     }
 
@@ -241,7 +306,9 @@ impl Pool {
         if buf.is_empty() {
             return;
         }
-        if buf.len() >= self.long_size {
+        if buf.len() >= self.huge_size {
+            self.huge.push(buf);
+        } else if buf.len() >= self.long_size {
             self.long.push(buf);
         } else {
             self.short.push(buf);
@@ -254,6 +321,7 @@ impl Pool {
             Memory::None => true,
             Memory::Short => buf.len() >= self.short_size,
             Memory::Long => buf.len() >= self.long_size,
+            Memory::Huge => buf.len() >= self.huge_size,
         }
     }
 }
@@ -278,9 +346,13 @@ enum Kind {
     Hall,
     RevRoll,
     FilterEcho,
+    TapeEcho,
+    Ducker,
+    Rhythm,
+    Solo,
 }
 
-const KINDS: [Kind; 18] = [
+const KINDS: [Kind; 22] = [
     Kind::Echo,
     Kind::Reverb,
     Kind::Filter,
@@ -299,6 +371,10 @@ const KINDS: [Kind; 18] = [
     Kind::Hall,
     Kind::RevRoll,
     Kind::FilterEcho,
+    Kind::TapeEcho,
+    Kind::Ducker,
+    Kind::Rhythm,
+    Kind::Solo,
 ];
 
 impl Kind {
@@ -317,7 +393,9 @@ impl Kind {
             | Kind::Spiral
             | Kind::Hall
             | Kind::RevRoll
-            | Kind::FilterEcho => Memory::Long,
+            | Kind::FilterEcho
+            | Kind::TapeEcho
+            | Kind::Rhythm => Memory::Long,
             Kind::Reverb | Kind::Flanger | Kind::Chorus => Memory::Short,
             Kind::Filter
             | Kind::Bitcrusher
@@ -325,7 +403,9 @@ impl Kind {
             | Kind::Gate
             | Kind::Noise
             | Kind::Drive
-            | Kind::Ladder => Memory::None,
+            | Kind::Ladder
+            | Kind::Ducker
+            | Kind::Solo => Memory::None,
         }
     }
 }
@@ -336,10 +416,11 @@ struct Manifest {
     defaults: &'static [f64],
 }
 
-const MANIFESTS: [Manifest; 18] = [
+const MANIFESTS: [Manifest; 22] = [
     Manifest {
         names: &["Time", "Feedback", "Ping Pong", "Send"],
-        defaults: &[0.5, 0.5, 0.0, 1.0],
+        // Time: 1/2 beat.
+        defaults: &[0.375, 0.5, 0.0, 1.0],
     },
     Manifest {
         names: &["Decay", "Bandwidth", "Damping", "Send"],
@@ -363,11 +444,12 @@ const MANIFESTS: [Manifest; 18] = [
     },
     Manifest {
         names: &["Length", "Depth", "Width"],
-        defaults: &[0.5, 0.8, 0.5],
+        defaults: &[0.25, 0.8, 0.5],
     },
     Manifest {
         names: &["Rate"],
-        defaults: &[0.25],
+        // Rate: 1/2 beat slices.
+        defaults: &[0.625],
     },
     Manifest {
         names: &["Time", "Feedback", "Length"],
@@ -403,17 +485,39 @@ const MANIFESTS: [Manifest; 18] = [
     },
     Manifest {
         names: &["Rate"],
-        defaults: &[0.25],
+        // Rate: 1/2 beat slices.
+        defaults: &[0.625],
     },
     Manifest {
         names: &["Time", "Feedback", "Filter", "Send"],
-        defaults: &[0.5, 0.6, 0.75, 1.0],
+        // Time: 1/2 beat.
+        defaults: &[0.375, 0.6, 0.75, 1.0],
+    },
+    Manifest {
+        names: &["Time", "Feedback", "Wow", "Send"],
+        // Time: 1/2 beat.
+        defaults: &[0.375, 0.55, 0.5, 1.0],
+    },
+    Manifest {
+        names: &["Depth", "Time"],
+        // Time: back up over 1/2 beat.
+        defaults: &[0.8, 0.5],
+    },
+    Manifest {
+        names: &["Rate", "Pattern"],
+        // Rate: 1/8 beat slices.
+        defaults: &[0.5, 0.0],
+    },
+    Manifest {
+        names: &[],
+        defaults: &[],
     },
 ];
 
-/// The beat switch's range: 1/16 to 4 beats, as powers of two.
+/// The beat switch's range: 1/16 to 64 beats, as powers of two. Each effect
+/// allows part of it (see [`time_parameter`]), as on Pioneer mixers.
 const BEATS_MIN: i32 = -4;
-const BEATS_MAX: i32 = 2;
+const BEATS_MAX: i32 = 6;
 /// Where a slot's beat switch starts.
 const DEFAULT_BEATS: f64 = 0.25;
 
@@ -422,10 +526,12 @@ const DEFAULT_BEATS: f64 = 0.25;
 /// how its `process` reads it with [`beats`].
 fn time_parameter(kind: Kind) -> Option<(usize, i32, i32, bool)> {
     match kind {
-        Kind::Echo | Kind::FilterEcho => Some((0, -4, 2, false)),
-        Kind::Flanger | Kind::Phaser => Some((0, -1, 5, true)),
-        Kind::Gate => Some((0, -4, 0, false)),
-        Kind::Roll | Kind::RevRoll => Some((0, -4, 0, true)),
+        Kind::Echo | Kind::FilterEcho | Kind::TapeEcho => Some((0, -4, 4, false)),
+        Kind::Ducker => Some((1, -2, 0, false)),
+        Kind::Rhythm => Some((0, -4, -2, false)),
+        Kind::Flanger | Kind::Phaser => Some((0, -1, 6, true)),
+        Kind::Gate => Some((0, -4, 4, false)),
+        Kind::Roll | Kind::RevRoll => Some((0, -4, 4, true)),
         Kind::EchoOut | Kind::Spiral => Some((0, -2, 0, false)),
         Kind::Brake => Some((0, 0, 3, false)),
         Kind::Chorus => Some((0, 0, 2, false)),
@@ -435,7 +541,20 @@ fn time_parameter(kind: Kind) -> Option<(usize, i32, i32, bool)> {
         | Kind::Noise
         | Kind::Drive
         | Kind::Ladder
-        | Kind::Hall => None,
+        | Kind::Hall
+        | Kind::Solo => None,
+    }
+}
+
+/// The longest length, as a power of two, a slot lets an effect have: deck
+/// FX echoes stop at 4 beats and rolls at 1 (their delay memory is two
+/// seconds); the Beat FX takes them to 16.
+fn beat_limit(kind: Option<Kind>, hi: i32, beat_fx: bool) -> i32 {
+    match kind {
+        _ if beat_fx => hi,
+        Some(Kind::Echo | Kind::FilterEcho | Kind::TapeEcho) => hi.min(2),
+        Some(Kind::Roll | Kind::RevRoll) => hi.min(0),
+        _ => hi,
     }
 }
 
@@ -444,7 +563,10 @@ fn time_parameter(kind: Kind) -> Option<(usize, i32, i32, bool)> {
 /// at 0 and turning up sweeps its high-pass.
 fn link(kind: Kind, meta: f64) -> [Option<f64>; MAX_PARAMETERS] {
     match kind {
-        Kind::Echo | Kind::Reverb | Kind::Hall => [None, None, None, Some(meta)],
+        Kind::Echo | Kind::Reverb | Kind::Hall | Kind::TapeEcho => [None, None, None, Some(meta)],
+        Kind::Ducker => [Some(meta), None, None, None],
+        // Its pattern is the FX bar's slider; Solo has nothing to turn.
+        Kind::Rhythm | Kind::Solo => [None; MAX_PARAMETERS],
         Kind::Filter => [Some(1.0), None, Some(meta), None],
         Kind::Flanger | Kind::Phaser | Kind::Gate => [None, Some(meta), None, None],
         // Bitcrusher and Noise leave their second control to the FX bar's
@@ -466,12 +588,63 @@ fn link(kind: Kind, meta: f64) -> [Option<f64>; MAX_PARAMETERS] {
     }
 }
 
+/// The Beat FX's LEVEL/DEPTH, as on Pioneer mixers: echoes are fully wet
+/// by the centre of the knob and repeat longer past it; the rest follow
+/// [`link`].
+fn link_beat_fx(kind: Kind, meta: f64) -> [Option<f64>; MAX_PARAMETERS] {
+    let wet = (2.0 * meta).min(1.0);
+    let more = (meta - 0.5).max(0.0);
+    match kind {
+        // Time, Feedback, Ping Pong, Send.
+        Kind::Echo | Kind::TapeEcho => [None, Some(0.5 + 0.7 * more), None, Some(wet)],
+        // Time, Feedback, Send.
+        Kind::Spiral => [None, Some(0.6 + 0.5 * more), Some(wet), None],
+        // Time, Feedback, Filter, Send.
+        Kind::FilterEcho => [
+            None,
+            Some(0.6 + 0.5 * more),
+            Some(0.5 + 0.5 * meta),
+            Some(wet),
+        ],
+        _ => link(kind, meta),
+    }
+}
+
+/// How much of the Beat FX is heard for its LEVEL/DEPTH: sweeps (flanger,
+/// phaser, chorus) are dry fully left and fade in over the first eighth of
+/// the knob, as on Pioneer mixers; other effects always play fully.
+fn beat_fx_wet(kind: Option<Kind>, meta: f64) -> f64 {
+    match kind {
+        Some(Kind::Flanger | Kind::Phaser | Kind::Chorus) => (meta * 8.0).clamp(0.0, 1.0),
+        _ => 1.0,
+    }
+}
+
+/// A slot's `band` as a mask of bands: 1 low, 2 mid, 4 high. None and all
+/// three both mean the whole signal, 0.
+pub fn band_mask(band: f64) -> u8 {
+    let m = band.round().clamp(0.0, 7.0) as u8;
+    if m == 7 {
+        0
+    } else {
+        m
+    }
+}
+
 struct SlotControls {
+    /// In the Beat FX unit: meta follows Pioneer's LEVEL/DEPTH curve
+    /// (see [`link_beat_fx`]).
+    beat_fx: bool,
     enabled: ControlHandle,
     meta: ControlHandle,
-    /// Length in beats, 1/16 to 4 (0 for effects without one), as the
-    /// slot's beat switch shows it.
+    /// The bands the effect works on (see [`band_mask`]).
+    band: ControlHandle,
+    /// Length in beats, 1/16 to 64 within the effect's own range (0 for
+    /// effects without one), as the slot's beat switch shows it.
     beats: ControlHandle,
+    /// Pushes that halve and double `beats` within the effect's range.
+    halve: ControlHandle,
+    double: ControlHandle,
     beats_seen: f64,
     params: [ControlHandle; MAX_PARAMETERS],
     loaded_effect: ControlHandle,
@@ -483,7 +656,7 @@ struct SlotControls {
     next: ControlHandle,
     prev: ControlHandle,
     clear: ControlHandle,
-    edges: [Edge; 3],
+    edges: [Edge; 5],
     /// The effect the parameters are set up for.
     kind: Option<Kind>,
     /// Or the plugin, by its place in the plugin list.
@@ -503,6 +676,7 @@ impl SlotControls {
         }
         reg.indicator(g, "num_button_parameters", MAX_BUTTON_PARAMETERS as f64);
         let mut s = Self {
+            beat_fx: unit == BEAT_FX_UNIT,
             enabled: reg.toggle(g, "enabled"),
             // The Beat FX and the mic's effects start half way, so turning
             // them on is heard at once.
@@ -518,7 +692,10 @@ impl SlotControls {
                 1.0,
                 Behavior::Linear,
             ),
-            beats: reg.create(g, "beats", 1.0, 0.0, 4.0, Behavior::Linear),
+            band: reg.create(g, "band", 0.0, 0.0, 7.0, Behavior::Linear),
+            beats: reg.create(g, "beats", 1.0, 0.0, 64.0, Behavior::Linear),
+            halve: reg.push(g, "beats_halve"),
+            double: reg.push(g, "beats_double"),
             beats_seen: f64::NAN,
             params: std::array::from_fn(|k| {
                 reg.create(
@@ -547,7 +724,7 @@ impl SlotControls {
             next: reg.push(g, "next_effect"),
             prev: reg.push(g, "prev_effect"),
             clear: reg.push(g, "clear"),
-            edges: [Edge::default(); 3],
+            edges: [Edge::default(); 5],
             kind: None,
             plugin: None,
             num_plugins: reg.indicator("[Master]", "num_plugins", MAX_PLUGINS as f64),
@@ -575,21 +752,12 @@ impl SlotControls {
             self.loaded_effect.set(0.0);
         }
         if step != 0 {
-            // Cycles through the effects, then the plugins; an empty slot
-            // steps to either end.
+            // Steps through the list as it is shown: the effects by kind,
+            // then the plugins; an empty slot steps to either end.
             let plugins = (self.num_plugins.get().round() as usize).min(MAX_PLUGINS);
-            let n = (KINDS.len() + plugins) as i32;
-            let cur = self.loaded_effect.get().round() as i32;
-            let next = if cur == 0 {
-                if step > 0 {
-                    1
-                } else {
-                    n
-                }
-            } else {
-                (cur - 1 + step).rem_euclid(n) + 1
-            };
-            self.loaded_effect.set(next as f64);
+            let cur = self.loaded_effect.get().round().max(0.0) as usize;
+            self.loaded_effect
+                .set(step_effect(cur, step, plugins) as f64);
         }
 
         let kind = Kind::from_loaded(self.loaded_effect.get());
@@ -609,6 +777,9 @@ impl SlotControls {
             }
         }
         if kind != self.kind || (kind.is_none() && plugin.is_none() && self.loaded.get_bool()) {
+            // Switching between effects that both have a length keeps it, as
+            // near as the new effect allows.
+            let had_length = self.kind.and_then(time_parameter).is_some() && self.beats.get() > 0.0;
             self.kind = kind;
             // A newly loaded effect starts from its defaults, then follows meta.
             let defaults = kind.map_or(&[][..], |k| MANIFESTS[k as usize].defaults);
@@ -618,13 +789,13 @@ impl SlotControls {
             self.loaded.set_bool(kind.is_some() || plugin.is_some());
             if plugin.is_none() {
                 self.num_parameters.set(defaults.len() as f64);
-                // The beat switch starts at 1/4 beat, or the nearest length
-                // the effect allows.
-                self.beats.set(if kind.and_then(time_parameter).is_some() {
-                    DEFAULT_BEATS
-                } else {
-                    0.0
-                });
+                // The beat switch starts at 1/4 beat (or keeps the last
+                // effect's length), or the nearest length the effect allows.
+                if kind.and_then(time_parameter).is_none() {
+                    self.beats.set(0.0);
+                } else if !had_length {
+                    self.beats.set(DEFAULT_BEATS);
+                }
                 self.beats_seen = f64::NAN;
             }
             self.meta_seen = f64::NAN;
@@ -633,12 +804,25 @@ impl SlotControls {
         if meta != self.meta_seen {
             self.meta_seen = meta;
             if let Some(k) = kind {
-                for (p, v) in self.params.iter().zip(link(k, meta)) {
+                let linked = if self.beat_fx {
+                    link_beat_fx(k, meta)
+                } else {
+                    link(k, meta)
+                };
+                for (p, v) in self.params.iter().zip(linked) {
                     if let Some(v) = v {
                         p.set(v);
                     }
                 }
             }
+        }
+        // Halving and doubling go through the switch, which keeps the
+        // length within what the effect allows.
+        let halve = self.edges[3].pressed(&self.halve);
+        let double = self.edges[4].pressed(&self.double);
+        let now = self.beats.get();
+        if now > 0.0 && halve != double {
+            self.beats.set(if double { now * 2.0 } else { now / 2.0 });
         }
         let wanted = self.beats.get();
         if wanted != self.beats_seen {
@@ -650,7 +834,10 @@ impl SlotControls {
                     } else {
                         0
                     }
-                    .clamp(lo.max(BEATS_MIN), hi.min(BEATS_MAX));
+                    .clamp(
+                        lo.max(BEATS_MIN),
+                        beat_limit(kind, hi, self.beat_fx).min(BEATS_MAX),
+                    );
                     let p = (power - lo) as f64 / (hi - lo) as f64;
                     self.params[i].set(if inverted { 1.0 - p } else { p });
                     self.beats.set(2f64.powi(power));
@@ -671,6 +858,10 @@ struct UnitControls {
     /// group_[Microphone]_enable and the other inputs' (see
     /// [`crate::inputs::input_group`]).
     routes: [ControlHandle; TARGETS],
+    /// The Beat FX's `route`, one control for its CH SELECT (see
+    /// [`route_targets`]), and its version last applied.
+    route: Option<ControlHandle>,
+    route_seen: u32,
     super_seen: u32,
     /// The unit's own tempo, from `bpm_tap`; 0 follows each target's tempo.
     bpm: ControlHandle,
@@ -681,10 +872,7 @@ struct UnitControls {
     auto: ControlHandle,
     release: ControlHandle,
     edges: [Edge; 3],
-    /// When the last tap came, on the engine clock, and the intervals before it.
-    last_tap: f64,
-    intervals: [f64; TAPS],
-    taps: usize,
+    taps: TapTempo,
 }
 
 impl UnitControls {
@@ -731,7 +919,11 @@ impl UnitControls {
             }
         });
         let super1 = reg.create(g, "super1", 0.0, 0.0, 1.0, Behavior::Linear);
+        let route = (unit == BEAT_FX_UNIT)
+            .then(|| reg.create(g, "route", ROUTE_DECKS_1_2, 0.0, ROUTE_MAIN, Behavior::Free));
         Self {
+            route_seen: route.as_ref().map_or(0, |r| r.version()),
+            route,
             enabled: {
                 let e = reg.toggle(g, "enabled");
                 e.set_bool(true);
@@ -746,10 +938,34 @@ impl UnitControls {
             auto: reg.push(g, "bpm_auto"),
             release: reg.push(g, "release"),
             edges: [Edge::default(); 3],
-            last_tap: f64::NEG_INFINITY,
-            intervals: [0.0; TAPS],
-            taps: 0,
+            taps: TapTempo::default(),
         }
+    }
+
+    /// Applies a new `route` to the routes, or shows the routes in `route`
+    /// when they were changed one by one (by the on-screen buttons).
+    fn update_route(&mut self) {
+        let Some(route) = &self.route else {
+            return;
+        };
+        if route.version() != self.route_seen {
+            if let Some(on) = route_targets(route.get()) {
+                for (t, r) in self.routes.iter().enumerate().take(MAIN + 1) {
+                    r.set_bool(on[t]);
+                }
+            }
+        } else {
+            let on: [bool; MAIN + 1] = std::array::from_fn(|t| self.routes[t].get_bool());
+            if let Some(v) = (0..=ROUTE_MAIN as usize)
+                .map(|v| v as f64)
+                .find(|&v| route_targets(v) == Some(on))
+            {
+                if route.get() != v {
+                    route.set(v);
+                }
+            }
+        }
+        self.route_seen = route.version();
     }
 
     /// Takes in `bpm_tap` and `bpm_auto` presses; `now` is the engine clock
@@ -757,22 +973,36 @@ impl UnitControls {
     fn update_tempo(&mut self, now: f64) {
         if self.edges[1].pressed(&self.auto) {
             self.bpm.set(0.0);
-            self.taps = 0;
+            self.taps = TapTempo::default();
         }
         if self.edges[0].pressed(&self.tap) {
-            let gap = now - self.last_tap;
-            self.last_tap = now;
-            if gap > TAP_GAP || gap <= 0.0 {
-                self.taps = 0;
-                return;
+            if let Some(bpm) = self.taps.tap(tap_time(now, &self.tap)) {
+                self.bpm
+                    .set((bpm.clamp(40.0, 300.0) * 100.0).round() / 100.0);
             }
-            self.intervals.rotate_right(1);
-            self.intervals[0] = gap;
-            self.taps = (self.taps + 1).min(TAPS);
-            let mean = self.intervals[..self.taps].iter().sum::<f64>() / self.taps as f64;
-            self.bpm.set((60.0 / mean).clamp(40.0, 300.0));
         }
     }
+}
+
+/// The Beat FX's `route` values: 0 off, 1 to 4 one deck, 5 decks 1 and 2,
+/// 6 the main mix (MST).
+const ROUTE_DECKS_1_2: f64 = 5.0;
+const ROUTE_MAIN: f64 = 6.0;
+
+/// The decks and the main mix (by target, `MAIN` last) a `route` value
+/// sends the Beat FX to, or `None` for a value that isn't one.
+fn route_targets(route: f64) -> Option<[bool; MAIN + 1]> {
+    let r = route.round();
+    if !(0.0..=ROUTE_MAIN).contains(&r) {
+        return None;
+    }
+    let r = r as usize;
+    Some(std::array::from_fn(|t| match r {
+        0 => false,
+        5 => t < 2,
+        6 => t == MAIN,
+        deck => t + 1 == deck,
+    }))
 }
 
 /// Per-buffer values an effect needs besides its parameters.
@@ -833,6 +1063,13 @@ struct Instance {
     /// Delay memory lent by the rack's [`Pool`] while the instance sounds
     /// (empty when it needs none or is quiet).
     mem: Box<[f32]>,
+    /// The bands the effect works on, as the slot's `band` (see
+    /// [`band_mask`]): 0 is the whole signal.
+    band: u8,
+    rate: f32,
+    /// Splits the input at the channel isolator's crossovers while `band`
+    /// picks some bands.
+    split: Isolator,
     echo: Echo,
     reverb: Reverb,
     filter: Filter,
@@ -850,6 +1087,9 @@ struct Instance {
     ladder: extra::Ladder,
     hall: extra::Hall,
     filter_echo: extra::FilterEcho,
+    tape_echo: remix_fx::TapeEcho,
+    ducker: remix_fx::Ducker,
+    rhythm: remix_fx::Rhythm,
 }
 
 impl Instance {
@@ -866,6 +1106,9 @@ impl Instance {
             release: 0.0,
             release_len: 0.0,
             mem: Box::default(),
+            band: 0,
+            rate: sample_rate,
+            split: Isolator::new(sample_rate as f64),
             echo,
             reverb: Reverb::new(sample_rate),
             filter: Filter::new(sample_rate),
@@ -883,6 +1126,9 @@ impl Instance {
             ladder: extra::Ladder::new(sample_rate),
             hall: extra::Hall::new(sample_rate),
             filter_echo: extra::FilterEcho::new(sample_rate),
+            tape_echo: remix_fx::TapeEcho::new(sample_rate),
+            ducker: remix_fx::Ducker::default(),
+            rhythm: remix_fx::Rhythm::new(sample_rate),
         }
     }
 
@@ -912,6 +1158,51 @@ impl Instance {
         [y[0] * fade, y[1] * fade]
     }
 
+    /// Works on the bands in `mask` from now on (see [`band_mask`]). The
+    /// split starts afresh when it comes into use.
+    fn set_band(&mut self, mask: u8) {
+        if mask != self.band {
+            if self.band == 0 {
+                self.split = Isolator::new(self.rate as f64);
+            }
+            self.band = mask;
+        }
+    }
+
+    /// The part of `x` in the chosen bands, or `None` when the effect works
+    /// on the whole signal. What is left is `x` minus this part, so the bands
+    /// add back up to `x` exactly.
+    #[inline]
+    fn band_part(&mut self, x: [f32; 2]) -> Option<[f32; 2]> {
+        if self.band == 0 {
+            return None;
+        }
+        let bands = self.split.split(x);
+        let mut part = [0.0f32; 2];
+        for (i, b) in bands.iter().enumerate() {
+            if self.band & (1 << i) != 0 {
+                part[0] += b[0];
+                part[1] += b[1];
+            }
+        }
+        Some(part)
+    }
+
+    /// [`Instance::process`] on the chosen bands only, the other bands
+    /// passing through as they are.
+    #[inline]
+    fn process_bands(&mut self, x: [f32; 2]) -> [f32; 2] {
+        match self.band_part(x) {
+            None => self.process(x),
+            // Solo: only the chosen bands play.
+            Some(part) if self.kind == Some(Kind::Solo) => part,
+            Some(part) => {
+                let y = self.process(part);
+                [y[0] + x[0] - part[0], y[1] + x[1] - part[1]]
+            }
+        }
+    }
+
     /// Clears the loaded effect's state so it starts silent, without old tails.
     fn reset(&mut self) {
         match self.kind {
@@ -922,7 +1213,10 @@ impl Instance {
             Some(Kind::Bitcrusher) => self.crusher = Bitcrusher::default(),
             Some(Kind::Phaser) => self.phaser = Phaser::default(),
             Some(Kind::Gate) => self.gate = Gate::default(),
-            Some(Kind::Roll | Kind::RevRoll) => self.roll.reset(),
+            Some(Kind::Roll | Kind::RevRoll) => {
+                self.roll.len = self.mem.len() / 2;
+                self.roll.reset()
+            }
             Some(Kind::EchoOut) => self.echo_out.reset(&mut self.mem),
             Some(Kind::Brake) => self.brake.reset(&mut self.mem),
             Some(Kind::Noise) => self.noise.reset(),
@@ -932,6 +1226,10 @@ impl Instance {
             Some(Kind::Ladder) => self.ladder.reset(),
             Some(Kind::Hall) => self.hall.reset(&mut self.mem),
             Some(Kind::FilterEcho) => self.filter_echo.reset(&mut self.mem),
+            Some(Kind::TapeEcho) => self.tape_echo.reset(&mut self.mem),
+            Some(Kind::Ducker) => self.ducker = remix_fx::Ducker::default(),
+            Some(Kind::Rhythm) => self.rhythm.reset(&mut self.mem),
+            Some(Kind::Solo) => {}
             None => {}
         }
     }
@@ -962,6 +1260,10 @@ impl Instance {
             Some(Kind::Ladder) => self.ladder.prepare(p),
             Some(Kind::Hall) => self.hall.prepare(p),
             Some(Kind::FilterEcho) => self.filter_echo.prepare(p, ctx),
+            Some(Kind::TapeEcho) => self.tape_echo.prepare(p, ctx),
+            Some(Kind::Ducker) => self.ducker.prepare(p, ctx),
+            Some(Kind::Rhythm) => self.rhythm.prepare(p, ctx),
+            Some(Kind::Solo) => {}
             None => {}
         }
     }
@@ -986,6 +1288,11 @@ impl Instance {
             Some(Kind::Ladder) => self.ladder.process(x),
             Some(Kind::Hall) => self.hall.process(&mut self.mem, x),
             Some(Kind::FilterEcho) => self.filter_echo.process(&mut self.mem, x),
+            Some(Kind::TapeEcho) => self.tape_echo.process(&mut self.mem, x),
+            Some(Kind::Ducker) => self.ducker.process(x),
+            Some(Kind::Rhythm) => self.rhythm.process(&mut self.mem, x),
+            // Solo keeps its bands and drops the rest (see `process_bands`).
+            Some(Kind::Solo) => x,
             None => x,
         }
     }
@@ -1014,6 +1321,14 @@ pub(crate) struct EffectRack {
     /// blocks, made up front.
     wet: Vec<[f32; 2]>,
     tails: Vec<[f32; 2]>,
+    /// The bands a plugin slot leaves alone, added back to what it returns.
+    rest: Vec<[f32; 2]>,
+    /// `[Master],fx_release` (held) and `fx_release_mode`, and the main
+    /// mix's brake, spin or cut (see [`RELEASE_ECHO`]).
+    fx_release: ControlHandle,
+    fx_release_mode: ControlHandle,
+    fx_release_edge: Edge,
+    release_stage: ReleaseStage,
     /// Plugin helpers, by instance, as the plugin host attached them.
     attached: Vec<Option<Box<Attached>>>,
     /// Each target's tempo and position, for plugins.
@@ -1040,11 +1355,20 @@ pub(crate) struct EffectRack {
     /// The arpeggiator after them, and this buffer's notes on their way
     /// to it.
     arp: Box<crate::arp::Arp>,
+    /// HOLD while the arpeggiator is off.
+    latch: crate::latch::Latch,
     arp_in: Vec<Midi>,
     scale_mask: u16,
+    /// The scale's root, 0 to 11 from C.
+    scale_root: u8,
+    /// The step sequencer's notes for this buffer (see [`crate::seq`]).
+    seq_notes: Vec<Midi>,
+    /// The notes played on keys and pads this buffer, before scale and
+    /// chord.
+    keys: Vec<Midi>,
     /// What the instrument plays, for its deck to show.
     view: Arc<InstrumentView>,
-    /// Its last [`SCOPE_SAMPLES`] samples (mono), and where the next goes.
+    /// Its last [`WAVE_SAMPLES`] samples (mono), and where the next goes.
     scope_ring: Vec<f32>,
     scope_pos: usize,
     /// The view shows nothing playing.
@@ -1067,7 +1391,10 @@ const SILENCE: f32 = 1e-5;
 /// Bins the instrument's scope shows, each its lowest and highest sample.
 pub const SCOPE_BINS: usize = 128;
 /// Samples the scope spans: about 43 ms at 48 kHz.
-const SCOPE_SAMPLES: usize = SCOPE_BINS * 16;
+pub const SCOPE_SAMPLES: usize = SCOPE_BINS * 16;
+/// Samples the spectrum looks at: about 170 ms at 48 kHz, so its lowest
+/// bands (6 Hz apart) still tell the bass notes apart.
+pub const WAVE_SAMPLES: usize = 8192;
 
 /// What the instrument plays, written on the audio thread each buffer for
 /// the app to show: the notes held and a scope of its sound.
@@ -1075,6 +1402,14 @@ pub struct InstrumentView {
     held: [AtomicU64; 2],
     /// Each bin's lowest then highest sample, as `f32` bits.
     scope: [AtomicU32; 2 * SCOPE_BINS],
+    /// The last [`WAVE_SAMPLES`] samples themselves, oldest first, as
+    /// `f32` bits: for a spectrum.
+    wave: Box<[AtomicU32; WAVE_SAMPLES]>,
+    /// The scope shows the deck's sound after its effects (set by the
+    /// app), not the instrument's own.
+    post: AtomicBool,
+    /// The sample rate the samples come at, as `f32` bits.
+    rate: AtomicU32,
 }
 
 impl Default for InstrumentView {
@@ -1082,6 +1417,9 @@ impl Default for InstrumentView {
         Self {
             held: std::array::from_fn(|_| AtomicU64::new(0)),
             scope: std::array::from_fn(|_| AtomicU32::new(0)),
+            wave: Box::new(std::array::from_fn(|_| AtomicU32::new(0))),
+            post: AtomicBool::new(false),
+            rate: AtomicU32::new(48_000f32.to_bits()),
         }
     }
 }
@@ -1102,6 +1440,73 @@ impl InstrumentView {
                 (v(2 * b), v(2 * b + 1))
             })
             .collect()
+    }
+
+    /// The last [`WAVE_SAMPLES`] samples, oldest first.
+    pub fn wave(&self) -> Vec<f32> {
+        self.wave
+            .iter()
+            .map(|v| f32::from_bits(v.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// The spectrum of [`InstrumentView::wave`] in `bands` bands spaced
+    /// evenly in pitch from 30 Hz to 16 kHz, low first, each 0 (-84 dB or
+    /// quieter) to 1 (full scale). Tilted up 3 dB an octave about 1 kHz,
+    /// as analysers show it, so a mix reads level rather than falling to
+    /// the right.
+    pub fn spectrum(&self, bands: usize) -> Vec<f32> {
+        use rustfft::num_complex::Complex;
+        let wave = self.wave();
+        let n = wave.len();
+        let rate = f32::from_bits(self.rate.load(Ordering::Relaxed)).max(1.0);
+        let mut buf: Vec<Complex<f32>> = wave
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let w = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos();
+                Complex::new(x * w, 0.0)
+            })
+            .collect();
+        rustfft::FftPlanner::new()
+            .plan_fft_forward(n)
+            .process(&mut buf);
+        // A full-scale sine through the Hann window peaks at n / 4.
+        let norm = 4.0 / n as f32;
+        let mag: Vec<f32> = buf[..n / 2].iter().map(|c| c.norm() * norm).collect();
+        let (lo, hi) = (30.0f32, 16_000.0f32.min(rate / 2.0));
+        let bin = |f: f32| (f * n as f32 / rate).clamp(1.0, (n / 2 - 2) as f32);
+        (0..bands)
+            .map(|b| {
+                let at = |t: f32| lo * (hi / lo).powf(t / bands as f32);
+                let (f0, f1) = (at(b as f32), at(b as f32 + 1.0));
+                let (a, z) = (bin(f0), bin(f1));
+                // A band narrower than a bin reads the bins about its
+                // middle (interpolated); a wider one its loudest bin.
+                let peak = if z - a < 1.0 {
+                    let c = bin((f0 * f1).sqrt());
+                    let (i, t) = (c.floor() as usize, c.fract());
+                    mag[i] * (1.0 - t) + mag[i + 1] * t
+                } else {
+                    (a.ceil() as usize..=z.floor() as usize)
+                        .map(|k| mag[k])
+                        .fold(0.0, f32::max)
+                };
+                let tilt = 3.0 * ((f0 * f1).sqrt() / 1000.0).log2();
+                let db = 20.0 * peak.max(1e-9).log10() + tilt;
+                ((db + 84.0) / 84.0).clamp(0.0, 1.0)
+            })
+            .collect()
+    }
+
+    /// Whether the scope follows the deck after its effects (true) or the
+    /// instrument as it plays (false).
+    pub fn set_post(&self, post: bool) {
+        self.post.store(post, Ordering::Relaxed);
+    }
+
+    pub fn post(&self) -> bool {
+        self.post.load(Ordering::Relaxed)
     }
 
     fn set_held(&self, held: u128) {
@@ -1269,11 +1674,17 @@ pub(crate) const PARALLEL: usize = NUM_DECKS;
 
 impl EffectRack {
     pub(crate) fn new(reg: &ControlRegistry, sample_rate: f64) -> Self {
-        Self::with_pool(reg, sample_rate, LONG_BUFFERS, SHORT_BUFFERS)
+        Self::with_pool(reg, sample_rate, HUGE_BUFFERS, LONG_BUFFERS, SHORT_BUFFERS)
     }
 
-    /// A rack whose pool holds `long` and `short` buffers.
-    fn with_pool(reg: &ControlRegistry, sample_rate: f64, long: usize, short: usize) -> Self {
+    /// A rack whose pool holds `huge`, `long` and `short` buffers.
+    fn with_pool(
+        reg: &ControlRegistry,
+        sample_rate: f64,
+        huge: usize,
+        long: usize,
+        short: usize,
+    ) -> Self {
         let sample_rate = sample_rate as f32;
         let (index, n) = instance_indices();
         let (to_engine, from_host) = rtrb::RingBuffer::new(2 * n);
@@ -1294,12 +1705,24 @@ impl EffectRack {
                 std::array::from_fn(|s| SlotControls::create(reg, u, s))
             }),
             instances: (0..n).map(|_| Instance::new(sample_rate)).collect(),
-            pool: Pool::new(sample_rate, long, short),
+            pool: Pool::new(sample_rate, huge, long, short),
             index,
             active: [[false; TARGETS]; NUM_EFFECT_UNITS],
             beats: [None; TARGETS],
             wet: vec![[0.0; 2]; BLOCK * PARALLEL],
             tails: vec![[0.0; 2]; BLOCK * PARALLEL],
+            rest: vec![[0.0; 2]; BLOCK * PARALLEL],
+            fx_release: reg.push("[Master]", "fx_release"),
+            fx_release_mode: reg.create(
+                "[Master]",
+                "fx_release_mode",
+                RELEASE_ECHO as f64,
+                0.0,
+                RELEASE_CUT as f64,
+                Behavior::Linear,
+            ),
+            fx_release_edge: Edge::default(),
+            release_stage: ReleaseStage::new(sample_rate),
             attached: (0..n).map(|_| None).collect(),
             transport: [Transport::default(); TARGETS],
             planar: std::array::from_fn(|_| vec![0.0; BLOCK]),
@@ -1317,10 +1740,14 @@ impl EffectRack {
             note_input: Some(NoteInput { tx: notes_tx }),
             scale: Box::default(),
             arp: Box::default(),
+            latch: crate::latch::Latch::default(),
             arp_in: Vec::with_capacity(opendj_plugin_host::shm::MAX_EVENTS),
             scale_mask: 0,
+            scale_root: 0,
+            seq_notes: Vec::with_capacity(opendj_plugin_host::shm::MAX_EVENTS),
+            keys: Vec::with_capacity(opendj_plugin_host::shm::MAX_EVENTS),
             view: Arc::default(),
-            scope_ring: vec![0.0; SCOPE_SAMPLES],
+            scope_ring: vec![0.0; WAVE_SAMPLES],
             scope_pos: 0,
             view_clear: true,
             instrument_sent: false,
@@ -1341,7 +1768,7 @@ impl EffectRack {
                 self.view_clear = true;
                 self.view.set_held(0);
                 self.scope_ring.fill(0.0);
-                for v in &self.view.scope {
+                for v in self.view.scope.iter().chain(self.view.wave.iter()) {
                     v.store(0, Ordering::Relaxed);
                 }
             }
@@ -1349,20 +1776,43 @@ impl EffectRack {
         };
         self.view_clear = false;
         self.view.set_held(held);
+        if !self.view.post() {
+            self.scope_from(buf);
+        }
+    }
+
+    /// Shows the deck playing the instrument after its effects in the
+    /// scope, while it follows that ([`InstrumentView::set_post`]).
+    pub(crate) fn show_instrument_deck(&mut self, buf: &[[f32; 2]]) {
+        if self.view.post() && !self.view_clear {
+            self.scope_from(buf);
+        }
+    }
+
+    /// Adds `buf` to the scope.
+    fn scope_from(&mut self, buf: &[[f32; 2]]) {
+        self.view
+            .rate
+            .store(self.sample_rate.to_bits(), Ordering::Relaxed);
         for s in buf {
             self.scope_ring[self.scope_pos] = 0.5 * (s[0] + s[1]);
-            self.scope_pos = (self.scope_pos + 1) % SCOPE_SAMPLES;
+            self.scope_pos = (self.scope_pos + 1) % WAVE_SAMPLES;
         }
         let per = SCOPE_SAMPLES / SCOPE_BINS;
         for b in 0..SCOPE_BINS {
             let (mut lo, mut hi) = (f32::MAX, f32::MIN);
             for k in 0..per {
-                let v = self.scope_ring[(self.scope_pos + b * per + k) % SCOPE_SAMPLES];
+                let at = self.scope_pos + WAVE_SAMPLES - SCOPE_SAMPLES + b * per + k;
+                let v = self.scope_ring[at % WAVE_SAMPLES];
                 lo = lo.min(v);
                 hi = hi.max(v);
             }
             self.view.scope[2 * b].store(lo.to_bits(), Ordering::Relaxed);
             self.view.scope[2 * b + 1].store(hi.to_bits(), Ordering::Relaxed);
+        }
+        for (i, v) in self.view.wave.iter().enumerate() {
+            let x = self.scope_ring[(self.scope_pos + i) % WAVE_SAMPLES];
+            v.store(x.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -1378,8 +1828,9 @@ impl EffectRack {
     fn memory_bytes(&self) -> usize {
         let pooled: usize = self
             .pool
-            .long
+            .huge
             .iter()
+            .chain(&self.pool.long)
             .chain(&self.pool.short)
             .map(|b| b.len())
             .sum();
@@ -1395,17 +1846,45 @@ impl EffectRack {
     /// Queues a note for the instrument from the audio thread itself (the
     /// Instrument input's pads).
     pub(crate) fn queue_note(&mut self, data: [u8; 3]) {
-        self.scale.map(
-            Midi { frame: 0, data },
-            self.scale_mask,
-            &mut self.notes_waiting,
-        );
+        // In with the keys, so the arpeggiator, HOLD and the sequencer's
+        // REC take it too.
+        if self.keys.len() < self.keys.capacity() {
+            self.keys.push(Midi { frame: 0, data });
+        }
+    }
+
+    /// Takes the notes played on keys since the last buffer into `keys`.
+    fn take_keys(&mut self) {
+        while self.keys.len() < self.keys.capacity() {
+            match self.notes.pop() {
+                Ok(n) => self.keys.push(n),
+                Err(_) => break,
+            }
+        }
     }
 
     /// The scale notes for the instrument move to from now on: a bit per
     /// pitch class from C, 0 for none (see [`crate::scale`]).
-    pub(crate) fn set_scale(&mut self, mask: u16) {
+    /// `root` is the scale's root, 0 to 11 from C.
+    pub(crate) fn set_scale(&mut self, mask: u16, root: u8) {
         self.scale_mask = mask;
+        self.scale_root = root;
+    }
+
+    /// Runs the step sequencer over this buffer of `frames`, on `target`'s
+    /// beat: its notes go in with the keys' in
+    /// [`EffectRack::start_instrument`].
+    pub(crate) fn sequence(&mut self, seq: &mut crate::seq::Seq, frames: usize, target: usize) {
+        self.take_keys();
+        seq.process(
+            frames,
+            self.sample_rate,
+            self.transport[target],
+            self.scale_root,
+            self.scale_mask,
+            &self.keys,
+            &mut self.seq_notes,
+        );
     }
 
     /// The chord each note plays from now on (see [`crate::scale::chord`]),
@@ -1414,8 +1893,26 @@ impl EffectRack {
         self.scale.set_chord(mode, shape, learn);
     }
 
-    /// The arpeggiator's settings from now on.
+    pub(crate) fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    /// How chords strum and what keys outside the scale do, from now on.
+    pub(crate) fn set_feel(&mut self, feel: crate::scale::Feel) {
+        self.scale.set_feel(feel);
+    }
+
+    /// The arpeggiator's settings from now on. Its `hold` is the
+    /// instrument's HOLD: the arpeggiator's own while it is on, otherwise
+    /// [`crate::latch`] keeps the notes played sounding.
     pub(crate) fn set_arp(&mut self, settings: crate::arp::ArpSettings) {
+        if settings.on {
+            // The arpeggiator ends every note as it starts.
+            self.latch.forget();
+            self.latch.set(false, &mut self.notes_waiting);
+        } else {
+            self.latch.set(settings.hold, &mut self.notes_waiting);
+        }
         self.arp.set(settings, &mut self.notes_waiting);
     }
 
@@ -1445,11 +1942,15 @@ impl EffectRack {
     ) {
         self.instrument_sent = false;
         let cap = self.arp_in.capacity();
-        while let Ok(n) = self.notes.pop() {
+        self.take_keys();
+        for &n in self.keys.iter().chain(&self.seq_notes) {
             if self.arp_in.len() < cap {
                 self.scale.map(n, self.scale_mask, &mut self.arp_in);
             }
         }
+        self.scale.flush(frames, &mut self.arp_in);
+        self.keys.clear();
+        self.seq_notes.clear();
         if self.arp.is_on() {
             self.arp.process(
                 &self.arp_in,
@@ -1459,13 +1960,12 @@ impl EffectRack {
                 &mut self.notes_waiting,
             );
         } else {
-            for &m in &self.arp_in {
-                if self.notes_waiting.len() < self.notes_waiting.capacity() {
-                    self.notes_waiting.push(m);
-                }
-            }
+            self.latch.process(&self.arp_in, &mut self.notes_waiting);
         }
         self.arp_in.clear();
+        // Keys come at the buffer's start, the sequencer's and the
+        // arpeggiator's notes on their steps: the plugin takes them in order.
+        sort_by_frame(&mut self.notes_waiting);
         let Some(a) = self.instrument.as_deref_mut() else {
             self.notes_waiting.clear();
             return;
@@ -1522,9 +2022,12 @@ impl EffectRack {
         let out = a
             .conn
             .collect([&mut out_l[..frames], &mut out_r[..frames]], deadline);
+        // The helper has this block's notes even when its sound comes too
+        // late to play: sending them again would start a note twice, and
+        // its one note off would leave the second voice sounding.
+        let held = held_after(self.view.held(), &self.notes_waiting);
+        self.notes_waiting.clear();
         if out.is_wet() {
-            let held = held_after(self.view.held(), &self.notes_waiting);
-            self.notes_waiting.clear();
             let mut peak = 0.0f32;
             for (f, s) in buf.iter_mut().enumerate() {
                 *s = [out_l[f], out_r[f]];
@@ -1592,12 +2095,28 @@ impl EffectRack {
         self.block_start = std::time::Instant::now();
         self.take_plugin_messages();
         self.legacy.update(&self.units, &self.slots);
+        // `fx_release` lets go of every unit at once, and starts the main
+        // mix's brake, spin or cut.
+        let master_release = self.fx_release_edge.pressed(&self.fx_release);
+        let release_mode = (self
+            .fx_release_mode
+            .get()
+            .round()
+            .clamp(0.0, RELEASE_CUT as f64)) as u8;
+        self.release_stage.held = self.fx_release.get_bool();
+        if master_release {
+            self.release_stage
+                .start(release_mode, beat_seconds[MAIN] as f32);
+        }
+        // A cut stops the effects dead; the other modes let their tails ring.
+        let with_tails = !(master_release && release_mode == RELEASE_CUT);
         for u in 0..NUM_EFFECT_UNITS {
             let unit = &mut self.units[u];
             unit.update_tempo(now);
+            unit.update_route();
             let bpm = unit.bpm.get();
             let beat_seconds = beat_seconds.map(|b| if bpm > 0.0 { 60.0 / bpm } else { b });
-            let release = unit.edges[2].pressed(&unit.release);
+            let release = unit.edges[2].pressed(&unit.release) || master_release;
             let version = unit.super1.version();
             if version != unit.super_seen {
                 // super1 drives every slot's meta knob, as Mixxx's linked super knob does.
@@ -1620,6 +2139,7 @@ impl EffectRack {
                     slot.enabled.set_bool(false);
                 }
                 let enabled = on && slot.enabled.get_bool();
+                let band = band_mask(slot.band.get());
                 let params = slot.params.each_ref().map(|p| p.get() as f32);
                 for (t, &routed) in routed.iter().enumerate() {
                     let Some(i) = self.index[u][s][t] else {
@@ -1627,7 +2147,7 @@ impl EffectRack {
                     };
                     let inst = &mut self.instances[i as usize];
                     // A plugin's tail isn't ours to play: it just fades out.
-                    if releasing && inst.gain > 0.0 && inst.plugin.is_none() {
+                    if releasing && with_tails && inst.gain > 0.0 && inst.plugin.is_none() {
                         // The tail takes over from the effect at once.
                         inst.release = RELEASE_BEATS * (beat_seconds[t] as f32) * self.sample_rate;
                         inst.release_len = inst.release;
@@ -1645,7 +2165,11 @@ impl EffectRack {
                         // Starting afresh: borrow delay memory if the effect
                         // needs it. With the pool empty it stays off, and
                         // tries again next buffer.
-                        let need = kind.map_or(Memory::None, Kind::memory);
+                        let need = match kind.map_or(Memory::None, Kind::memory) {
+                            // The Beat FX's delays reach 16 beats.
+                            Memory::Long if u == BEAT_FX_UNIT => Memory::Huge,
+                            need => need,
+                        };
                         if !self.pool.fits(&inst.mem, need) {
                             let old = std::mem::take(&mut inst.mem);
                             self.pool.give(old);
@@ -1660,6 +2184,9 @@ impl EffectRack {
                         }
                     }
                     inst.target = if on { 1.0 } else { 0.0 };
+                    if same {
+                        inst.set_band(band);
+                    }
                     if !inst.active() && !inst.mem.is_empty() {
                         // Quiet: the memory goes back for another effect.
                         let old = std::mem::take(&mut inst.mem);
@@ -1682,6 +2209,10 @@ impl EffectRack {
                         self.active[u][t] = true;
                     }
                 }
+            }
+            if u == BEAT_FX_UNIT {
+                let slot = &self.slots[u][0];
+                self.mix[u].1 *= beat_fx_wet(slot.kind, slot.meta.get()) as f32;
             }
         }
     }
@@ -1743,6 +2274,7 @@ impl EffectRack {
         let faded = |f: usize| (f + 1) as f32 * step;
         let mut wet = std::mem::take(&mut self.wet);
         let mut tails = std::mem::take(&mut self.tails);
+        let mut rest = std::mem::take(&mut self.rest);
         let span = |k: usize| k * BLOCK..k * BLOCK + frames;
         for u in 0..NUM_EFFECT_UNITS {
             let mut live = [false; PARALLEL];
@@ -1766,7 +2298,7 @@ impl EffectRack {
                     let Some(i) = self.index[u][s][*target] else {
                         continue;
                     };
-                    let inst = &self.instances[i as usize];
+                    let inst = &mut self.instances[i as usize];
                     let Some(plugin) = inst.plugin.filter(|_| inst.active()) else {
                         continue;
                     };
@@ -1780,10 +2312,15 @@ impl EffectRack {
                     {
                         continue;
                     }
+                    // Only the chosen bands go to the plugin; the rest waits
+                    // to be added back to what it returns.
                     let [in_l, in_r, ..] = &mut self.planar;
+                    let rest = &mut rest[span(k)];
                     for (f, w) in wet[span(k)].iter().enumerate() {
-                        in_l[f] = w[0];
-                        in_r[f] = w[1];
+                        let part = inst.band_part(*w).unwrap_or(*w);
+                        in_l[f] = part[0];
+                        in_r[f] = part[1];
+                        rest[f] = [w[0] - part[0], w[1] - part[1]];
                     }
                     sent[k] = a
                         .conn
@@ -1817,7 +2354,7 @@ impl EffectRack {
                     let (g0, g1) = (inst.gain, inst.target);
                     for (f, w) in wet[span(k)].iter_mut().enumerate() {
                         let g = fade(g0, g1, faded(f));
-                        let y = inst.process(*w);
+                        let y = inst.process_bands(*w);
                         for c in 0..2 {
                             w[c] += (y[c] - w[c]) * g;
                         }
@@ -1846,10 +2383,11 @@ impl EffectRack {
                     }
                     let inst = &self.instances[i as usize];
                     let (g0, g1) = (inst.gain, inst.target);
+                    let rest = &rest[span(k)];
                     for (f, w) in wet[span(k)].iter_mut().enumerate() {
                         let g = fade(g0, g1, faded(f));
-                        w[0] += (out_l[f] - w[0]) * g;
-                        w[1] += (out_r[f] - w[1]) * g;
+                        w[0] += (out_l[f] + rest[f][0] - w[0]) * g;
+                        w[1] += (out_r[f] + rest[f][1] - w[1]) * g;
                     }
                 }
             }
@@ -1872,6 +2410,12 @@ impl EffectRack {
         }
         self.wet = wet;
         self.tails = tails;
+        self.rest = rest;
+        for (target, buf) in blocks.iter_mut() {
+            if *target == MAIN {
+                self.release_stage.process(buf);
+            }
+        }
     }
 
     /// Runs frame `f` of a buffer `frames` long of `target` through the units
@@ -1906,7 +2450,7 @@ impl EffectRack {
                     continue;
                 }
                 let g = fade(inst.gain, inst.target, by);
-                let y = inst.process(wet);
+                let y = inst.process_bands(wet);
                 for c in 0..2 {
                     wet[c] += (y[c] - wet[c]) * g;
                 }
@@ -2075,6 +2619,8 @@ impl Echo {
     }
 
     fn reset(&mut self, mem: &mut [f32]) {
+        // As long as the memory lent: two seconds, or more on the Beat FX.
+        self.len = mem.len() / 2;
         mem[..2 * self.len].fill(0.0);
         self.write = 0;
         self.delay = -1.0;
@@ -2102,8 +2648,9 @@ impl Echo {
     }
 
     fn prepare(&mut self, p: &[f32; MAX_PARAMETERS], ctx: Ctx) {
-        // Time: 1/16 to 4 beats (as long as the buffer allows at slow tempos).
-        self.set_time(beats(p[0], -4, 2), ctx);
+        // Time: 1/16 to 16 beats, as long as the buffer allows (deck FX stop
+        // at 4 beats; see [`beat_limit`]).
+        self.set_time(beats(p[0], -4, 4), ctx);
         self.feedback_target = p[1] * 0.9;
         self.pingpong_target = p[2];
         self.send_target = p[3];
@@ -2453,10 +3000,10 @@ impl Flanger {
     }
 
     fn prepare(&mut self, p: &[f32; MAX_PARAMETERS], ctx: Ctx) {
-        // Speed: one sweep every 32 beats down to every half beat, in time
+        // Speed: one sweep every 64 beats down to every half beat, in time
         // with the track and starting on a beat of it. Manual: 0.5..8 ms
         // centre delay.
-        let cycle = beats(1.0 - p[0], -1, 5);
+        let cycle = beats(1.0 - p[0], -1, 6);
         self.step = 1.0 / (cycle * ctx.beat_seconds * ctx.sample_rate);
         lock_to_beat(
             &mut self.phase,
@@ -2589,9 +3136,9 @@ struct Phaser {
 
 impl Phaser {
     fn prepare(&mut self, p: &[f32; MAX_PARAMETERS], ctx: Ctx) {
-        // Speed: one sweep every 32 beats down to every half beat, in time
+        // Speed: one sweep every 64 beats down to every half beat, in time
         // with the track and starting on a beat of it. Stages: 2..12.
-        let cycle = beats(1.0 - p[0], -1, 5);
+        let cycle = beats(1.0 - p[0], -1, 6);
         self.step = 1.0 / (cycle * ctx.beat_seconds * ctx.sample_rate);
         let mut unlocked = !self.locked;
         lock_to_beat(
@@ -2711,8 +3258,8 @@ impl Default for Gate {
 
 impl Gate {
     fn prepare(&mut self, p: &[f32; MAX_PARAMETERS], ctx: Ctx) {
-        // Length: 1/16 to 1 beat per open-and-close.
-        let cycle = beats(p[0], -4, 0);
+        // Length: 1/16 to 16 beats per open-and-close.
+        let cycle = beats(p[0], -4, 4);
         self.step = 1.0 / (cycle * ctx.beat_seconds * ctx.sample_rate);
         lock_to_beat(
             &mut self.phase,
@@ -2784,8 +3331,9 @@ impl Roll {
     }
 
     fn prepare(&mut self, p: &[f32; MAX_PARAMETERS], ctx: Ctx) {
-        // Rate: 0 rolls whole beats, 1 rolls 1/16 beats.
-        let b = beats(1.0 - p[0], -4, 0);
+        // Rate: 0 rolls 16 beats, 1 rolls 1/16 beats (deck FX stop at a
+        // whole beat; see [`beat_limit`]).
+        let b = beats(1.0 - p[0], -4, 4);
         self.slice = ((b * ctx.beat_seconds * ctx.sample_rate) as usize).clamp(64, self.len - 1);
         self.fade = 0.003 * ctx.sample_rate;
         if !self.waiting_set {
@@ -3030,7 +3578,14 @@ impl Spiral {
 /// `[QuickEffectRack1_[ChannelN]],loaded_chain_preset` values 1 and up (0 is
 /// none: the knob does nothing). Each deck picks its own from the menu
 /// beside its filter knob; the DDJ-FLX4's SHIFT + SMART CFX steps both decks.
-pub const COLOR_FX: [&str; 5] = ["Filter", "Space", "Dub Echo", "Noise", "Crush"];
+pub const COLOR_FX: [&str; 6] = ["Filter", "Space", "Dub Echo", "Noise", "Crush", "Pitch"];
+
+/// The `loaded_chain_preset` value of the Pitch Color FX.
+const COLOR_PITCH: usize = 6;
+
+/// How far the Pitch Color FX shifts with the knob all the way round, in
+/// semitones either way: an octave, as on Pioneer mixers.
+const PITCH_CFX_SEMITONES: f64 = 12.0;
 
 /// The Color FX of a `loaded_chain_preset` value ("" for none).
 pub fn color_fx_name(preset: f64) -> &'static str {
@@ -3050,11 +3605,14 @@ const COLOR_TAIL_SECONDS: f32 = 6.0;
 /// low-pass to the left and a high-pass to the right; Space and Dub Echo send
 /// the sound, filtered the same way but more gently, into a reverb or a
 /// tempo-synced echo, more the further the knob turns; Noise adds filtered
-/// white noise; Crush lowers the bit depth and sample rate.
+/// white noise; Crush lowers the bit depth and sample rate; Pitch shifts
+/// the sound down to the left and up to the right, up to an octave, keeping
+/// its tempo.
 pub(crate) struct ColorFx {
     preset: usize,
     sweep: crate::dsp::SweepFilter,
     inst: Instance,
+    pitch: PitchShifter,
     /// How far the knob is from the middle, 0..1, and how much of the effect
     /// (as opposed to plain filtering) is heard, gliding.
     amount: f32,
@@ -3070,6 +3628,7 @@ impl ColorFx {
             preset: 1,
             sweep: crate::dsp::SweepFilter::new(sample_rate),
             inst: Instance::with_memory(sample_rate as f32),
+            pitch: PitchShifter::new(sample_rate as f32),
             amount: 0.0,
             wet: 0.0,
             tail: 0.0,
@@ -3081,6 +3640,7 @@ impl ColorFx {
 
     fn load(&mut self, preset: usize) {
         self.preset = preset;
+        self.pitch.reset();
         self.inst.kind = match preset {
             2 => Some(Kind::Reverb),
             3 => Some(Kind::Echo),
@@ -3113,7 +3673,17 @@ impl ColorFx {
         };
         self.sweep.set(filter_knob);
         if a > 0.005 {
-            self.tail = COLOR_TAIL_SECONDS * self.sample_rate;
+            // Pitch has nothing to ring on: long enough to fade out.
+            let seconds = if preset == COLOR_PITCH {
+                0.25
+            } else {
+                COLOR_TAIL_SECONDS
+            };
+            self.tail = seconds * self.sample_rate;
+        }
+        if preset == COLOR_PITCH {
+            self.pitch
+                .set_semitones((side * 2.0 * PITCH_CFX_SEMITONES) as f32);
         }
         let ctx = Ctx {
             sample_rate: self.sample_rate,
@@ -3139,6 +3709,9 @@ impl ColorFx {
     #[inline]
     pub(crate) fn process(&mut self, x: [f32; 2]) -> [f32; 2] {
         let y = self.sweep.process(x);
+        if self.preset == COLOR_PITCH {
+            return self.process_pitch(y);
+        }
         let Some(kind) = self.inst.kind else {
             return y;
         };
@@ -3165,6 +3738,196 @@ impl ColorFx {
     }
 }
 
+impl ColorFx {
+    /// Pitch: the shifted sound in place of the dry one, faded in over the
+    /// first stretch of the knob so the middle is exactly dry. The shifter
+    /// always hears the deck, so turning the knob starts on what is playing.
+    #[inline]
+    fn process_pitch(&mut self, y: [f32; 2]) -> [f32; 2] {
+        self.pitch.write(y);
+        if self.tail <= 0.0 && self.amount == 0.0 {
+            self.wet = 0.0;
+            return y;
+        }
+        self.tail -= 1.0;
+        let goal = (self.amount / 0.05).min(1.0);
+        self.wet += (goal - self.wet) * 0.002;
+        if (goal - self.wet).abs() < 1e-5 {
+            self.wet = goal;
+        }
+        if self.wet == 0.0 {
+            return y;
+        }
+        let z = self.pitch.read();
+        [
+            y[0] + (z[0] - y[0]) * self.wet,
+            y[1] + (z[1] - y[1]) * self.wet,
+        ]
+    }
+}
+
+/// Samples in the pitch shifter's delay line (a power of two), enough for
+/// its window and search at 192 kHz.
+const PITCH_BUFFER: usize = 16_384;
+
+/// The pitch shifter's window in seconds: long enough for low notes to keep
+/// their body, short enough that the sound stays on the beat.
+const PITCH_WINDOW_SECONDS: f32 = 0.05;
+
+/// How far a pitch shifter head may start further back to line up with the
+/// other, and how much sound it compares to find where, in seconds.
+const PITCH_SEARCH_SECONDS: f32 = 0.015;
+const PITCH_MATCH_SECONDS: f32 = 0.0027;
+
+/// A low-latency pitch shifter for the Pitch Color FX: two read heads move
+/// through a delay line at the new speed, each faded in and out with a
+/// raised cosine half a window apart, so one jumps back while the other is
+/// heard (the classic rotating-head shifter). Each head starts where the
+/// sound best lines up with what the other head is playing, so the two
+/// don't cancel where they cross. The sound keeps its tempo and lags by
+/// less than a window.
+pub(crate) struct PitchShifter {
+    buf: Vec<[f32; 2]>,
+    pos: usize,
+    /// Where the first head is in its window, 0..1; the second is half a
+    /// window on.
+    phase: f32,
+    /// Each head's last phase (to see it wrap) and how much further back it
+    /// started, in samples.
+    last: [f32; 2],
+    offset: [f32; 2],
+    /// Playback speed (2 an octave up), gliding to `target`.
+    ratio: f32,
+    target: f32,
+    window: f32,
+    search: usize,
+    matched: usize,
+    glide: f32,
+}
+
+impl PitchShifter {
+    pub(crate) fn new(sample_rate: f32) -> Self {
+        let window = PITCH_WINDOW_SECONDS * sample_rate;
+        let search = (PITCH_SEARCH_SECONDS * sample_rate) as usize;
+        let matched = (PITCH_MATCH_SECONDS * sample_rate) as usize;
+        assert!(window as usize + search + matched + 8 < PITCH_BUFFER);
+        Self {
+            buf: vec![[0.0; 2]; PITCH_BUFFER],
+            pos: 0,
+            phase: 0.0,
+            last: [0.0, 0.5],
+            offset: [0.0; 2],
+            ratio: 1.0,
+            target: 1.0,
+            window,
+            search,
+            matched,
+            // About 10 ms to glide to a new pitch.
+            glide: 1.0 - (-1.0 / (0.01 * sample_rate)).exp(),
+        }
+    }
+
+    /// Silences the delay line and goes back to no shift.
+    pub(crate) fn reset(&mut self) {
+        self.buf.fill([0.0; 2]);
+        self.phase = 0.0;
+        self.last = [0.0, 0.5];
+        self.offset = [0.0; 2];
+        self.ratio = 1.0;
+        self.target = 1.0;
+    }
+
+    /// The shift to glide to, in semitones.
+    pub(crate) fn set_semitones(&mut self, semitones: f32) {
+        self.target = (semitones / 12.0).exp2();
+    }
+
+    /// Feeds the next frame.
+    #[inline]
+    pub(crate) fn write(&mut self, x: [f32; 2]) {
+        self.pos = (self.pos + 1) & (PITCH_BUFFER - 1);
+        self.buf[self.pos] = x;
+    }
+
+    /// The shifted frame for the last frame written; moves the heads on.
+    #[inline]
+    pub(crate) fn read(&mut self) -> [f32; 2] {
+        self.ratio += (self.target - self.ratio) * self.glide;
+        // A head reading at speed r falls behind (or gains on) the writer
+        // by 1 - r samples a frame.
+        self.phase += (1.0 - self.ratio) / self.window;
+        self.phase -= self.phase.floor();
+        let phases = [self.phase, (self.phase + 0.5).fract()];
+        #[allow(clippy::needless_range_loop)] // both heads are read by index
+        for k in 0..2 {
+            // A head wraps where its gain is nil: start it in step with the other.
+            if (phases[k] - self.last[k]).abs() > 0.5 {
+                let other = 1 - k;
+                let lead = self.delay(phases[other], self.offset[other]);
+                self.offset[k] = self.best_offset(lead, self.delay(phases[k], 0.0));
+            }
+            self.last[k] = phases[k];
+        }
+        let mut out = [0.0; 2];
+        for (&phase, &offset) in phases.iter().zip(&self.offset) {
+            let gain = (PI * phase).sin().powi(2);
+            let y = self.tap(self.delay(phase, offset));
+            out[0] += gain * y[0];
+            out[1] += gain * y[1];
+        }
+        out
+    }
+
+    /// A head's delay in samples at `phase` in its window.
+    #[inline]
+    fn delay(&self, phase: f32, offset: f32) -> f32 {
+        2.0 + offset + phase * self.window
+    }
+
+    /// How much further back than `start` a head should begin so the sound
+    /// there lines up best with the sound at `lead`: the best match of the
+    /// stretch just before each, in steps of two samples.
+    fn best_offset(&self, lead: f32, start: f32) -> f32 {
+        let mask = PITCH_BUFFER - 1;
+        let mono = |delay: usize| {
+            let x = self.buf[self.pos.wrapping_sub(delay) & mask];
+            x[0] + x[1]
+        };
+        let (lead, start) = (lead as usize, start as usize);
+        let mut best = (0, f32::MIN);
+        for c in (0..self.search).step_by(2) {
+            let score: f32 = (0..self.matched)
+                .map(|j| mono(lead + j) * mono(start + c + j))
+                .sum();
+            if score > best.1 {
+                best = (c, score);
+            }
+        }
+        best.0 as f32
+    }
+
+    /// The delay line `delay` samples back, cubic-interpolated.
+    #[inline]
+    fn tap(&self, delay: f32) -> [f32; 2] {
+        let back = delay.floor();
+        let t = delay - back;
+        let mask = PITCH_BUFFER - 1;
+        let i = self.pos.wrapping_sub(back as usize) & mask;
+        // Newer to older: x(-1) is one sample later than x(0).
+        let s = |k: usize| self.buf[k & mask];
+        let (xm1, x0, x1, x2) = (s(i + 1), s(i), s(i.wrapping_sub(1)), s(i.wrapping_sub(2)));
+        let mut out = [0.0; 2];
+        for c in 0..2 {
+            // Catmull-Rom between x0 (t = 0) and x1 (t = 1, one sample older).
+            let c1 = 0.5 * (x1[c] - xm1[c]);
+            let c2 = xm1[c] - 2.5 * x0[c] + 2.0 * x1[c] - 0.5 * x2[c];
+            let c3 = 0.5 * (x2[c] - xm1[c]) + 1.5 * (x0[c] - x1[c]);
+            out[c] = ((c3 * t + c2) * t + c1) * t + x0[c];
+        }
+        out
+    }
+}
+
 /// The 0..1 parameter that [`beats`] reads back as `wanted` beats.
 fn beats_parameter(wanted: f32, lo: i32, hi: i32) -> f32 {
     (wanted.log2() - lo as f32) / (hi - lo) as f32
@@ -3173,8 +3936,17 @@ fn beats_parameter(wanted: f32, lo: i32, hi: i32) -> f32 {
 /// The effects a deck's stems can be sent into, as `[ChannelN],stem_fx`
 /// values 1 and up. One per deck: the stems with their quick effect on
 /// (`[QuickEffectRack1_[ChannelN_StemM]],enabled`) share it, which sounds
-/// the same as one each since both effects are linear.
-pub const STEM_FX: [&str; 2] = ["Echo", "Reverb"];
+/// the same as one each since the effects are linear.
+///
+/// Echo and Reverb add to the stems, which play on dry (muting a sent stem
+/// leaves its echo). Roll and Trans take the sent stems' place: a roll of
+/// them, or them chopped in time, `[ChannelN],stem_fx_beats` long, and
+/// stop as soon as nothing is sent (a controller's drum roll).
+pub const STEM_FX: [&str; 4] = ["Echo", "Reverb", "Roll", "Trans"];
+
+/// `stem_fx` values for Roll and Trans.
+const STEM_ROLL: usize = 3;
+const STEM_TRANS: usize = 4;
 
 /// How long a stem effect rings on once nothing is sent into it, in
 /// seconds, before the deck stops running it.
@@ -3211,12 +3983,18 @@ impl StemFx {
 
     fn load(&mut self, preset: usize) {
         self.preset = preset;
-        self.inst.kind = Some(if preset == 2 {
-            Kind::Reverb
-        } else {
-            Kind::Echo
+        self.inst.kind = Some(match preset {
+            2 => Kind::Reverb,
+            STEM_ROLL => Kind::Roll,
+            STEM_TRANS => Kind::Gate,
+            _ => Kind::Echo,
         });
         self.clear();
+    }
+
+    /// Roll and Trans replace the sent stems rather than adding to them.
+    fn replaces(&self) -> bool {
+        matches!(self.preset, STEM_ROLL | STEM_TRANS)
     }
 
     /// Silences the effect at once, tail and all (a new track).
@@ -3225,9 +4003,10 @@ impl StemFx {
         self.tail = 0.0;
     }
 
-    /// Once per buffer: the chosen effect (`stem_fx`) and the deck's beat
-    /// length in seconds.
-    pub(crate) fn prepare(&mut self, preset: f64, beat_seconds: f64) {
+    /// Once per buffer: the chosen effect (`stem_fx`), the deck's beat
+    /// length in seconds, and how many beats Roll and Trans repeat or chop
+    /// (`stem_fx_beats`, 1/16 to 1).
+    pub(crate) fn prepare(&mut self, preset: f64, beat_seconds: f64, beats: f64) {
         let preset = (preset.round() as usize).clamp(1, STEM_FX.len());
         if preset != self.preset {
             self.load(preset);
@@ -3240,6 +4019,10 @@ impl StemFx {
         let p = match preset {
             // Decay, bandwidth, damping, send: a big, slightly dark hall.
             2 => [0.8, 0.7, 0.35, 1.0],
+            // Rolls read their rate backwards: 1 is the shortest slice.
+            STEM_ROLL => [1.0 - beats_parameter(beats as f32, -4, 4), 0.0, 0.0, 0.0],
+            // Fully shut between beats, open half of each.
+            STEM_TRANS => [beats_parameter(beats as f32, -4, 4), 1.0, 0.5, 0.0],
             // Half a beat, repeats fading over a couple of bars, a little
             // ping-pong, full send.
             _ => [beats_parameter(STEM_ECHO_BEATS, -4, 2), 0.72, 0.25, 1.0],
@@ -3253,6 +4036,7 @@ impl StemFx {
     pub(crate) fn capture_seconds(&self, beat_seconds: f64) -> f64 {
         match self.preset {
             2 => 0.25,
+            STEM_ROLL | STEM_TRANS => 0.0,
             _ => STEM_ECHO_BEATS as f64 * beat_seconds,
         }
     }
@@ -3267,6 +4051,12 @@ impl StemFx {
     pub(crate) fn process(&mut self, x: [f32; 2], sending: bool) -> [f32; 2] {
         if sending {
             self.tail = self.tail_len;
+        } else if self.replaces() {
+            // Nothing to ring on: the stems are back as they were.
+            if self.tail > 0.0 {
+                self.clear();
+            }
+            return [0.0; 2];
         } else if self.tail <= 0.0 {
             return [0.0; 2];
         } else {
@@ -3278,13 +4068,156 @@ impl StemFx {
             }
         }
         let y = self.inst.process(x);
-        // Fades over the last quarter of the tail, so cutting it is silent.
+        // Taking the sent stems out leaves Echo and Reverb's effect alone
+        // (the deck plays the dry stems on), and puts Roll and Trans in
+        // the dry stems' place. Fades over the last quarter of the tail, so cutting it is silent.
         let fade = (self.tail / (0.25 * self.tail_len)).min(1.0);
         [(y[0] - x[0]) * fade, (y[1] - x[1]) * fade]
     }
 }
 
+/// `[Master],fx_release_mode`: how `fx_release` lets go of the effects.
+/// Echo: every effect stops and its echoes and reverb ring out. Brake: the
+/// main mix also slows to a stop over a beat. Spin: it spins back for a beat.
+/// Cut: it is silent while the button is held, and the effects stop dead.
+/// After a brake or a spin the main mix comes back once the button is let go.
+pub const RELEASE_ECHO: u8 = 0;
+pub const RELEASE_BRAKE: u8 = 1;
+pub const RELEASE_SPIN: u8 = 2;
+pub const RELEASE_CUT: u8 = 3;
+
+/// How fast Spin starts backwards, in times normal speed.
+const SPIN_SPEED: f32 = 3.0;
+/// What the main mix keeps of what it played, for a spin back.
+const RELEASE_SECONDS: f32 = 3.0;
+
+/// The main mix as a record on a turntable, for a release's brake, spin or
+/// cut: it always keeps the last few seconds of what played, so it can be
+/// slowed to a stop or spun backwards, then let go.
+struct ReleaseStage {
+    sample_rate: f32,
+    l: Box<[f32]>,
+    r: Box<[f32]>,
+    write: usize,
+    /// What is playing: `RELEASE_BRAKE`, `RELEASE_SPIN` or `RELEASE_CUT`,
+    /// or nothing (the live mix).
+    mode: Option<u8>,
+    /// How far behind the newest sample playback is, its speed (1 normal,
+    /// below 0 backwards) and how much the speed changes each sample.
+    lag: f32,
+    speed: f32,
+    accel: f32,
+    /// The release button is down.
+    held: bool,
+    /// Level of the live mix: down while cut, coming back after a release.
+    live: f32,
+}
+
+impl ReleaseStage {
+    fn new(sample_rate: f32) -> Self {
+        let len = (RELEASE_SECONDS * sample_rate) as usize;
+        Self {
+            sample_rate,
+            l: vec![0.0; len].into_boxed_slice(),
+            r: vec![0.0; len].into_boxed_slice(),
+            write: 0,
+            mode: None,
+            lag: 0.0,
+            speed: 1.0,
+            accel: 0.0,
+            held: false,
+            live: 1.0,
+        }
+    }
+
+    /// Starts a release in `mode`; `beat_seconds` is the main mix's beat.
+    fn start(&mut self, mode: u8, beat_seconds: f32) {
+        let beat = beat_seconds.clamp(0.25, 2.0);
+        match mode {
+            RELEASE_BRAKE => {
+                self.lag = 0.0;
+                self.speed = 1.0;
+                self.accel = -1.0 / (beat * self.sample_rate);
+                self.mode = Some(mode);
+            }
+            RELEASE_SPIN => {
+                // Playback falls behind by about (1 + SPIN_SPEED / 2) times
+                // the spin's length, which what is kept has to hold.
+                let most =
+                    (self.l.len() as f32 - 8.0) / (self.sample_rate * (1.0 + SPIN_SPEED / 2.0));
+                let len = beat.min(most);
+                self.lag = 0.0;
+                self.speed = -SPIN_SPEED;
+                self.accel = SPIN_SPEED / (len * self.sample_rate);
+                self.mode = Some(mode);
+            }
+            RELEASE_CUT => self.mode = Some(mode),
+            _ => {}
+        }
+    }
+
+    /// Plays the main mix through the stage, in place.
+    fn process(&mut self, buf: &mut [[f32; 2]]) {
+        let step = fade_step(self.sample_rate);
+        let len = self.l.len();
+        for x in buf.iter_mut() {
+            self.l[self.write] = x[0];
+            self.r[self.write] = x[1];
+            self.write += 1;
+            if self.write == len {
+                self.write = 0;
+            }
+            match self.mode {
+                None => {
+                    if self.live < 1.0 {
+                        self.live = (self.live + step).min(1.0);
+                        x[0] *= self.live;
+                        x[1] *= self.live;
+                    }
+                }
+                Some(RELEASE_CUT) => {
+                    self.live = (self.live - step).max(0.0);
+                    x[0] *= self.live;
+                    x[1] *= self.live;
+                    if !self.held {
+                        self.mode = None;
+                    }
+                }
+                Some(_) => {
+                    let done = if self.accel < 0.0 {
+                        self.speed <= 0.0
+                    } else {
+                        self.speed >= 0.0
+                    };
+                    if done {
+                        *x = [0.0; 2];
+                        if !self.held {
+                            // Let go: the live mix fades back in.
+                            self.mode = None;
+                            self.live = 0.0;
+                        }
+                        continue;
+                    }
+                    let delay = (1.0 + self.lag).clamp(1.0, (len - 4) as f32);
+                    // Fades the last moment, so the stop doesn't click.
+                    let g = (self.speed.abs() * 20.0).min(1.0);
+                    *x = [
+                        tap(&self.l, self.write, delay) * g,
+                        tap(&self.r, self.write, delay) * g,
+                    ];
+                    self.lag += 1.0 - self.speed;
+                    self.speed += self.accel;
+                }
+            }
+        }
+    }
+}
+
 mod extra;
+pub(crate) mod remix;
+mod remix_fx;
+mod remix_pads;
+mod scenes;
 
 #[cfg(test)]
 mod bench;
@@ -3292,6 +4225,160 @@ mod bench;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_spectrum_peaks_at_a_sine() {
+        let view = InstrumentView::default();
+        for (i, v) in view.wave.iter().enumerate() {
+            let x = 0.5 * (std::f32::consts::TAU * 1000.0 * i as f32 / 48_000.0).sin();
+            v.store(x.to_bits(), Ordering::Relaxed);
+        }
+        let bands = view.spectrum(64);
+        let peak = (0..64)
+            .max_by(|&a, &b| bands[a].total_cmp(&bands[b]))
+            .unwrap();
+        // 30 Hz to 16 kHz in 64 steps: 1 kHz falls in band 35.
+        assert!((34..=36).contains(&peak), "peak in band {peak}");
+        assert!(bands[peak] > 0.85, "about -6 dB: {}", bands[peak]);
+        assert!(bands[5] < 0.5, "quiet far from it");
+    }
+
+    #[test]
+    fn the_spectrum_shows_the_bass() {
+        let view = InstrumentView::default();
+        for (i, v) in view.wave.iter().enumerate() {
+            let x = 0.5 * (std::f32::consts::TAU * 60.0 * i as f32 / 48_000.0).sin();
+            v.store(x.to_bits(), Ordering::Relaxed);
+        }
+        let bands = view.spectrum(64);
+        let peak = (0..64)
+            .max_by(|&a, &b| bands[a].total_cmp(&bands[b]))
+            .unwrap();
+        // 60 Hz is one octave above 30 Hz: band 7 of 64.
+        assert!((6..=8).contains(&peak), "peak in band {peak}");
+        assert!(bands[peak] > 0.7, "loud: {}", bands[peak]);
+        assert!(bands[30] < 0.3, "quiet far above it: {}", bands[30]);
+    }
+
+    #[test]
+    fn effects_step_in_list_order_and_wrap() {
+        for plugins in [0, 3] {
+            let order: Vec<_> = EFFECT_MENU_ORDER
+                .into_iter()
+                .chain(PLUGIN_BASE..PLUGIN_BASE + plugins)
+                .collect();
+            assert_eq!(step_effect(0, 1, plugins), order[0]);
+            assert_eq!(step_effect(0, -1, plugins), *order.last().unwrap());
+            for (i, &id) in order.iter().enumerate() {
+                assert_eq!(step_effect(id, 1, plugins), order[(i + 1) % order.len()]);
+                assert_eq!(
+                    step_effect(id, -1, plugins),
+                    order[(i + order.len() - 1) % order.len()]
+                );
+            }
+        }
+        // Every built-in effect once.
+        let mut sorted = EFFECT_MENU_ORDER;
+        sorted.sort();
+        assert_eq!(
+            sorted.to_vec(),
+            (1..=AVAILABLE_EFFECTS.len()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn halving_and_doubling_stop_at_the_effects_limits() {
+        let reg = ControlRegistry::new();
+        let mut slot = SlotControls::create(&reg, BEAT_FX_UNIT, 0);
+        let c = |k: &str| reg.get("[EffectRack1_EffectUnit5_Effect1]", k).unwrap();
+        let press = |slot: &mut SlotControls, k: &str| {
+            c(k).set_bool(true);
+            slot.update();
+            c(k).set_bool(false);
+            slot.update();
+        };
+        c("loaded_effect").set(1.0);
+        slot.update();
+        c("beats").set(2.0);
+        slot.update();
+        // The Beat FX echo goes on to 16 beats, and stops there.
+        for want in [4.0, 8.0, 16.0, 16.0] {
+            press(&mut slot, "beats_double");
+            assert_eq!(c("beats").get(), want);
+        }
+        c("beats").set(4.0);
+        slot.update();
+        // Flanger goes on to 64.
+        c("loaded_effect").set(4.0);
+        slot.update();
+        for want in [8.0, 16.0, 32.0, 64.0, 64.0] {
+            press(&mut slot, "beats_double");
+            assert_eq!(c("beats").get(), want);
+        }
+        // And down to 1/2 beat.
+        for _ in 0..10 {
+            press(&mut slot, "beats_halve");
+        }
+        assert_eq!(c("beats").get(), 0.5);
+        // Reverb has no length: nothing to halve.
+        c("loaded_effect").set(2.0);
+        slot.update();
+        press(&mut slot, "beats_halve");
+        assert_eq!(c("beats").get(), 0.0);
+    }
+
+    #[test]
+    fn the_beat_fx_route_sets_its_routes_and_follows_them() {
+        let reg = ControlRegistry::new();
+        let mut unit = UnitControls::create(&reg, BEAT_FX_UNIT);
+        let c = |k: &str| reg.get("[EffectRack1_EffectUnit5]", k).unwrap();
+        let routes = || {
+            [
+                "[Channel1]",
+                "[Channel2]",
+                "[Channel3]",
+                "[Channel4]",
+                "[Master]",
+            ]
+            .map(|g| c(&format!("group_{g}_enable")).get_bool())
+        };
+        unit.update_route();
+        // It starts on decks 1 and 2.
+        assert_eq!(c("route").get(), 5.0);
+        assert_eq!(routes(), [true, true, false, false, false]);
+        c("route").set(6.0);
+        unit.update_route();
+        assert_eq!(routes(), [false, false, false, false, true]);
+        c("route").set(2.0);
+        unit.update_route();
+        assert_eq!(routes(), [false, true, false, false, false]);
+        c("route").set(0.0);
+        unit.update_route();
+        assert_eq!(routes(), [false; 5]);
+        // A route button pressed on screen shows in `route`.
+        c("group_[Channel3]_enable").set_bool(true);
+        unit.update_route();
+        assert_eq!(c("route").get(), 3.0);
+        // Deck units have no route.
+        let _deck = UnitControls::create(&reg, 0);
+        assert!(reg.get("[EffectRack1_EffectUnit1]", "route").is_none());
+    }
+
+    #[test]
+    fn the_beat_fx_depth_follows_pioneers_curve() {
+        // Echo is fully wet at the centre and repeats longer past it.
+        let at = |meta| link_beat_fx(Kind::Echo, meta);
+        assert_eq!(at(0.0)[3], Some(0.0));
+        assert_eq!(at(0.5)[3], Some(1.0));
+        assert_eq!(at(1.0)[3], Some(1.0));
+        assert!(at(1.0)[1].unwrap() > at(0.5)[1].unwrap());
+        // Deck FX stay linear.
+        assert_eq!(link(Kind::Echo, 0.5)[3], Some(0.5));
+        // Sweeps are dry fully left and fully wet soon after.
+        assert_eq!(beat_fx_wet(Some(Kind::Flanger), 0.0), 0.0);
+        assert_eq!(beat_fx_wet(Some(Kind::Flanger), 0.25), 1.0);
+        assert_eq!(beat_fx_wet(Some(Kind::Echo), 0.0), 1.0);
+    }
 
     #[test]
     fn held_notes_follow_note_ons_offs_and_all_notes_off() {
@@ -3383,10 +4470,77 @@ mod tests {
         }
     }
 
+    /// The strongest frequency in `x` between 50 and 1000 Hz, to 0.5 Hz.
+    fn frequency(x: &[f32]) -> f32 {
+        let power = |f: f32| {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, v) in x.iter().enumerate() {
+                let w = (TAU * f * i as f32 / SR) as f64;
+                re += *v as f64 * w.cos();
+                im += *v as f64 * w.sin();
+            }
+            re * re + im * im
+        };
+        (100..2000)
+            .map(|k| k as f32 * 0.5)
+            .max_by(|a, b| power(*a).total_cmp(&power(*b)))
+            .unwrap()
+    }
+
+    #[test]
+    fn pitch_shifts_down_to_the_left_and_up_to_the_right() {
+        for (knob, semitones) in [(0.0, -12.0), (0.25, -6.0), (0.75, 6.0), (1.0, 12.0)] {
+            let mut fx = ColorFx::new(SR as f64);
+            fx.prepare(6.0, knob, 0.5);
+            let out: Vec<f32> = (0..SR as usize)
+                .map(|i| fx.process([tone(i); 2])[0])
+                .collect();
+            let got = frequency(&out[SR as usize / 2..]);
+            let want = 220.0 * (semitones as f32 / 12.0).exp2();
+            assert!(
+                (got / want - 1.0).abs() < 0.02,
+                "knob {knob}: {got} Hz, wanted {want}"
+            );
+            // Level stays about the same (no dips where the heads cross).
+            let level = rms(&out[SR as usize / 2..])
+                / rms(&(0..SR as usize / 2).map(tone).collect::<Vec<_>>());
+            assert!((0.9..1.1).contains(&level), "knob {knob}: level {level}");
+        }
+    }
+
+    #[test]
+    fn pitch_glides_back_to_dry_in_the_middle() {
+        let mut fx = ColorFx::new(SR as f64);
+        fx.prepare(6.0, 1.0, 0.5);
+        for i in 0..SR as usize / 4 {
+            fx.process([tone(i); 2]);
+        }
+        fx.prepare(6.0, 0.5, 0.5);
+        let start = SR as usize / 4;
+        let out: Vec<f32> = (start..start + SR as usize / 2)
+            .map(|i| fx.process([tone(i); 2])[0])
+            .collect();
+        // A quarter of a second later it is the dry tone again.
+        let late = &out[SR as usize / 4..];
+        let err = late
+            .iter()
+            .enumerate()
+            .map(|(k, y)| (y - tone(start + SR as usize / 4 + k)).abs())
+            .fold(0.0, f32::max);
+        assert!(err < 1e-4, "still shifted by {err}");
+        // And it got there without a jump.
+        let jump = out
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(jump < 0.1, "a jump of {jump}");
+    }
+
     #[test]
     fn color_fx_names() {
         assert_eq!(color_fx_name(1.0), "Filter");
         assert_eq!(color_fx_name(3.0), "Dub Echo");
+        assert_eq!(color_fx_name(6.0), "Pitch");
         assert_eq!(color_fx_name(0.0), "");
     }
 
@@ -3408,7 +4562,7 @@ mod tests {
                 .unwrap()
                 .get()
         };
-        // Echo: 1/16 to 4 beats, all of them.
+        // Echo on a deck: 1/16 to 4 beats, all of them.
         set("loaded_effect", 1.0);
         slot.update();
         // A new effect starts at 1/4 beat.
@@ -3417,15 +4571,28 @@ mod tests {
             set("beats", want);
             slot.update();
             assert_eq!(get("beats"), want);
-            assert_eq!(beats(get("parameter1") as f32, -4, 2) as f64, want);
+            assert_eq!(beats(get("parameter1") as f32, -4, 4) as f64, want);
         }
+        // Its delay memory stops it at 4 beats.
+        set("beats", 16.0);
+        slot.update();
+        assert_eq!(get("beats"), 4.0);
         // Flanger sweeps 1/2 beat at the shortest; the switch stops there.
         set("loaded_effect", 4.0);
         slot.update();
         set("beats", 0.125);
         slot.update();
         assert_eq!(get("beats"), 0.5);
-        assert_eq!(beats(1.0 - get("parameter1") as f32, -1, 5), 0.5);
+        assert_eq!(beats(1.0 - get("parameter1") as f32, -1, 6), 0.5);
+        // ...and sweeps up to 64 beats.
+        set("beats", 64.0);
+        slot.update();
+        assert_eq!(get("beats"), 64.0);
+        assert_eq!(beats(1.0 - get("parameter1") as f32, -1, 6), 64.0);
+        // Echo after it keeps the length as near as it allows: 4 beats.
+        set("loaded_effect", 1.0);
+        slot.update();
+        assert_eq!(get("beats"), 4.0);
         // Reverb has no length.
         set("loaded_effect", 2.0);
         slot.update();
@@ -3485,7 +4652,10 @@ mod tests {
             unit("bpm_tap").set(0.0);
             rack.prepare(beats, i as f64 * 0.5 + 0.01);
         }
-        assert!((unit("bpm").get() - 120.0).abs() < 1e-6);
+        // A tap's time takes off how long ago the press came in, read on
+        // the wall clock, so a busy machine moves it by a little.
+        let bpm = unit("bpm").get();
+        assert!((bpm - 120.0).abs() < 0.5, "tapped {bpm}");
         unit("bpm_auto").set(1.0);
         rack.prepare(beats, 3.0);
         unit("bpm_auto").set(0.0);
@@ -3576,6 +4746,197 @@ mod tests {
         let off = run(&mut rack, 20);
         assert!(off[FRAMES - 1] > 0.5, "{}", off[FRAMES - 1]);
         assert!(off[fade].abs() < 1e-3, "{}", off[fade]);
+    }
+
+    #[test]
+    fn band_split_adds_back_up_to_the_input() {
+        // No effect loaded passes the chosen bands through as they are: the
+        // bands then add back up to the input, whichever are chosen.
+        for mask in 1..7u8 {
+            let mut inst = Instance::new(SR);
+            inst.set_band(mask);
+            for i in 0..4800 {
+                let v = 0.5 * tone(i) + 0.3 * (i as f32 * 0.9).sin();
+                let y = inst.process_bands([v, -v]);
+                assert!(
+                    (y[0] - v).abs() < 1e-5 && (y[1] + v).abs() < 1e-5,
+                    "mask {mask}"
+                );
+            }
+        }
+        assert_eq!(band_mask(7.0), 0, "all three bands is the whole signal");
+        assert_eq!(band_mask(4.2), 4);
+    }
+
+    #[test]
+    fn a_band_effect_changes_only_its_band() {
+        // A 2-bit Bitcrusher on deck 1, on the highs, the lows or everything.
+        let run = |band: f64, hz: f32| {
+            let reg = ControlRegistry::new();
+            let mut rack = EffectRack::new(&reg, SR as f64);
+            let unit = |k: &str| reg.get("[EffectRack1_EffectUnit1]", k).unwrap();
+            let slot = |s: usize, k: &str| {
+                reg.get(&format!("[EffectRack1_EffectUnit1_Effect{s}]"), k)
+                    .unwrap()
+            };
+            unit("group_[Channel1]_enable").set(1.0);
+            unit("enabled").set(1.0);
+            unit("mix").set(1.0);
+            for s in 1..=3 {
+                slot(s, "enabled").set(0.0);
+            }
+            slot(1, "loaded_effect").set(5.0);
+            let beats = [0.5; TARGETS];
+            rack.prepare(beats, 0.0);
+            slot(1, "parameter1").set(0.0);
+            slot(1, "parameter2").set(1.0);
+            slot(1, "band").set(band);
+            slot(1, "enabled").set(1.0);
+            let mut diff = Vec::new();
+            let mut i = 0usize;
+            for n in 0..200 {
+                rack.prepare(beats, n as f64 * 0.01);
+                let mut buf = [[0.0f32; 2]; 64];
+                let input: Vec<f32> = (0..64)
+                    .map(|f| 0.4 * (TAU * hz * (i + f) as f32 / SR).sin())
+                    .collect();
+                for (b, x) in buf.iter_mut().zip(&input) {
+                    *b = [*x, *x];
+                }
+                rack.process_block(0, &mut buf);
+                rack.finish(64);
+                if n >= 100 {
+                    diff.extend(buf.iter().zip(&input).map(|(b, x)| b[0] - x));
+                }
+                i += 64;
+            }
+            rms(&diff)
+        };
+        let whole_low = run(0.0, 60.0);
+        let high_on_low = run(4.0, 60.0);
+        let high_on_high = run(4.0, 8000.0);
+        let low_on_high = run(1.0, 8000.0);
+        assert!(whole_low > 0.05, "the whole signal is crushed: {whole_low}");
+        assert!(
+            high_on_low < 0.02,
+            "a bass note passes the highs' effect: {high_on_low}"
+        );
+        assert!(high_on_high > 0.05, "the highs are crushed: {high_on_high}");
+        assert!(
+            low_on_high < 0.02,
+            "a high note passes the lows' effect: {low_on_high}"
+        );
+    }
+
+    #[test]
+    fn solo_plays_only_its_bands() {
+        // Solo on the highs of deck 1: a bass note goes quiet, a high one
+        // plays on.
+        let run = |hz: f32| {
+            let reg = ControlRegistry::new();
+            let mut rack = EffectRack::new(&reg, SR as f64);
+            let unit = |k: &str| reg.get("[EffectRack1_EffectUnit1]", k).unwrap();
+            let slot = |s: usize, k: &str| {
+                reg.get(&format!("[EffectRack1_EffectUnit1_Effect{s}]"), k)
+                    .unwrap()
+            };
+            unit("group_[Channel1]_enable").set(1.0);
+            unit("enabled").set(1.0);
+            unit("mix").set(1.0);
+            for s in 1..=3 {
+                slot(s, "enabled").set(0.0);
+            }
+            let solo = AVAILABLE_EFFECTS.iter().position(|&n| n == "Solo").unwrap() + 1;
+            slot(1, "loaded_effect").set(solo as f64);
+            slot(1, "band").set(4.0);
+            slot(1, "enabled").set(1.0);
+            let beats = [0.5; TARGETS];
+            let mut out = Vec::new();
+            let mut i = 0usize;
+            for n in 0..200 {
+                rack.prepare(beats, n as f64 * 0.01);
+                let mut buf = [[0.0f32; 2]; 64];
+                for (f, b) in buf.iter_mut().enumerate() {
+                    let x = 0.4 * (TAU * hz * (i + f) as f32 / SR).sin();
+                    *b = [x, x];
+                }
+                rack.process_block(0, &mut buf);
+                rack.finish(64);
+                if n >= 100 {
+                    out.extend(buf.iter().map(|b| b[0]));
+                }
+                i += 64;
+            }
+            rms(&out)
+        };
+        let input = 0.4 / 2f32.sqrt();
+        assert!(run(60.0) < 0.02 * input, "the bass is gone");
+        assert!(run(8000.0) > 0.9 * input, "the highs play");
+    }
+
+    #[test]
+    fn master_release_brakes_spins_or_cuts_the_main_mix_until_let_go() {
+        // A steady tone on the main mix, 120 BPM (half a second a beat).
+        let run = |mode: u8| {
+            let reg = ControlRegistry::new();
+            let mut rack = EffectRack::new(&reg, SR as f64);
+            let master = |k: &str| reg.get("[Master]", k).unwrap();
+            master("fx_release_mode").set(mode as f64);
+            let beats = [0.5; TARGETS];
+            let mut i = 0usize;
+            let mut buffer = |rack: &mut EffectRack, n: f64| {
+                rack.prepare(beats, n);
+                let mut buf = [[0.0f32; 2]; 480];
+                for b in buf.iter_mut() {
+                    let v = 0.5 * (TAU * 220.0 * i as f32 / SR).sin();
+                    *b = [v, v];
+                    i += 1;
+                }
+                let input = buf;
+                rack.process_block(MAIN, &mut buf);
+                rack.finish(480);
+                (buf.map(|b| b[0]), input.map(|b| b[0]))
+            };
+            for n in 0..20 {
+                let (out, input) = buffer(&mut rack, n as f64 * 0.01);
+                assert_eq!(out, input, "the main mix plays as it is");
+            }
+            master("fx_release").set(1.0);
+            let (first, input) = buffer(&mut rack, 0.2);
+            let first_diff: Vec<f32> = first.iter().zip(&input).map(|(a, b)| a - b).collect();
+            // Held for two beats.
+            let mut held = Vec::new();
+            for n in 0..100 {
+                held = buffer(&mut rack, 0.21 + n as f64 * 0.01).0.to_vec();
+            }
+            master("fx_release").set(0.0);
+            let mut after = (Vec::new(), Vec::new());
+            for n in 0..10 {
+                let (o, i) = buffer(&mut rack, 1.3 + n as f64 * 0.01);
+                after = (o.to_vec(), i.to_vec());
+            }
+            let after_diff: Vec<f32> = after.0.iter().zip(&after.1).map(|(a, b)| a - b).collect();
+            (rms(&first_diff), rms(&held), rms(&after_diff))
+        };
+        let (_, held, after) = run(RELEASE_CUT);
+        assert!(held < 1e-6 && after < 1e-6, "cut: {held} {after}");
+        let (first, held, after) = run(RELEASE_BRAKE);
+        assert!(first > 0.005, "brake: the mix slows at once: {first}");
+        assert!(
+            held < 1e-6 && after < 1e-6,
+            "brake: stopped, then back: {held} {after}"
+        );
+        let (first, held, after) = run(RELEASE_SPIN);
+        assert!(first > 0.1, "spin: the mix runs backwards: {first}");
+        assert!(
+            held < 1e-6 && after < 1e-6,
+            "spin: done, then back: {held} {after}"
+        );
+        let (first, held, after) = run(RELEASE_ECHO);
+        assert!(
+            first < 1e-6 && held > 0.3 && after < 1e-6,
+            "echo leaves the mix alone"
+        );
     }
 
     #[test]

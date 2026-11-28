@@ -8,6 +8,8 @@ import { ApcPicture } from "apc.slint";
 import { ControlKnob, Switch } from "controls.slint";
 export { Switch }
 import { AudioSettings, MenuField, OutputsTable, ExternalOutputsTable, InputsTable } from "mixer.slint";
+import { RoomEqEditor } from "room_eq.slint";
+import { SectionTitle } from "pills.slint";
 
 // One row of a settings page. The app builds the rows for the page shown,
 // or for a search.
@@ -37,7 +39,8 @@ export struct PrefItem {
     // holds one folder only (+ replaces it), `action` "fixed" can't be changed. It presses
     // id + "#add", id + "#remove:" + index and id + "#reveal:" + path, 22
     // how track colors show: the title, then `choices` as segmented
-    // buttons with a small preview of the `chosen` one beside them.
+    // buttons with a small preview of the `chosen` one beside them, 24
+    // the Room EQ editor (room_eq.slint).
     // (18 is a tag group: ↑ (id + "#up", hidden when `action` is
     // "first"), its name to edit in `value` (typing sends id), Several or
     // One tag per track (`choices`, `chosen`), Tags (id + "#open"; `on`
@@ -212,15 +215,15 @@ export component Button inherits Rectangle {
     callback clicked();
     height: 26px;
     min-width: 72px;
-    border-radius: Theme.radius;
+    border-radius: 7px;
     background: primary ? (ta.pressed ? Theme.accent.darker(0.3) : Theme.accent)
-        : ta.pressed ? Theme.control-pressed : ta.has-hover ? Theme.n-2e2e32 : Theme.panel-raised;
+        : ta.pressed ? Theme.control-pressed : ta.has-hover ? Theme.pill-hover : Theme.pill;
     border-width: 1px;
-    border-color: primary ? Theme.accent : Theme.border;
+    border-color: primary ? Theme.accent : ta.has-hover ? Theme.n-48484c : Theme.n-2c2c31;
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
-        Text { text: root.text; color: primary ? #000000 : Theme.text; font-size: 12px; font-weight: primary ? 600 : 500; vertical-alignment: center; horizontal-alignment: center; }
+        Text { text: root.text; color: primary ? Theme.f-000000 : Theme.text; font-size: 12px; font-weight: primary ? 600 : 500; vertical-alignment: center; horizontal-alignment: center; }
     }
     ta := TouchArea {
         mouse-cursor: pointer;
@@ -234,20 +237,19 @@ component Segmented inherits Rectangle {
     in property <int> chosen;
     callback picked(index: int);
     height: 26px;
-    border-radius: Theme.radius;
-    background: Theme.control;
-    border-width: 1px;
-    border-color: Theme.border;
+    // Each choice its own pill, the chosen one lit lilac.
     HorizontalLayout {
-        padding: 2px;
-        spacing: 2px;
+        spacing: 5px;
         for c[i] in choices: Rectangle {
-            border-radius: Theme.radius - 2px;
-            background: i == chosen ? Theme.n-3a3a3d : sta.has-hover ? Theme.n-222225 : transparent;
+            border-radius: 7px;
+            background: sta.pressed ? Theme.control-pressed : sta.has-hover ? Theme.pill-hover : Theme.pill;
+            border-width: 1px;
+            border-color: i == chosen ? Theme.pill-on-border : sta.has-hover ? Theme.n-48484c : Theme.n-2c2c31;
+            animate border-color { duration: 120ms; }
             HorizontalLayout {
                 padding-left: 10px;
                 padding-right: 10px;
-                Text { text: c; color: i == chosen ? Theme.text : Theme.text-dim; font-size: 12px; font-weight: i == chosen ? 600 : 400; vertical-alignment: center; horizontal-alignment: center; }
+                Text { text: c; color: i == chosen ? Theme.lilac-text : Theme.pill-off-text; font-size: 12px; font-weight: 500; vertical-alignment: center; horizontal-alignment: center; }
             }
             sta := TouchArea {
                 mouse-cursor: pointer;
@@ -310,7 +312,7 @@ component KeyButton inherits Rectangle {
     width: 130px;
     height: 28px;
     border-radius: Theme.radius;
-    background: listening ? #2a2440 : ta.has-hover ? Theme.n-222225 : Theme.well;
+    background: listening ? Theme.f-2a2440 : ta.has-hover ? Theme.n-222225 : Theme.well;
     border-width: 1px;
     border-color: listening ? Theme.accent : Theme.separator;
     Text {
@@ -347,7 +349,7 @@ component ScriptField inherits Rectangle {
     border-radius: Theme.radius;
     background: Theme.well;
     border-width: 1px;
-    border-color: item.on ? #ff6b6b : input.has-focus ? Theme.accent : Theme.separator;
+    border-color: item.on ? Theme.f-ff6b6b : input.has-focus ? Theme.accent : Theme.separator;
     if input.text == "": Text {
         x: 8px;
         text: "Type an action…";
@@ -381,7 +383,7 @@ component FilterChipButton inherits Rectangle {
     border-color: on ? Theme.accent : Theme.border;
     label := Text {
         text: root.text;
-        color: on ? #000000 : Theme.text;
+        color: on ? Theme.f-000000 : Theme.text;
         font-size: 12px;
         font-weight: 600;
         vertical-alignment: center;
@@ -679,7 +681,7 @@ component StorageButton inherits Rectangle {
     height: 24px;
     border-radius: Theme.radius;
     border-width: 1px;
-    border-color: warn ? #ff9f0a : Theme.border;
+    border-color: warn ? Theme.f-ff9f0a : Theme.border;
     background: ta.pressed ? Theme.control-pressed : ta.has-hover ? Theme.n-2a2a2e : Theme.control;
     label := Text { text: root.text; color: warn ? Theme.c-ff9f0a : Theme.text; font-size: 12px; }
     ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
@@ -726,11 +728,11 @@ component StorageView inherits VerticalLayout {
                 height: StorageUi.actions.length * 26px + 12px;
                 close-policy: close-on-click-outside;
                 Rectangle {
-                    background: Theme.panel-raised;
-                    border-radius: Theme.radius;
+                    background: Theme.pill-list;
+                    border-radius: 9px;
                     border-width: 1px;
                     border-color: Theme.border;
-                    drop-shadow-blur: 12px;
+                    drop-shadow-blur: 14px;
                     drop-shadow-color: Theme.s-000000a0;
                 }
                 VerticalLayout {
@@ -738,7 +740,7 @@ component StorageView inherits VerticalLayout {
                     for a[i] in StorageUi.actions: Rectangle {
                         height: 26px;
                         border-radius: 4px;
-                        background: ata.has-hover ? Theme.n-3a3a3d : transparent;
+                        background: ata.has-hover ? Theme.n-38373d : transparent;
                         Text { x: 8px; text: a; color: Theme.text; font-size: 12px; vertical-alignment: center; height: parent.height; }
                         ata := TouchArea { mouse-cursor: pointer; clicked => { Preferences.picked(item.id, i); menu.close(); } }
                     }
@@ -786,8 +788,8 @@ component StorageView inherits VerticalLayout {
     if StorageUi.confirm != "": Rectangle {
         border-radius: Theme.radius;
         border-width: 1px;
-        border-color: #ff9f0a80;
-        background: #ff9f0a14;
+        border-color: Theme.f-ff9f0a80;
+        background: Theme.f-ff9f0a14;
         HorizontalLayout {
             padding: 10px;
             spacing: 10px;
@@ -815,8 +817,8 @@ component StorageView inherits VerticalLayout {
 component TrackColorPreview inherits Rectangle {
     in property <int> mode;
     property <[{title: string, artist: string, tint: color}]> rows: [
-        { title: "Sunrise", artist: "Artist", tint: #ff9f0a },
-        { title: "Night Drive", artist: "Artist", tint: #b69cff },
+        { title: "Sunrise", artist: "Artist", tint: Theme.f-ff9f0a },
+        { title: "Night Drive", artist: "Artist", tint: Theme.f-b69cff },
     ];
     width: 240px;
     height: 52px;
@@ -897,12 +899,8 @@ export component PrefRow inherits Rectangle {
                 fill: transparent;
                 commands: item.action == "open" ? "M 1.5 3.5 L 5 7 L 8.5 3.5" : "M 3.5 1.5 L 7 5 L 3.5 8.5";
             }
-            Text {
-                text: item.title;
-                color: Theme.text-dim;
-                font-size: 11px;
-                font-weight: 600;
-                letter-spacing: 0.6px;
+            SectionTitle {
+                title: item.title;
                 horizontal-stretch: 1;
             }
         }
@@ -926,6 +924,7 @@ export component PrefRow inherits Rectangle {
             if item.title != "": VerticalLayout {
                 alignment: start;
                 MenuField {
+                    title: item.title;
                     width: 96px;
                     text: "Actions";
                     choices: item.choices;
@@ -978,7 +977,7 @@ export component PrefRow inherits Rectangle {
                     background: item.on || item.value == "some" ? Theme.accent : transparent;
                     Text {
                         text: item.on ? "✓" : item.value == "some" ? "–" : "";
-                        color: #000000;
+                        color: Theme.f-000000;
                         font-size: 11px;
                         font-weight: 700;
                         horizontal-alignment: center;
@@ -1048,7 +1047,7 @@ export component PrefRow inherits Rectangle {
                     width: 8px;
                     height: 8px;
                     border-radius: 4px;
-                    background: item.chosen == 1 ? #30c158 : item.chosen == 2 ? #ff9f0a : Theme.n-4a4a4f;
+                    background: item.chosen == 1 ? Theme.f-30c158 : item.chosen == 2 ? Theme.f-ff9f0a : Theme.n-4a4a4f;
                 }
             }
             Text {
@@ -1133,6 +1132,7 @@ export component PrefRow inherits Rectangle {
             if item.kind == 1: VerticalLayout {
                 alignment: center;
                 MenuField {
+                    title: item.title;
                     width: 260px;
                     text: item.value != "" ? item.value : item.choices[item.chosen];
                     choices: item.choices;
@@ -1167,6 +1167,7 @@ export component PrefRow inherits Rectangle {
                 if item.choices2.length > 0: VerticalLayout {
                     alignment: center;
                     MenuField {
+                        title: "Deck";
                         width: 128px;
                         opacity: item.on ? 1 : 0.4;
                         text: item.choices2[item.chosen2];
@@ -1179,6 +1180,7 @@ export component PrefRow inherits Rectangle {
                 VerticalLayout {
                     alignment: center;
                     MenuField {
+                        title: "Mapping";
                         width: 240px;
                         opacity: item.on ? 1 : 0.4;
                         text: item.choices[item.chosen];
@@ -1253,6 +1255,7 @@ export component PrefRow inherits Rectangle {
                 VerticalLayout {
                     alignment: center;
                     MenuField {
+                        title: item.title;
                         width: 110px;
                         text: item.choices[item.chosen];
                         choices: item.choices;
@@ -1272,6 +1275,7 @@ export component PrefRow inherits Rectangle {
                 VerticalLayout {
                     alignment: center;
                     MenuField {
+                        title: item.title;
                         width: 260px;
                         text: item.choices[item.chosen];
                         choices: item.choices;
@@ -1332,13 +1336,14 @@ export component PrefRow inherits Rectangle {
         if item.kind == 4 && !AudioSettings.external: OutputsTable { roomy: true; bright: bright; }
         if item.kind == 4 && AudioSettings.external: ExternalOutputsTable { bright: bright; }
         if item.kind == 13: InputsTable { }
+        if item.kind == 24: RoomEqEditor { }
         if item.kind == 5: HorizontalLayout {
             alignment: start;
             spacing: 36px;
             padding-top: 4px;
-            ControlKnob { group: "[Master]"; key: "headMix"; label: "CUE MIX"; bipolar: true; size: 36px; }
-            ControlKnob { group: "[Master]"; key: "headGain"; label: "CUE LEVEL"; size: 36px; }
-            ControlKnob { group: "[Master]"; key: "booth_gain"; label: "BOOTH"; size: 36px; }
+            ControlKnob { group: "[Master]"; key: "headMix"; label: "Cue Mix"; bipolar: true; size: 36px; look: 4; arc-color: Theme.accent; }
+            ControlKnob { group: "[Master]"; key: "headGain"; label: "Cue Level"; size: 36px; look: 4; arc-color: Theme.accent; }
+            ControlKnob { group: "[Master]"; key: "booth_gain"; label: "Booth"; size: 36px; look: 4; arc-color: Theme.accent; }
         }
     }
     // A thin line under each row, as between rows of a settings list.
@@ -1351,7 +1356,7 @@ export component CloseButton inherits Rectangle {
     width: 26px;
     height: 26px;
     border-radius: 13px;
-    background: ta.has-hover ? Theme.n-3a3a3d : transparent;
+    background: ta.has-hover ? Theme.n-38373d : transparent;
     Path {
         width: 10px;
         height: 10px;

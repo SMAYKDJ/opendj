@@ -23,7 +23,7 @@ use opendj_controllers::own::{self, OwnMapping};
 use opendj_controllers::probe::{message_key, MessageKey};
 use opendj_controllers::view::{self, LightRow, MappingView, Row};
 use opendj_controllers::{is_own_file, Controllers, MappingChoice};
-use opendj_controllers::{pickup, support};
+use opendj_controllers::{jog_feel, pickup, support};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::{
@@ -498,6 +498,9 @@ impl Editor {
             return;
         };
         let g = app.global::<ControllerEditor>();
+        // A HID mapping is all script: shown, never copied or changed.
+        let hid = base.ends_with(".hid.xml");
+        g.set_hid(hid);
         if is_own_file(base) {
             // One that stands alone: there's no original to go back to.
             let id = base.trim_end_matches(".json");
@@ -528,11 +531,17 @@ impl Editor {
             settings::controller_version(base).filter(|id| self.own.iter().any(|m| &m.id == id));
         let mut items: Vec<SharedString> = vec!["Original mapping".into()];
         items.extend(self.own.iter().map(|m| SharedString::from(m.name.as_str())));
-        self.actions = vec![Action::Duplicate];
+        self.actions = if hid {
+            Vec::new()
+        } else {
+            vec![Action::Duplicate]
+        };
         if self.version.is_some() {
             self.actions.extend([Action::Rename, Action::Delete]);
         }
-        self.actions.push(Action::Import);
+        if !hid {
+            self.actions.push(Action::Import);
+        }
         if self.version.is_some() {
             self.actions.extend([Action::Export, Action::ExportMixxx]);
         }
@@ -1253,6 +1262,7 @@ impl Editor {
             return;
         };
         let b = Binding::of(row);
+        let hid_row = row.keys.first().is_some_and(|k| k.0 == view::HID_STATUS);
         g.set_editing(true);
         g.set_edit_control(
             if row.layer.is_empty() {
@@ -1270,7 +1280,7 @@ impl Editor {
             .is_some_and(|s| !s.is_control() && s.action.is_none());
         g.set_edit_function(
             match (&b.control, script) {
-                _ if row.off => row.function.name.clone(),
+                _ if row.off || hid_row => row.function.name.clone(),
                 (Some(_), _) => row.function.name.clone(),
                 (None, true) => format!("{} (by the script)", row.function.name),
                 (None, false) => "Does nothing".to_string(),
@@ -1345,7 +1355,13 @@ impl Editor {
         g.set_edit_edited(row.edited);
         g.set_edit_enabled(!row.off && first.is_some());
         let mut hint = Vec::new();
-        if row.off {
+        if hid_row {
+            hint.push(
+                "A USB HID controller: its mapping's script does this, and it can't be \
+                 remapped here."
+                    .to_string(),
+            );
+        } else if row.off {
             hint.push(if row.note.is_empty() {
                 "Kept from the import but not working yet.".to_string()
             } else {
@@ -1678,7 +1694,7 @@ impl Editor {
 
     /// The Options tab's first rows: two decks or four and the deck order,
     /// for a mapping with a layout for each, and how knobs and faders take
-    /// over on the controllers running it.
+    /// over and how the jog wheels feel on the controllers running it.
     fn playing(&self) {
         let Some(app) = self.app.upgrade() else {
             return;
@@ -1726,6 +1742,25 @@ impl Editor {
                 choices: strings(&["Pick-up", "Scale"]),
                 chosen: pickup::scale(&opendj_controllers::device_key(port)) as i32,
             });
+            let feel = jog_feel::feel(&opendj_controllers::device_key(port));
+            rows.push(EditorSetting {
+                id: "jog_bend".into(),
+                label: "Pitch bend".into(),
+                detail: "How much turning a jog wheel's rim speeds the track up or slows \
+                         it down. Fine suits small beatmatching nudges."
+                    .into(),
+                choices: strings(&jog_feel::BEND_CHOICES),
+                chosen: feel.bend as i32,
+            });
+            rows.push(EditorSetting {
+                id: "jog_scratch".into(),
+                label: "Scratch".into(),
+                detail: "How closely the track follows your hand on the platter. Tight \
+                         answers quick cuts sooner; Loose is smoother on long pushes."
+                    .into(),
+                choices: strings(&jog_feel::SCRATCH_CHOICES),
+                chosen: feel.scratch as i32,
+            });
         }
         g.set_playing(ModelRc::new(VecModel::from(rows)));
     }
@@ -1744,6 +1779,21 @@ impl Editor {
                 let key = opendj_controllers::device_key(&port);
                 pickup::set_scale(&key, index == 1);
                 settings::set_controller_scaled(&key, index == 1);
+            }
+            self.playing();
+            return;
+        }
+        if id == "jog_bend" || id == "jog_scratch" {
+            for port in self.live_ports() {
+                let key = opendj_controllers::device_key(&port);
+                let mut feel = jog_feel::feel(&key);
+                if id == "jog_bend" {
+                    feel.bend = index;
+                } else {
+                    feel.scratch = index;
+                }
+                jog_feel::set_feel(&key, feel);
+                settings::set_controller_jog_feel(&key, jog_feel::feel(&key));
             }
             self.playing();
             return;

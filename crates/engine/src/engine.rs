@@ -18,13 +18,15 @@ use crate::controls::{
     SCULPT_DEFAULTS,
 };
 use crate::dsp::{soft_clip, Isolator, Limiter, Sculpt};
+use crate::effects::remix::{self, RemixControls, RemixDeck, Source};
 use crate::effects::{
-    fade, fade_step, input_target, ColorFx, EffectRack, StemFx, BLOCK, COLOR_FX, MAIN, TAPS,
-    TAP_GAP, TARGETS,
+    fade, fade_step, input_target, ColorFx, EffectRack, StemFx, BLOCK, COLOR_FX, MAIN, TARGETS,
 };
+use crate::gridfit::GridMode;
 use crate::groove::{pick_source, GrooveBox};
 use crate::inputs::{
     Ducker, Input, InputFeed, Routing, AUXILIARIES, INSTRUMENT, MICROPHONE, MIXER, NUM_INPUTS,
+    SESSION,
 };
 use crate::key::{self, Key};
 use crate::keyshift::{transpose_factor, KeyShifter, MAX_RATE};
@@ -33,8 +35,10 @@ use crate::looper::{Heard, LooperIntake, Loopers};
 use crate::midi_clock::LeaderSource;
 use crate::preview::{Preview, PreviewInput};
 use crate::recorder::{self, Feed, RecordTap};
+use crate::room_eq::{RoomEq, RoomEqControls};
 use crate::sampler::{SamplerInput, Samplers};
 use crate::stems::{Stems, MAX_STEMS};
+use crate::tap_tempo::{tap_time, TapTempo};
 use crate::track::{Audio, Track};
 use crate::visual::VisualPositions;
 use crate::{NUM_DECKS, NUM_HOTCUES};
@@ -94,8 +98,20 @@ impl EngineInput {
     }
 }
 
-/// Track seconds one unit of `jog` moves the play position by.
+/// Track seconds one unit of `jog_search` moves the play position by.
 const JOG_SECONDS: f64 = 0.01;
+/// `jog` works as in Mixxx (RateControl::getJogFactor): each unit adds a
+/// tenth of itself to the speed for one engine block, averaged over the
+/// last 25 blocks. Counted in 10 ms blocks, as `jog_bend` is, that is this
+/// many times normal speed for each unit a second: a unit moves a playing
+/// deck 1 ms further, and can play it backwards.
+const JOG_RATE: f64 = 0.001;
+/// A paused deck moves this many times further per `jog` unit (Mixxx's
+/// kPausedJogMultiplier): 18 ms a unit.
+const JOG_PAUSED: f64 = 18.0;
+/// Seconds `jog` is averaged over, like Mixxx's 25-block moving average
+/// (an exponential average this long lags the same).
+const JOG_SMOOTH: f64 = 0.125;
 /// Seconds over which a jog movement is spread, so a turning wheel bends smoothly.
 const JOG_SPREAD: f64 = 0.05;
 /// The SLICER's section, in beats: one beat on each of the 8 pads.
@@ -109,15 +125,20 @@ const JOG_SEARCH_SPEED: f64 = 8.0;
 /// so it doesn't flutter between wheel steps.
 const JOG_SEARCH_HOLD: f64 = 0.15;
 /// `jog_bend` comes in ticks of a jog's rim, 720 to a turn as on Pioneer
-/// controllers. As in Mixxx, where a rim tick is a `jog` of 0.8 and a jog
-/// adds a tenth of itself to the rate: each tick a second the rim turns adds
-/// 0.08% of normal speed (a quarter turn a second is about +14%).
-const BEND_PER_TICK_PER_SECOND: f64 = 0.0008;
+/// controllers: each tick a second the rim turns adds 0.014% of normal speed
+/// (a quarter turn a second is about +2.5%, a turn a second +10%), gentle
+/// enough to beatmatch by hand. (It was 0.08%, Mixxx's, which overshoots.)
+const BEND_PER_TICK_PER_SECOND: f64 = 0.00014;
 /// Seconds the rim's speed is averaged over, like Mixxx's jog filter: the
 /// bend follows the hand smoothly and springs back once the rim stops.
 const BEND_SMOOTH: f64 = 0.15;
-/// Track seconds one rim tick moves a paused deck by.
-const BEND_PAUSED_SECONDS: f64 = 0.008;
+/// Rim ticks to a full turn of a jog (Pioneer's 720).
+const RIM_TICKS_PER_TURN: f64 = 720.0;
+/// A full turn of the rim moves a paused deck by one bar of the track, as
+/// in other DJ software; a track without a tempo moves as a 33⅓ rpm record
+/// does, 1.8 s a turn.
+const BEND_PAUSED_BEATS_PER_TURN: f64 = 4.0;
+const BEND_PAUSED_SECONDS_PER_TURN: f64 = 1.8;
 /// How long a clip lights a PeakIndicator, in seconds.
 const PEAK_HOLD: f32 = 0.5;
 /// A control set to a value that is used once, put back to 0.
@@ -138,6 +159,24 @@ const RATE_RESET_SPEED: f64 = 0.005;
 
 /// A live input's safety ceiling: -1 dBTP.
 const LIVE_CEILING: f32 = 0.891_250_9;
+
+#[derive(Clone, Copy)]
+struct HotcueLaunch {
+    pad: usize,
+    position: f64,
+    end: Option<f64>,
+    slip: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingHotcue {
+    launch: HotcueLaunch,
+    at: f64,
+    /// `play` and `cue_default` versions when it was queued: a pause, play or
+    /// CUE press while it waits cancels it.
+    play: u32,
+    cue: u32,
+}
 
 /// Left and right gains for balance `pan` (-1 left, 1 right): the side
 /// moved away from fades, the other stays, so the middle is unchanged.
@@ -165,31 +204,6 @@ pub(crate) fn xfader_gains(x: f32, shape: u8, cut_in: f32) -> [f32; 2] {
     }
 }
 
-/// Tap tempo: taps in time give a tempo, averaged over the last few.
-#[derive(Default)]
-struct TapTempo {
-    last: Option<f64>,
-    intervals: [f64; TAPS],
-    taps: usize,
-}
-
-impl TapTempo {
-    /// A tap at `now` seconds; the tapped BPM once there are two in time.
-    fn tap(&mut self, now: f64) -> Option<f64> {
-        let gap = self.last.map_or(f64::INFINITY, |last| now - last);
-        self.last = Some(now);
-        if gap > TAP_GAP || gap <= 0.0 {
-            self.taps = 0;
-            return None;
-        }
-        self.intervals.rotate_right(1);
-        self.intervals[0] = gap;
-        self.taps = (self.taps + 1).min(TAPS);
-        let mean = self.intervals[..self.taps].iter().sum::<f64>() / self.taps as f64;
-        Some(60.0 / mean)
-    }
-}
-
 struct Deck {
     c: DeckControls,
     track: Option<Arc<Track>>,
@@ -209,9 +223,16 @@ struct Deck {
     /// `clock` at the last buffer's controls.
     last_clock: f64,
     taps: TapTempo,
+    /// When this buffer's `bpm_tap` press came, on the engine clock.
+    tap_at: f64,
+    /// The track tempo the taps last set, so a tap that changes nothing
+    /// leaves the grid (and its undo) alone.
+    tapped: Option<f64>,
     /// The `bpmlock` version last seen, so the DJ turning it is told apart
     /// from the engine showing a loaded track's lock.
     bpmlock_seen: u32,
+    /// The `beats_mode` version last seen, likewise.
+    beats_mode_seen: u32,
     /// The metronome: the last grid beat it passed, and the click playing
     /// (samples into it, and its pitch).
     metronome_beat: f64,
@@ -219,8 +240,13 @@ struct Deck {
     /// Playback speed reached at the end of the last buffer, in multiples of
     /// normal speed; negative plays backwards.
     velocity: f64,
-    /// Jog movement still to be applied, in track seconds.
+    /// Fast-search movement (`jog_search`) still to be applied, in track
+    /// seconds.
     jog_pending: f64,
+    /// `jog` units that came in since the last buffer.
+    jog_in: f64,
+    /// `jog`, smoothed, in units a second.
+    jog_rate: f64,
     /// Seconds the deck stays quiet for after a fast-search jog.
     search_quiet: f64,
     /// How fast the jog's rim is turning, smoothed, in ticks per second.
@@ -234,6 +260,12 @@ struct Deck {
     /// The hot cue held in slip mode: it plays from its point while held and
     /// the track carries on from the silent playhead when it is let go.
     slip_cue: Option<usize>,
+    /// A hot cue pressed this buffer, resolved against the other deck after
+    /// every deck has read its controls.
+    hotcue_request: Option<HotcueLaunch>,
+    /// A hot cue whose nearest quantize point is still ahead. The old audio
+    /// keeps playing (or a stopped deck stays stopped) until that point.
+    pending_hotcue: Option<PendingHotcue>,
     rolling: bool,
     /// SLICER: the grid beat its 8-beat section starts on, while it is on.
     slicer: Option<f64>,
@@ -257,6 +289,8 @@ struct Deck {
     eject_edge: Edge,
     sync_edge: Edge,
     was_synced: bool,
+    /// Playing when sync last looked, so `sync_on_play` sees PLAY pressed.
+    played_for_sync: bool,
     /// Followed a synced leader last buffer.
     following: bool,
     /// While following a sync leader: the speed that matches it, which may
@@ -311,6 +345,9 @@ struct Deck {
     file_key: Option<Key>,
     /// Plays the deck through the time-stretcher with key lock or a key shift.
     shifter: KeyShifter,
+    /// Seconds the running stretcher has had no work to do (see
+    /// [`SHIFT_LINGER_SECONDS`]).
+    shift_idle: f64,
     /// This buffer's audio from the shifter, when it is in use.
     shifted: Vec<[f32; 2]>,
     /// Low-pass state that softens fast waveform scrubbing.
@@ -377,6 +414,60 @@ impl Deck {
         self.last_written_position = self.c.playposition.get();
     }
 
+    /// Moves the play position to `seconds` for a jump (a hot cue, the
+    /// cue point, a seek): a jump out of an active loop ends it, as in
+    /// Mixxx, rather than the loop pulling the playhead back in.
+    fn seek(&mut self, seconds: f64) {
+        self.set_seconds(seconds);
+        if self.c.loop_enabled.get_bool() && self.loop_end > self.loop_start {
+            let at = self.seconds();
+            if at < self.loop_start - 1e-6 || at >= self.loop_end {
+                self.c.loop_enabled.set_bool(false);
+            }
+        }
+    }
+
+    /// Whether the loop from `start` to `end` is the one playing.
+    fn is_playing_loop(&self, start: f64, end: f64) -> bool {
+        self.c.loop_enabled.get_bool()
+            && (self.loop_start - start).abs() < 1e-3
+            && (self.loop_end - end).abs() < 1e-3
+    }
+
+    fn launch_hotcue(&mut self, launch: HotcueLaunch) {
+        if launch.slip {
+            if launch.end.is_none() {
+                self.slip_cue = Some(launch.pad);
+            }
+            if self.slip.is_none() {
+                self.slip = Some(self.pos);
+                self.slip_moving =
+                    self.was_playing || self.c.play.get_bool() || launch.end.is_some();
+            }
+        }
+        if let Some(end) = launch.end {
+            self.loop_in_pending = false;
+            self.loop_start = launch.position;
+            self.loop_end = end;
+            self.c.loop_enabled.set_bool(true);
+            self.set_seconds(launch.position);
+        } else {
+            self.seek(launch.position);
+        }
+        // A paused deck jumps there and plays, as on Pioneer gear and as the
+        // pads' guide says.
+        self.c.play.set_bool(true);
+    }
+
+    /// Whether a hot cue pad holds the loop that is playing.
+    fn loop_on_a_pad(&self) -> bool {
+        self.c.hotcues.iter().any(|hc| {
+            hc.enabled.get_bool()
+                && hc.kind.get() == HOTCUE_LOOP
+                && self.is_playing_loop(hc.position.get(), hc.end_position.get())
+        })
+    }
+
     fn speed(&self) -> f64 {
         self.sync_speed
             .unwrap_or_else(|| 1.0 + self.c.rate.get() * self.c.rate_range.get() * self.rate_dir())
@@ -426,6 +517,8 @@ impl Deck {
     /// sync leaves alone.
     fn nudging(&self) -> bool {
         self.jog_pending != 0.0
+            || self.jog_rate != 0.0
+            || self.jog_in != 0.0
             || self.bend_rate != 0.0
             || self.c.rate_temp.iter().any(|c| c.get_bool())
             || self.c.scratch2_enable.get_bool()
@@ -441,6 +534,21 @@ impl Deck {
     /// isn't pulled back to the start of the bar.
     fn point_step(&self) -> f64 {
         self.quantize_beats().min(1.0)
+    }
+
+    /// Where CUE on a paused deck sets the cue point: here, or with quantize
+    /// on the nearest quantize step (a beat at most), as for hot cues. The
+    /// deck moves there too, so the cue plays from where it now is.
+    fn cue_spot(&mut self, track: &Track) -> f64 {
+        let at = self.seconds();
+        if !self.c.quantize.get_bool() || track.bpm <= 0.0 {
+            return at;
+        }
+        let snapped = track.snap_to(at, self.point_step(), false).max(0.0);
+        if (snapped - at).abs() > 1e-9 {
+            self.seek(snapped);
+        }
+        snapped
     }
 
     /// The deck's quantize size in beats, 1/16 to 4.
@@ -508,10 +616,14 @@ impl Deck {
         self.pos = 0.0;
         self.velocity = 0.0;
         self.jog_pending = 0.0;
+        self.jog_in = 0.0;
+        self.jog_rate = 0.0;
         self.bend_rate = 0.0;
         self.slip = None;
         self.slip_moving = false;
         self.slip_cue = None;
+        self.hotcue_request = None;
+        self.pending_hotcue = None;
         self.c.slip_position.set(-1.0);
         self.rolling = false;
         self.stop_slicer();
@@ -567,6 +679,15 @@ impl Deck {
         self.bpmlock_seen = self.c.bpmlock.version();
     }
 
+    /// Shows the loaded track's grid mode on `beats_mode`, as
+    /// [`Self::show_grid_lock`] shows the lock.
+    fn show_grid_mode(&mut self, track: &Track) {
+        self.c
+            .beats_mode
+            .set(f64::from(track.info.grid_mode().id()));
+        self.beats_mode_seen = self.c.beats_mode.version();
+    }
+
     fn handle_controls(&mut self) {
         let Some(track) = self.track.clone() else {
             return;
@@ -574,7 +695,7 @@ impl Deck {
         // Seeks from the UI (e.g. clicking the overview) arrive as playposition changes.
         let p = self.c.playposition.get();
         if (p - self.last_written_position).abs() > 1e-9 {
-            self.set_seconds(p * track.duration);
+            self.seek(p * track.duration);
             // A seek while slipping takes the silent playhead along.
             if self.slip.is_some() {
                 self.slip = Some(self.pos);
@@ -583,6 +704,18 @@ impl Deck {
         // Where the track is before this buffer's jumps: a slip that starts
         // now runs on from here.
         let unslipped = self.pos;
+        if self.pending_hotcue.is_some_and(|pending| {
+            pending.play != self.c.play.version() || pending.cue != self.c.cue_default.version()
+        }) {
+            self.pending_hotcue = None;
+        }
+        if self
+            .pending_hotcue
+            .is_some_and(|pending| pending.at <= self.clock + 1e-9)
+        {
+            let pending = self.pending_hotcue.take().expect("pending hot cue");
+            self.launch_hotcue(pending.launch);
+        }
         // Beats played since the last buffer, at the speed reached then.
         let beats_dt = (self.clock - self.last_clock).max(0.0)
             * self.velocity.max(0.0)
@@ -597,15 +730,23 @@ impl Deck {
                 self.grid_edit = Some((GridEdit::Lock(on), self.seconds()));
             }
         }
+        if self.c.beats_mode.version() != self.beats_mode_seen {
+            self.beats_mode_seen = self.c.beats_mode.version();
+            let mode = GridMode::from_id(self.c.beats_mode.get().round() as u8);
+            if let Some(mode) = mode.filter(|&m| track.info.grid_mode != Some(m)) {
+                self.grid_edit = Some((GridEdit::Mode(mode), self.seconds()));
+            }
+        }
 
         let playing = self.c.play.get_bool();
         if self.cue_edge.pressed(&self.c.cue_default) {
             if playing {
                 self.c.play.set_bool(false);
                 let cue = self.c.cue_point.get();
-                self.set_seconds(cue);
+                self.seek(cue);
             } else {
-                self.c.cue_point.set(self.seconds());
+                let at = self.cue_spot(&track);
+                self.c.cue_point.set(at);
                 if self.c.cue_mode.get() != 3.0 {
                     self.c.play.set_bool(true);
                     self.previewing = Some(self.c.play.version());
@@ -620,16 +761,17 @@ impl Deck {
                 self.previewing = None;
                 self.c.play.set_bool(false);
                 let cue = self.c.cue_point.get();
-                self.set_seconds(cue);
+                self.seek(cue);
             }
         }
         if self.cup_edge.pressed(&self.c.cue_play) {
             if playing {
                 self.c.play.set_bool(false);
                 let cue = self.c.cue_point.get();
-                self.set_seconds(cue);
+                self.seek(cue);
             } else {
-                self.c.cue_point.set(self.seconds());
+                let at = self.cue_spot(&track);
+                self.c.cue_point.set(at);
             }
             self.cup_held = true;
         }
@@ -655,32 +797,39 @@ impl Deck {
             if activate {
                 match saved_loop {
                     // Pressing the loop that is playing turns it off, as in Mixxx.
-                    Some(end)
-                        if self.c.loop_enabled.get_bool()
-                            && (self.loop_start - position).abs() < 1e-3
-                            && (self.loop_end - end).abs() < 1e-3 =>
-                    {
+                    Some(end) if self.is_playing_loop(position, end) => {
                         self.c.loop_enabled.set_bool(false)
                     }
                     Some(end) => {
-                        self.loop_in_pending = false;
-                        self.loop_start = position;
-                        self.loop_end = end;
-                        self.c.loop_enabled.set_bool(true);
-                        self.set_seconds(position);
+                        self.hotcue_request = Some(HotcueLaunch {
+                            pad: h,
+                            position,
+                            end: Some(end),
+                            // A loop is a slip trick whether the deck was
+                            // already playing or starts from the pad.
+                            slip: self.c.slip_enabled.get_bool(),
+                        });
                     }
                     None if set => {
-                        // In slip mode a playing deck plays the cue while
-                        // it is held, then carries on as if it hadn't.
-                        if playing && self.c.slip_enabled.get_bool() {
-                            self.slip_cue = Some(h);
-                        }
-                        self.set_seconds(position)
+                        self.hotcue_request = Some(HotcueLaunch {
+                            pad: h,
+                            position,
+                            end: None,
+                            // In slip mode a playing deck plays the cue while
+                            // it is held, then carries on as if it hadn't.
+                            slip: playing && self.c.slip_enabled.get_bool(),
+                        });
                     }
                     None => {
+                        // An empty pad pressed while a loop plays saves the
+                        // loop, unless another pad holds it already: then
+                        // it sets a cue, so one loop doesn't fill the pads.
+                        let saved = self.loop_on_a_pad();
                         let hc = &self.c.hotcues[h];
-                        // An empty pad pressed while a loop plays saves the loop.
-                        if self.c.loop_enabled.get_bool() && self.loop_end > self.loop_start {
+                        if self.c.loop_enabled.get_bool()
+                            && self.loop_end > self.loop_start
+                            && !saved
+                        {
                             hc.position.set(self.loop_start.max(0.0));
                             hc.end_position.set(self.loop_end);
                             hc.kind.set(HOTCUE_LOOP);
@@ -700,11 +849,17 @@ impl Deck {
                 }
             }
             if set && (goto_play || goto_stop) {
-                self.set_seconds(position);
+                self.seek(position);
                 self.c.play.set_bool(goto_play);
             }
             let hc = &self.c.hotcues[h];
             if clear {
+                // Deleting the pad of the loop that is playing ends the
+                // loop too, so the pad then sets a cue rather than saving
+                // the same loop again.
+                if saved_loop.is_some_and(|end| self.is_playing_loop(position, end)) {
+                    self.c.loop_enabled.set_bool(false);
+                }
                 hc.enabled.set_bool(false);
                 hc.kind.set(0.0);
                 hc.end_position.set(-1.0);
@@ -736,6 +891,9 @@ impl Deck {
         let mut n = 0;
         for p in self.c.pushes.iter_mut() {
             if p.edge.pressed(&p.control) && n < actions.len() {
+                if matches!(p.action, Action::BpmTap) {
+                    self.tap_at = tap_time(self.clock, &p.control);
+                }
                 actions[n] = Some(p.action);
                 n += 1;
             }
@@ -781,7 +939,7 @@ impl Deck {
                 }
                 Action::BeatLoop(n) => {
                     if !enabled {
-                        self.loop_start = snap(now, true);
+                        self.loop_start = snap(now, false);
                     }
                     self.c.beatloop_size.set(n);
                     self.loop_end = self.loop_start + beats_from(self.loop_start, n);
@@ -789,7 +947,7 @@ impl Deck {
                 }
                 Action::BeatLoopToggle if enabled => self.c.loop_enabled.set_bool(false),
                 Action::BeatLoopToggle => {
-                    self.loop_start = snap(now, true);
+                    self.loop_start = snap(now, false);
                     self.loop_end = self.loop_start + beats_from(self.loop_start, size);
                     self.c.loop_enabled.set_bool(true);
                 }
@@ -820,6 +978,17 @@ impl Deck {
                         self.c.loop_enabled.set_bool(true);
                     }
                 }
+                Action::SavedLoop => {
+                    let [start, end] = self.c.saved_loop.each_ref().map(|c| c.get());
+                    if start >= 0.0 && end > start {
+                        self.loop_in_pending = false;
+                        self.loop_start = start;
+                        self.loop_end = end;
+                        self.c.loop_enabled.set_bool(true);
+                        self.set_seconds(start);
+                        self.c.play.set_bool(true);
+                    }
+                }
                 Action::Reloop if enabled => self.c.loop_enabled.set_bool(false),
                 Action::Reloop => {
                     if self.loop_end > self.loop_start {
@@ -848,28 +1017,34 @@ impl Deck {
                     self.c.rate.set(self.c.rate.get() + step / range);
                 }
                 Action::Start(play) => {
-                    self.set_seconds(0.0);
+                    self.seek(0.0);
                     if let Some(play) = play {
                         self.c.play.set_bool(play);
                     }
                 }
-                Action::End => self.set_seconds(track.duration),
+                Action::End => self.seek(track.duration),
                 Action::CueGoto(play) => {
                     let cue = self.c.cue_point.get();
-                    self.set_seconds(cue);
+                    self.seek(cue);
                     self.c.play.set_bool(play);
                 }
                 Action::Grid(edit) => self.grid_edit = Some((edit, now)),
                 // Taps come at the playing speed; the grid is at the track's.
-                Action::BpmTap => {
-                    if let Some(bpm) = self.taps.tap(self.clock) {
+                // Taps are good to about half a BPM, so the track's tempo
+                // goes to the nearest whole one.
+                Action::BpmTap => match self.taps.tap(self.tap_at) {
+                    Some(bpm) => {
                         let speed = self.speed().abs();
                         if speed > 0.0 {
-                            let bpm = (bpm / speed).clamp(40.0, 300.0);
-                            self.grid_edit = Some((GridEdit::SetTempo(bpm), now));
+                            let bpm = (bpm / speed).clamp(40.0, 300.0).round();
+                            if self.tapped != Some(bpm) {
+                                self.tapped = Some(bpm);
+                                self.grid_edit = Some((GridEdit::SetTempo(bpm), now));
+                            }
                         }
                     }
-                }
+                    None => self.tapped = None,
+                },
                 Action::KeyStep(n) => {
                     let p = (self.c.pitch.get() + n).clamp(-6.0, 6.0);
                     // Whole steps land on whole semitones.
@@ -894,7 +1069,7 @@ impl Deck {
                         }
                         None => self.c.cue_point.get(),
                     };
-                    self.set_seconds(at);
+                    self.seek(at);
                     self.c.play.set_bool(true);
                 }
             }
@@ -953,7 +1128,12 @@ impl Deck {
         let jog = self.c.jog.get();
         if jog != 0.0 {
             self.c.jog.set(0.0);
-            self.jog_pending += jog * JOG_SECONDS;
+            self.jog_in += jog;
+        }
+        let search = self.c.jog_search.get();
+        if search != 0.0 {
+            self.c.jog_search.set(0.0);
+            self.jog_pending += search * JOG_SECONDS;
         }
 
         let enabled = self.c.loop_enabled.get_bool();
@@ -1144,28 +1324,31 @@ impl Deck {
     fn target_velocity(&mut self, dt: f64) -> f64 {
         self.search_quiet = (self.search_quiet - dt).max(0.0);
         let bend = self.bend_step(dt);
-        if self.audio.is_none() {
+        let held =
+            self.audio.is_none() || self.c.seek_hold.get_bool() || self.c.scrub_enable.get_bool();
+        if held || self.c.rate_search.get() != 0.0 {
             self.jog_pending = 0.0;
-            return 0.0;
+            self.jog_in = 0.0;
+            self.jog_rate = 0.0;
         }
-        if self.c.seek_hold.get_bool() {
-            self.jog_pending = 0.0;
+        if self.audio.is_none() || self.c.seek_hold.get_bool() {
             return 0.0;
         }
         if self.c.scrub_enable.get_bool() {
-            self.jog_pending = 0.0;
             return self.scrub_velocity(dt);
         }
         if self.c.scratch2_enable.get_bool() {
-            // Jog still counts while the wheel is touched: mappings such as
-            // the DDJ-FLX4's send SHIFT + turn as fast `jog` steps.
-            return self.c.scratch2.get() + self.jog_step(dt);
+            // Jog still counts while the wheel is touched, as in Mixxx;
+            // mappings such as the DDJ-FLX4's send SHIFT + turn as fast
+            // `jog_search` steps.
+            return self.c.scratch2.get() + self.jog_rate_step(dt, 1.0) + self.jog_step(dt);
         }
         let search = self.c.rate_search.get();
         if search != 0.0 {
             return search;
         }
-        let mut v = if self.c.play.get_bool() {
+        let playing = self.c.play.get_bool();
+        let mut v = if playing {
             // Turning the rim bends the speed: faster clockwise, slower
             // counterclockwise, but never backwards.
             (self.forward_speed() + bend).max(0.0)
@@ -1175,8 +1358,29 @@ impl Deck {
         if self.c.reverse.get_bool() || self.c.reverseroll.get_bool() {
             v = -v;
         }
-        // A jog movement bends the speed while playing and scrubs while stopped.
-        v + self.jog_step(dt)
+        // `jog` bends the speed as in Mixxx, further while paused; a fast
+        // search moves the position.
+        let jog = self.jog_rate_step(dt, if playing { 1.0 } else { JOG_PAUSED });
+        v + jog + self.jog_step(dt)
+    }
+
+    /// Takes the `jog` units that came in over the last `dt` seconds and
+    /// returns the speed they add, in multiples of normal speed: the
+    /// smoothed units a second times [`JOG_RATE`] times `gain`.
+    fn jog_rate_step(&mut self, dt: f64, gain: f64) -> f64 {
+        let units = std::mem::take(&mut self.jog_in);
+        if dt <= 0.0 {
+            return 0.0;
+        }
+        self.jog_rate += (units / dt - self.jog_rate) * (dt / JOG_SMOOTH).min(1.0);
+        if units == 0.0 && (self.jog_rate * JOG_RATE).abs() < 1e-4 {
+            self.jog_rate = 0.0;
+        }
+        let speed = self.jog_rate * JOG_RATE * gain;
+        if speed.abs() > JOG_SEARCH_SPEED {
+            self.search_quiet = JOG_SEARCH_HOLD;
+        }
+        speed
     }
 
     /// Takes the rim ticks (`jog_bend`) that came in over the last `dt`
@@ -1188,7 +1392,7 @@ impl Deck {
             self.c.jog_bend.set(0.0);
         }
         if !self.c.play.get_bool() || dt <= 0.0 {
-            self.jog_pending += ticks * BEND_PAUSED_SECONDS;
+            self.jog_pending += ticks * self.rim_tick_seconds();
             self.bend_rate = 0.0;
             return 0.0;
         }
@@ -1197,6 +1401,20 @@ impl Deck {
             self.bend_rate = 0.0;
         }
         self.bend_rate * BEND_PER_TICK_PER_SECOND
+    }
+
+    /// Track seconds one rim tick moves a paused deck by: a bar a turn.
+    fn rim_tick_seconds(&self) -> f64 {
+        let bpm = self
+            .track
+            .as_ref()
+            .map_or(0.0, |t| t.bpm_at(self.seconds()));
+        let turn = if bpm > 0.0 {
+            BEND_PAUSED_BEATS_PER_TURN * 60.0 / bpm
+        } else {
+            BEND_PAUSED_SECONDS_PER_TURN
+        };
+        turn / RIM_TICKS_PER_TURN
     }
 
     /// The speed that moves on a share of the pending jog this buffer.
@@ -1215,7 +1433,8 @@ impl Deck {
 }
 
 /// What a deck plays from: a track's audio, or the mix of its stems.
-pub(crate) trait Frames {
+/// Stereo frames a player reads: decoded audio, or a mix of stems.
+pub trait Frames {
     /// Frame `i`, or silence where there is none.
     fn frame(&self, i: usize) -> [f32; 2];
     /// Frame `k`, which may be before the start.
@@ -1386,10 +1605,33 @@ impl Frames for StemMix<'_> {
 /// How long a jump in the play position fades over: long enough to hide the
 /// step in the waveform, short enough not to be heard as a fade.
 pub(crate) const DECLICK_SECONDS: f64 = 0.006;
+/// How long a playing deck stays in the time-stretcher after key lock and
+/// key shifts stop needing it, so quick key lock toggles carry on through
+/// it instead of crossfading in and out on every press.
+const SHIFT_LINGER_SECONDS: f64 = 1.0;
 
 /// How long the stems made on load crossfade into high-quality ones once
 /// those are ready, so a muted stem doesn't click at the switch.
 pub(crate) const STEM_UPGRADE_SECONDS: f64 = 0.02;
+
+/// How far around the play position high-quality stems must be there
+/// before a deck crossfades to them: more than a buffer, the
+/// time-stretcher's reach ahead and a fast scratch, so the crossfade is
+/// over before the deck reads past them.
+pub(crate) const STEM_UPGRADE_MARGIN_SECONDS: f64 = 0.5;
+
+/// Below this speed, in multiples of normal, a deck fades out with its
+/// speed: there the music is too low to hear anyway, and what is left is the
+/// held sample's level stepping as the deck starts and stops, which clicks.
+const SLOW_FADE_SPEED: f64 = 0.1;
+
+/// The gain for a deck moving at `speed`: 1 from [`SLOW_FADE_SPEED`] up,
+/// easing down to 0 at a standstill.
+#[inline]
+fn slow_gain(speed: f64) -> f32 {
+    let x = (speed.abs() / SLOW_FADE_SPEED).min(1.0) as f32;
+    x * x * (3.0 - 2.0 * x)
+}
 
 /// A short crossfade as a deck goes into the time-stretcher (from playing
 /// as a record) or out of it, over this many output frames. The two differ
@@ -1647,6 +1889,12 @@ pub struct Engine {
     loopers: Loopers,
     looper_buf: Vec<Vec<[f32; 2]>>,
     looper_seen: [bool; NUM_DECKS],
+    /// Each deck's `[RemixN]` controls, the one Remix deck's sound (only
+    /// one deck is the Remix deck at a time), and each deck's
+    /// `[RemixN],enabled` as last seen, to tell when one is picked.
+    remix_controls: Vec<RemixControls>,
+    remix: Box<RemixDeck>,
+    remix_seen: [bool; NUM_DECKS],
     last_main: Vec<[f32; 2]>,
     last_main_len: usize,
     looper_supply: Option<crate::looper::LooperSupply>,
@@ -1660,6 +1908,16 @@ pub struct Engine {
     /// Seconds played, for blinking indicators.
     clock: f64,
     limiter: Limiter,
+    /// Room EQ on the main output and on the booth, and their controls
+    /// (`[RoomEQ_Main]`, `[RoomEQ_Booth]`).
+    room_eq: [RoomEq; 2],
+    room_eq_controls: [RoomEqControls; 2],
+    /// While the main Room EQ is on, the mix without it goes through this
+    /// limiter for recording, going on air, the loudness meter, the
+    /// headphones and the loopers, at the main limiter's ceiling. Off, they
+    /// take the main output, and this one stands aside.
+    rec_limiter: Limiter,
+    rec_split: bool,
     visual: Arc<VisualPositions>,
     link: Link,
     /// The master deck: the one Link and MIDI clock follow.
@@ -1693,6 +1951,10 @@ pub struct Engine {
     /// Copies the master out for Battle Live (video), while live.
     live: RecordTap,
     live_feed: Option<Feed>,
+    /// Copies the main output as it leaves (after Room EQ and the
+    /// limiter) for the Room EQ page's spectrum, while it's open.
+    spectrum: RecordTap,
+    spectrum_feed: Option<Feed>,
     /// Plays a track into the headphones for the info panel.
     preview: Preview,
     preview_input: Option<PreviewInput>,
@@ -1807,16 +2069,23 @@ impl Engine {
             clock: 0.0,
             last_clock: 0.0,
             taps: TapTempo::default(),
+            tap_at: 0.0,
+            tapped: None,
             bpmlock_seen: 0,
+            beats_mode_seen: 0,
             metronome_beat: f64::NAN,
             click: None,
             velocity: 0.0,
             jog_pending: 0.0,
+            jog_in: 0.0,
+            jog_rate: 0.0,
             search_quiet: 0.0,
             bend_rate: 0.0,
             slip: None,
             slip_moving: false,
             slip_cue: None,
+            hotcue_request: None,
+            pending_hotcue: None,
             rolling: false,
             slicer: None,
             slice_held: None,
@@ -1830,6 +2099,7 @@ impl Engine {
             eject_edge: Edge::default(),
             sync_edge: Edge::default(),
             was_synced: false,
+            played_for_sync: false,
             following: false,
             sync_speed: None,
             sync_bend: 0.0,
@@ -1856,6 +2126,7 @@ impl Engine {
             peak_hold: 0.0,
             file_key: None,
             shifter: KeyShifter::new(sample_rate),
+            shift_idle: 0.0,
             shifted: vec![[0.0; 2]; 4096],
             scrub_tone: [0.0; 2],
             expected_pos: None,
@@ -1897,6 +2168,7 @@ impl Engine {
         meter_feed.set_active(true);
         let (broadcast, broadcast_feed) = recorder::tap(sample_rate);
         let (live, live_feed) = recorder::tap(sample_rate);
+        let (spectrum, spectrum_feed) = recorder::tap(sample_rate);
         let mut live_wave_rx = Vec::with_capacity(NUM_DECKS);
         let live_waves = std::array::from_fn(|_| {
             let (wave, rx) = crate::live_wave::channel(sample_rate);
@@ -1932,6 +2204,8 @@ impl Engine {
                 broadcast_feed: Some(broadcast_feed),
                 live,
                 live_feed: Some(live_feed),
+                spectrum,
+                spectrum_feed: Some(spectrum_feed),
                 preview,
                 preview_input: Some(preview_input),
                 sampler_input: Some(sampler_input),
@@ -1962,6 +2236,11 @@ impl Engine {
                 loopers,
                 looper_buf: vec![vec![[0.0; 2]; BLOCK]; NUM_DECKS],
                 looper_seen: [false; NUM_DECKS],
+                remix_controls: (0..NUM_DECKS)
+                    .map(|d| RemixControls::new(registry, d))
+                    .collect(),
+                remix: Box::new(RemixDeck::new(sample_rate, kits.clone())),
+                remix_seen: [false; NUM_DECKS],
                 last_main: vec![[0.0; 2]; BLOCK],
                 last_main_len: 0,
                 looper_supply: Some(looper_supply),
@@ -1974,6 +2253,11 @@ impl Engine {
                 xfade: [1.0; NUM_DECKS],
                 clock: 0.0,
                 limiter: Limiter::new(sample_rate, LIMIT_CEILING),
+                room_eq: [RoomEq::new(sample_rate), RoomEq::new(sample_rate)],
+                room_eq_controls: [crate::room_eq::MAIN_GROUP, crate::room_eq::BOOTH_GROUP]
+                    .map(|g| RoomEqControls::create(registry, g)),
+                rec_limiter: Limiter::new(sample_rate, LIMIT_CEILING),
+                rec_split: false,
                 tone_frame: 0,
             },
             EngineInput {
@@ -2026,11 +2310,25 @@ impl Engine {
         self.live_feed.take()
     }
 
+    /// The other end of the spectrum's tap; there is only one.
+    pub(crate) fn take_spectrum_feed(&mut self) -> Option<Feed> {
+        self.spectrum_feed.take()
+    }
+
     /// Plays input `input` (see [`crate::inputs`]) from `feed`, or from
     /// nothing. Returns the feed it played before, to be dropped off the
     /// audio thread.
     pub(crate) fn set_input(&mut self, input: usize, feed: Option<InputFeed>) -> Option<InputFeed> {
         self.inputs[input].set_feed(feed)
+    }
+
+    /// The Session plays from `source`, or nothing. Returns the old one, to
+    /// be dropped off the audio thread.
+    pub(crate) fn set_session(
+        &mut self,
+        source: Option<Box<dyn crate::inputs::SessionSource>>,
+    ) -> Option<Box<dyn crate::inputs::SessionSource>> {
+        self.inputs[SESSION].set_source(source)
     }
 
     /// Input `input` plays the Mixer deck's Groove Box, or not.
@@ -2075,10 +2373,13 @@ impl Engine {
                     d.c.duration.set(track.duration);
                     d.c.track_loaded.set_bool(true);
                     d.show_grid_lock(track.info.grid_locked);
+                    d.show_grid_mode(&track);
                     d.c.beats_edit.set_bool(false);
                     d.c.cue_point.set(track.first_beat);
                     d.c.loop_enabled.set_bool(false);
                     d.loop_in_pending = false;
+                    d.hotcue_request = None;
+                    d.pending_hotcue = None;
                     d.c.loop_in_pending.set_bool(false);
                     for h in &d.c.hotcues {
                         h.enabled.set_bool(false);
@@ -2152,8 +2453,15 @@ impl Engine {
                         }
                     }
                     d.audio = track.audio.clone();
+                    // A drag that never saw its release (the Player bar
+                    // moving to the other deck mid-drag) would hold this
+                    // deck still for good; a new track starts free.
+                    d.c.seek_hold.set_bool(false);
+                    d.c.scrub_enable.set_bool(false);
                     d.velocity = 0.0;
                     d.jog_pending = 0.0;
+                    d.jog_in = 0.0;
+                    d.jog_rate = 0.0;
                     d.slip = None;
                     d.slip_moving = false;
                     d.slip_cue = None;
@@ -2175,6 +2483,9 @@ impl Engine {
                         let speed = held * sync_ratio(held, own) / own;
                         let range = d.c.rate_range.get() * d.rate_dir();
                         d.c.rate.set((speed - 1.0) / range);
+                    }
+                    if held_bpm.is_none() {
+                        self.match_bpm_on_load(deck, &track);
                     }
                     self.match_key_on_load(deck, &track);
                     // The headphones follow the deck the DJ just loaded, as
@@ -2210,6 +2521,7 @@ impl Engine {
                     }
                     let first_beat = track.first_beat;
                     d.show_grid_lock(track.info.grid_locked);
+                    d.show_grid_mode(&track);
                     if let Some(old) = d.track.replace(track) {
                         let _ = self.returned.push(Returned::Done(old));
                     }
@@ -2225,6 +2537,7 @@ impl Engine {
                     };
                     let old = if same {
                         d.show_grid_lock(track.info.grid_locked);
+                        d.show_grid_mode(&track);
                         d.track.replace(track)
                     } else {
                         Some(track)
@@ -2246,11 +2559,12 @@ impl Engine {
                 d.c.play.set_bool(false);
             }
             let pressed = d.eject_edge.pressed(&d.c.eject) && !d.c.play.get_bool();
-            // Ejecting an empty Groove Box or live input deck makes it an
-            // empty track deck.
+            // Ejecting an empty Groove Box, Looper, Remix or live input
+            // deck makes it an empty track deck.
             if pressed && d.track.is_none() {
                 self.grooves[deck].c.enabled.set_bool(false);
                 self.loopers.loopers[deck].c.enabled.set_bool(false);
+                self.remix_controls[deck].enabled.set_bool(false);
                 d.c.live_input.set(0.0);
             }
             if pressed || groove {
@@ -2346,6 +2660,54 @@ impl Engine {
         }
     }
 
+    /// The deck that is the Remix deck, if any.
+    fn remix_deck(&self) -> Option<usize> {
+        self.remix_controls
+            .iter()
+            .position(|c| c.enabled.get_bool())
+    }
+
+    /// Keeps one Remix deck: picking Remix on a deck moves it there with
+    /// its settings, takes the deck from its track, input, Groove Box or
+    /// Looper, and picking one of those on the Remix deck turns it back
+    /// into that.
+    fn remix_decks(&mut self) {
+        for deck in 0..NUM_DECKS {
+            let on = self.remix_controls[deck].enabled.get_bool();
+            if on && !self.remix_seen[deck] {
+                for other in (0..NUM_DECKS).filter(|&k| k != deck) {
+                    if self.remix_controls[other].enabled.get_bool() {
+                        self.remix_controls[other].enabled.set_bool(false);
+                        self.remix_seen[other] = false;
+                        let (to, from) = (&self.remix_controls[deck], &self.remix_controls[other]);
+                        to.take_settings(from);
+                    }
+                }
+                self.grooves[deck].c.enabled.set_bool(false);
+                self.groove_seen[deck] = false;
+                self.loopers.loopers[deck].c.enabled.set_bool(false);
+                self.looper_seen[deck] = false;
+                let d = &mut self.decks[deck];
+                d.c.live_input.set(0.0);
+                self.live_seen[deck] = 0;
+                d.c.play.set_bool(false);
+                if let Some(track) = d.unload() {
+                    let _ = self.returned.push(Returned::Ejected { deck, track });
+                }
+            } else if on {
+                let d = &self.decks[deck];
+                let taken = d.track.is_some()
+                    || d.live_input() > 0
+                    || self.grooves[deck].enabled()
+                    || self.loopers.loopers[deck].enabled();
+                if taken {
+                    self.remix_controls[deck].enabled.set_bool(false);
+                }
+            }
+            self.remix_seen[deck] = self.remix_controls[deck].enabled.get_bool();
+        }
+    }
+
     /// The leading deck's tempo and beat as heard (the deck SYNC follows,
     /// else the first playing deck with a tempo), and which deck it is.
     fn leading_beat(&self) -> (Option<(f64, f64)>, Option<usize>) {
@@ -2408,7 +2770,10 @@ impl Engine {
             let d = &mut self.decks[i];
             d.was_synced = synced[i];
             let was_following = std::mem::replace(&mut d.following, following);
-            let once = d.sync_edge.pressed(&d.c.beatsync);
+            let playing = d.c.play.get_bool();
+            let started = playing && !std::mem::replace(&mut d.played_for_sync, playing);
+            let once = d.sync_edge.pressed(&d.c.beatsync)
+                || (started && !synced[i] && self.master.sync_on_play.get_bool());
             // Set again below while following.
             d.sync_speed = None;
             d.sync_bend = 0.0;
@@ -2589,8 +2954,34 @@ impl Engine {
             .or_else(|| (0..NUM_DECKS).find(|&k| candidate(k)));
     }
 
-    /// The deck `deck` syncs to: the leader, or else a playing deck, or
-    /// else any deck with a track.
+    /// BPM matching on load (`bpm_match_on_load`): a track loaded while
+    /// another deck plays takes that deck's tempo, or half or double it,
+    /// whichever is nearest its own. Its beats aren't lined up: PLAY (with
+    /// sync on play) or SYNC does that.
+    fn match_bpm_on_load(&mut self, deck: usize, track: &Track) {
+        if !self.master.bpm_match_on_load.get_bool() || track.bpm <= 0.0 {
+            return;
+        }
+        let Some(o) = self
+            .sync_target(deck)
+            .filter(|&o| self.decks[o].c.play.get_bool())
+        else {
+            return;
+        };
+        let theirs = self.decks[o].effective_bpm();
+        if theirs <= 0.0 {
+            return;
+        }
+        let d = &self.decks[deck];
+        if d.c.rate.is_locked() {
+            return;
+        }
+        let own = track.bpm_at(track.first_beat);
+        let speed = theirs * sync_ratio(theirs, own) / own;
+        let range = d.c.rate_range.get() * d.rate_dir();
+        d.c.rate.set(((speed - 1.0) / range).clamp(-1.0, 1.0));
+    }
+
     /// Key matching on load: a track loaded while another deck plays is
     /// shifted by up to `key_match_on_load` semitones so its key mixes with
     /// that deck's, with key lock on so the tempo fader doesn't move it
@@ -2624,6 +3015,8 @@ impl Engine {
         }
     }
 
+    /// The deck `deck` syncs to: the leader, or else a playing deck, or
+    /// else any deck with a track.
     fn sync_target(&self, deck: usize) -> Option<usize> {
         let has_bpm = |d: &Deck| d.track.as_ref().is_some_and(|t| t.bpm > 0.0);
         self.sync_leader
@@ -2634,6 +3027,67 @@ impl Engine {
                 })
             })
             .or_else(|| (0..NUM_DECKS).find(|&k| k != deck && has_bpm(&self.decks[k])))
+    }
+
+    /// Resolves hot-cue presses after every deck has read its controls. A
+    /// press in the first half of a quantize step jumps at once and catches
+    /// up to the current phase. In the second half, the upcoming point is
+    /// nearer, so keep the old audio playing and launch there instead of
+    /// pulling the cue backwards ahead of the beat.
+    fn resolve_hotcue_launches(&mut self) {
+        for i in 0..NUM_DECKS {
+            let Some(launch) = self.decks[i].hotcue_request.take() else {
+                continue;
+            };
+            let pending_at = (|| {
+                let other = self.sync_target(i)?;
+                let (d, l) = (&self.decks[i], &self.decks[other]);
+                if !(d.c.quantize.get_bool() || d.following) || !l.c.play.get_bool() || d.nudging()
+                {
+                    return None;
+                }
+                let (Some(mine), Some(theirs)) = (&d.track, &l.track) else {
+                    return None;
+                };
+                if mine.bpm <= 0.0 || theirs.bpm <= 0.0 {
+                    return None;
+                }
+                let (ratio, offset) = if d.following {
+                    (d.sync_ratio, d.phase_offset)
+                } else {
+                    (sync_ratio(l.effective_bpm(), d.effective_bpm()), 0.0)
+                };
+                let step = if d.following {
+                    d.quantize_beats().max(1.0)
+                } else {
+                    d.quantize_beats()
+                };
+                let cue_beat = mine.beat_at(launch.position);
+                let leader_beat = theirs.beat_at(l.seconds());
+                let leader_phase = leader_beat * ratio + offset;
+                let error = phase_error(leader_phase / step, cue_beat / step);
+                if error >= -1e-6 {
+                    return None;
+                }
+                let wait_beats = -error * step / ratio;
+                let until = theirs.beats_from(l.seconds(), wait_beats) - l.seconds();
+                let wait = until / l.forward_speed();
+                (wait.is_finite() && wait > 0.0).then_some(self.clock + wait)
+            })();
+
+            let d = &mut self.decks[i];
+            d.pending_hotcue = None;
+            if let Some(at) = pending_at {
+                d.pending_hotcue = Some(PendingHotcue {
+                    launch,
+                    at,
+                    play: d.c.play.version(),
+                    cue: d.c.cue_default.version(),
+                });
+            } else {
+                d.launch_hotcue(launch);
+            }
+        }
     }
 
     /// With quantize on, or on a synced deck, a deck that jumps (hot cue,
@@ -2977,25 +3431,18 @@ impl Engine {
         self.apply_commands();
         self.eject();
         self.live_inputs();
+        self.remix_decks();
         for d in &mut self.decks {
             d.change_rate_range();
         }
         let link = self.link.begin(frames, self.sample_rate);
         self.sync(link);
-        let mut moved = [Move::None; NUM_DECKS];
+        let before = self.decks.each_ref().map(|d| d.pos);
         let clock = self.clock;
         for (deck, d) in self.decks.iter_mut().enumerate() {
-            let before = d.pos;
             d.clock = clock;
             d.reset_rate(dt);
             d.handle_controls();
-            moved[deck] = if d.pos != before {
-                Move::Jump
-            } else if !d.was_playing && d.c.play.get_bool() {
-                Move::Start
-            } else {
-                Move::None
-            };
             if let (Some((edit, seconds)), Some(track)) = (d.grid_edit.take(), &d.track) {
                 let _ = self.returned.push(Returned::GridEdit {
                     deck,
@@ -3005,6 +3452,17 @@ impl Engine {
                 });
             }
         }
+        self.resolve_hotcue_launches();
+        let moved = std::array::from_fn(|deck| {
+            let d = &self.decks[deck];
+            if d.pos != before[deck] {
+                Move::Jump
+            } else if !d.was_playing && d.c.play.get_bool() {
+                Move::Start
+            } else {
+                Move::None
+            }
+        });
         self.land_in_phase(moved);
         self.start_gapless(frames);
         // The audio each deck's own joins on to, for this buffer.
@@ -3049,6 +3507,16 @@ impl Engine {
                 None
             }
         }));
+        // The Remix deck follows its source deck's grid, else the main mix's.
+        if let Some(r) = self.remix_deck() {
+            let c = &self.remix_controls[r];
+            let follow = match remix::source(c.source.get()) {
+                Some(Source::Deck(k)) if k != r => k,
+                _ => main_deck,
+            };
+            let d = &self.decks[follow];
+            self.remix.prepare(c, d.beat_seconds(), grid(d));
+        }
         let main_transport = self.decks[main_deck].transport();
         self.fx.set_transport(std::array::from_fn(|t| {
             if t >= MAIN {
@@ -3146,6 +3614,26 @@ impl Engine {
         if ceiling != self.limiter.ceiling() {
             self.limiter.set_ceiling(ceiling);
         }
+        for (eq, c) in self.room_eq.iter_mut().zip(&self.room_eq_controls) {
+            let (on, bands) = c.read();
+            eq.set(on, &bands);
+        }
+        // The main Room EQ coming in, the recording's limiter takes over
+        // where the main one is, so the recording runs on without a seam.
+        // Going out, the two run on until the main one, which may have
+        // been holding a boost down, has come back to where the other is;
+        // then it takes over the other's state, and the main output and
+        // the recording are one again.
+        let settling =
+            self.rec_split && (self.limiter.gain() - self.rec_limiter.gain()).abs() > 1e-4;
+        let split = (self.room_eq[0].is_active() || settling) && !external;
+        if split && !self.rec_split {
+            self.rec_limiter.copy_state_from(&self.limiter);
+        } else if !split && self.rec_split {
+            self.limiter.copy_state_from(&self.rec_limiter);
+        }
+        self.rec_split = split;
+        self.rec_limiter.set_ceiling(ceiling);
         let auto_gain_on = self.master.auto_gain.get_bool();
         let auto_gain_target = self.master.auto_gain_target.get() as f32;
         let balance_target = self.master.balance.get() as f32;
@@ -3271,15 +3759,27 @@ impl Engine {
             d.was_playing = playing;
             // Key lock and key shifts go through the time-stretcher while
             // playing forwards, nudges and pitch bends included; scratching,
-            // searching and reverse play as a record does.
+            // searching and reverse play as a record does. At normal speed,
+            // key lock alone has no work to do, so do not switch audio paths.
+            // Once the stretcher is running it lingers a moment after it
+            // has no work left: turning key lock off and on again then only
+            // changes its transpose instead of leaving it and re-seeding it.
             let keylock = d.c.keylock.get_bool();
             let semitones = d.c.pitch.get();
-            let shifting = from > 0.0
+            let can_shift = from > 0.0
                 && target > 0.0
                 && from.max(target) <= MAX_RATE
                 && !held
-                && d.c.rate_search.get() == 0.0
-                && (keylock || semitones.abs() > 1e-3);
+                && d.c.rate_search.get() == 0.0;
+            let at_normal_speed = (from - 1.0).abs() < 1e-6 && (target - 1.0).abs() < 1e-6;
+            let needed = semitones.abs() > 1e-3 || (keylock && !at_normal_speed);
+            d.shift_idle = if needed || !d.shifter.is_active() {
+                0.0
+            } else {
+                d.shift_idle + dt
+            };
+            let shifting = can_shift
+                && (needed || (d.shifter.is_active() && d.shift_idle < SHIFT_LINGER_SECONDS));
             // The deck was heard moving last buffer (not starting from a stop).
             let was_moving = d.velocity != 0.0 && from != 0.0;
             let was_shifting = d.shifter.is_active();
@@ -3297,23 +3797,36 @@ impl Engine {
                 d.stem_gains = [1.0; MAX_STEMS];
                 // Stems that are already high quality when they turn up
                 // start there.
-                d.stem_upgrade = if stems.and_then(Stems::ready_upgrade).is_some() {
+                d.stem_upgrade = if stems
+                    .and_then(Stems::ready_upgrade)
+                    .is_some_and(Stems::is_complete)
+                {
                     1.0
                 } else {
                     0.0
                 };
             }
+            // High-quality stems separated from the play position outwards
+            // take over a stretch at a time: crossfade to them where they
+            // are there around the deck, and back ahead of a stretch they
+            // haven't reached yet.
             let upgrade = match stems.and_then(Stems::ready_upgrade) {
-                Some(_) => (
-                    d.stem_upgrade,
-                    (d.stem_upgrade
-                        + frames as f32 / (STEM_UPGRADE_SECONDS * self.sample_rate) as f32)
-                        .min(1.0),
-                ),
+                Some(up) => {
+                    let margin = (STEM_UPGRADE_MARGIN_SECONDS * d.source_rate()) as usize;
+                    let there = up.has_around(d.pos.max(0.0) as usize, margin);
+                    let step = frames as f32 / (STEM_UPGRADE_SECONDS * self.sample_rate) as f32;
+                    let to = if there {
+                        (d.stem_upgrade + step).min(1.0)
+                    } else {
+                        (d.stem_upgrade - step).max(0.0)
+                    };
+                    (d.stem_upgrade, to)
+                }
                 None => (0.0, 0.0),
             };
             d.stem_upgrade = upgrade.1;
-            d.stem_fx.prepare(d.c.stem_fx.get(), beat);
+            d.stem_fx
+                .prepare(d.c.stem_fx.get(), beat, d.c.stem_fx_beats.get());
             let capture = d.stem_fx.capture_seconds(beat);
             let mut send_to = [0.0f32; MAX_STEMS];
             let stem_gains = stems.map(|_| {
@@ -3583,8 +4096,9 @@ impl Engine {
                 Routing::Deck
             } else if strips[i] {
                 Routing::Mixer { any_solo }
-            } else if i == MICROPHONE {
-                // The mic talks over the music with MIC, Mixer or not.
+            } else if i == MICROPHONE || i == SESSION {
+                // The mic talks over the music with MIC, Mixer or not; the
+                // Session is a channel of its own.
                 Routing::Main
             } else {
                 Routing::Off
@@ -3632,15 +4146,31 @@ impl Engine {
                 }
             }
         }
+        // The Remix deck plays its source's channel after the source's EQ,
+        // so it comes after every other deck in the frame loop.
+        let remix_at = self.remix_deck();
+        let remix_src = remix_at.and_then(|r| {
+            remix::source(self.remix_controls[r].source.get()).filter(|&s| s != Source::Deck(r))
+        });
+        let mut order: [usize; NUM_DECKS] = std::array::from_fn(|i| i);
+        if let Some(r) = remix_at {
+            order[r..].rotate_left(1);
+        }
         for (i, wave) in self.live_waves.iter_mut().enumerate() {
-            if live_on[i] == 0 && !mixer_on[i] && !groove_on[i] && !looper_on[i] {
+            if live_on[i] == 0
+                && !mixer_on[i]
+                && !groove_on[i]
+                && !looper_on[i]
+                && remix_at != Some(i)
+            {
                 wave.idle();
             }
         }
         for f in 0..frames {
             let r = (f + 1) as f32 / frames as f32;
             let lerp = |(a, b): (f32, f32)| a + (b - a) * r;
-            for (i, d) in self.decks.iter_mut().enumerate() {
+            for &i in &order {
+                let d = &mut self.decks[i];
                 let p = &plans[i];
                 let mut s = [0.0f32; 2];
                 let mut send = [0.0f32; 2];
@@ -3697,6 +4227,14 @@ impl Engine {
                     if p.scrub {
                         s = soften_scrub(s, v.abs(), out_rate, &mut d.scrub_tone);
                     }
+                    // Near a standstill the sound fades with the speed, so
+                    // touching the platter, holding it, and a scratch
+                    // settling to a stop don't click on the held sample.
+                    let g = slow_gain(v);
+                    if g < 1.0 {
+                        s = [s[0] * g, s[1] * g];
+                        send = [send[0] * g, send[1] * g];
+                    }
                     let before = d.pos;
                     d.pos += step;
                     if let Some((a, b)) = p.loop_frames {
@@ -3732,6 +4270,18 @@ impl Engine {
                 if looper_on[i] {
                     s = looper_buf[i][f];
                 }
+                if remix_at == Some(i) {
+                    let x = match remix_src {
+                        Some(Source::Deck(k)) => deck_buf[k][f],
+                        Some(Source::Input(k)) => self.inputs[k].raw[f],
+                        None => [0.0; 2],
+                    };
+                    s = self.remix.play(x);
+                    // Insert: the source is heard only through the Remix deck.
+                    if let (true, Some(Source::Deck(k))) = (self.remix.insert(), remix_src) {
+                        deck_buf[k][f] = [0.0; 2];
+                    }
+                }
                 // The Mixer's strips with FX off, kept apart (see below).
                 let mut dry = None;
                 if live_on[i] > 0 || mixer_on[i] {
@@ -3764,7 +4314,12 @@ impl Engine {
                 let dry = dry.map(|x| [x[0] * pre, x[1] * pre]);
                 // A live deck's sound for its waveform, after the trim and
                 // before the EQ, as a track's waveform shows the track.
-                if live_on[i] > 0 || mixer_on[i] || groove_on[i] || looper_on[i] {
+                if live_on[i] > 0
+                    || mixer_on[i]
+                    || groove_on[i]
+                    || looper_on[i]
+                    || remix_at == Some(i)
+                {
                     let heard = dry.map_or(s, |x| [s[0] + x[0], s[1] + x[1]]);
                     self.live_waves[i].push(heard);
                 }
@@ -3804,6 +4359,11 @@ impl Engine {
             };
             self.fx.process_blocks(&mut blocks);
         }
+        // The instrument's scope can follow its deck after the effects.
+        if let Some(i) = (0..NUM_DECKS).find(|&i| live_on[i] == crate::inputs::INSTRUMENT + 1) {
+            self.fx.show_instrument_deck(&deck_buf[i][..frames]);
+        }
+        let preview_main = self.preview.on_main();
         // The Mixer's dry strips join its deck after the deck's effects.
         if let Some(m) = mixer_deck {
             for (d, x) in deck_buf[m][..frames].iter_mut().zip(&mixer_dry) {
@@ -3845,10 +4405,15 @@ impl Engine {
                     tap_buf[i][f] = [s[0] * g, s[1] * g];
                 }
             }
-            // The preview player is for the headphones only.
+            // The preview player is for the headphones only, unless the
+            // Mixed Set Editor plays a recording back through the main mix.
             let preview = self.preview.next();
             cue[0] += preview[0];
             cue[1] += preview[1];
+            if preview_main && !external {
+                main[0] += preview[0];
+                main[1] += preview[1];
+            }
             let samples = self.samplers.next();
             if !external {
                 main[0] += samples[0];
@@ -3871,8 +4436,9 @@ impl Engine {
             } else {
                 self.ducker.next(duck, mic.live && gm > 0.0, m)
             };
-            // The auxiliary inputs and the instrument play with the music.
-            for input in std::iter::once(INSTRUMENT).chain(AUXILIARIES) {
+            // The auxiliary inputs, the instrument and the Session play
+            // with the music.
+            for input in [INSTRUMENT, SESSION].into_iter().chain(AUXILIARIES) {
                 let inp = &self.inputs[input];
                 let a = inp.buf[f];
                 // A Mixer strip is in its deck's sound instead.
@@ -3956,26 +4522,42 @@ impl Engine {
                 to[0] += t;
                 to[1] += t;
             }
-            // The booth hears the main mix before the main level, at its own,
-            // bent rather than clipped when it runs hot.
-            let booth = main.map(|v| soft_clip(v * booth_gain));
+            // The booth hears the main mix before the main level, through
+            // its Room EQ, at its own level, bent rather than clipped when
+            // it runs hot.
+            let booth = if channels >= 6 {
+                self.room_eq[1]
+                    .process(main)
+                    .map(|v| soft_clip(v * booth_gain))
+            } else {
+                [0.0; 2]
+            };
             let mg = lerp(master);
             let bal = balance_gains(lerp(balance));
-            let mut hot = [0.0; 2];
+            let mut hot = main.map(|v| v * mg);
+            // What is recorded and heard in the headphones: the mix without
+            // Room EQ, limited on its own while the main output has it.
+            let rec = split.then(|| self.rec_limiter.process(hot));
+            if split {
+                hot = self.room_eq[0].process(hot);
+            }
             for c in 0..2 {
-                hot[c] = main[c] * mg;
                 master_clip[c] |= hot[c].abs() > 1.0;
             }
             // Limited rather than clipped when the mix runs hot.
             let limited = self.limiter.process(hot);
+            let main_out = [limited[0] * bal[0], limited[1] * bal[1]];
             for c in 0..2 {
-                main[c] = limited[c] * bal[c];
-                master_peak[c] = master_peak[c].max(main[c].abs());
+                master_peak[c] = master_peak[c].max(main_out[c].abs());
             }
+            // From here on, `main` is the mix without Room EQ.
+            let rec = rec.unwrap_or(limited);
+            let main = [rec[0] * bal[0], rec[1] * bal[1]];
+            main_buf[f] = main;
             let o = &mut out[f * channels..(f + 1) * channels];
-            o[0] = main[0];
+            o[0] = main_out[0];
             if channels > 1 {
-                o[1] = main[1];
+                o[1] = main_out[1];
             }
             if channels >= 4 {
                 if head_split {
@@ -4124,12 +4706,17 @@ impl Engine {
         self.master
             .vu
             .set(self.master_vu[0].max(self.master_vu[1]) as f64);
-        // The main mix as heard, for loopers recording it next buffer.
+        // The main mix as heard, without Room EQ, for loopers recording it
+        // next buffer.
         for f in 0..frames {
-            self.last_main[f] = [
-                out[f * channels],
-                out[(f * channels + 1).min(out.len() - 1)],
-            ];
+            self.last_main[f] = if external {
+                [
+                    out[f * channels],
+                    out[(f * channels + 1).min(out.len() - 1)],
+                ]
+            } else {
+                self.main_buf[f]
+            };
         }
         self.last_main_len = frames;
         // What is recorded and sent on air: one Auxiliary input as it comes
@@ -4139,23 +4726,18 @@ impl Engine {
             0 => None,
             n => AUXILIARIES.get(n - 1).copied(),
         };
-        if let Some(input) = source {
-            let rec = self.inputs[input].raw[..frames].as_flattened();
-            self.record.push(rec, 2);
-            self.meter.push(rec, 2);
-            self.broadcast.push(rec, 2);
-            self.live.push(rec, 2);
-        } else if external {
-            let rec = self.main_buf[..frames].as_flattened();
-            self.record.push(rec, 2);
-            self.meter.push(rec, 2);
-            self.broadcast.push(rec, 2);
-            self.live.push(rec, 2);
-        } else {
-            self.record.push(out, channels);
-            self.meter.push(out, channels);
-            self.broadcast.push(out, channels);
-            self.live.push(out, channels);
+        // The main mix is in `main_buf`: limited and without Room EQ, or
+        // with an external mixer, the inputs as they are.
+        let rec = match source {
+            Some(input) => self.inputs[input].raw[..frames].as_flattened(),
+            None => self.main_buf[..frames].as_flattened(),
+        };
+        self.record.push(rec, 2);
+        self.meter.push(rec, 2);
+        self.broadcast.push(rec, 2);
+        self.live.push(rec, 2);
+        if !external {
+            self.spectrum.push(out, channels);
         }
     }
 }
@@ -4300,7 +4882,7 @@ mod tests {
         run(&mut engine, 0.01);
         assert_eq!(presets(), vec![1.0, 1.0, 3.0, 1.0]);
         // Stepping on deck 3 wraps round past the last.
-        for want in [4.0, 5.0, 1.0] {
+        for want in [4.0, 5.0, 6.0, 1.0] {
             c(2, "next_chain_preset").set(1.0);
             c(2, "next_chain_preset").set(0.0);
             run(&mut engine, 0.01);
@@ -4309,7 +4891,7 @@ mod tests {
         c(1, "prev_chain_preset").set(1.0);
         c(1, "prev_chain_preset").set(0.0);
         run(&mut engine, 0.01);
-        assert_eq!(presets(), vec![1.0, 5.0, 1.0, 1.0]);
+        assert_eq!(presets(), vec![1.0, 6.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -4422,7 +5004,7 @@ mod tests {
         load(&mut input, 0, track.clone());
         run(&mut engine, 0.01);
         assert_eq!(reg.get("[Channel1]", "stem_count").unwrap().get(), 4.0);
-        assert_eq!(reg_stem(&reg, "color").get(), 0x2E4E75 as f64);
+        assert_eq!(reg_stem(&reg, "color").get(), 0xC9444A as f64);
         assert_eq!(reg.get("[Channel2]", "stem_count").unwrap().get(), 0.0);
     }
 
@@ -4585,6 +5167,82 @@ mod tests {
         assert!(!fx.get_bool());
     }
 
+    /// Peak level over each 10 ms of the left channel.
+    fn peaks(left: &[f32]) -> Vec<f32> {
+        left.chunks((SR * 0.01) as usize)
+            .map(|c| c.iter().fold(0f32, |m, v| m.max(v.abs())))
+            .collect()
+    }
+
+    #[test]
+    fn stem_trans_chops_the_stem_and_stops_at_once() {
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, vocal_tone_track(14.0));
+        run(&mut engine, 0.01);
+        reg.get("[Channel1]", "stem_fx").unwrap().set(4.0);
+        reg.get("[Channel1]", "stem_fx_beats").unwrap().set(0.25);
+        reg.get("[Channel1]", "play").unwrap().set_bool(true);
+        record(&mut engine, 0.5);
+        let fx = reg
+            .get("[QuickEffectRack1_[Channel1_Stem4]]", "enabled")
+            .unwrap();
+        fx.set_bool(true);
+        // A quarter beat at 120 BPM is 125 ms: open half, shut half.
+        let chopped = peaks(&record(&mut engine, 1.0));
+        let shut = chopped.iter().filter(|&&p| p < 0.01).count();
+        let open = chopped.iter().filter(|&&p| p > 0.25).count();
+        assert!(
+            shut > 30 && open > 30,
+            "shut {shut}, open {open}: {chopped:?}"
+        );
+        // Let go, the stem is back whole at once, with nothing ringing on.
+        fx.set_bool(false);
+        record(&mut engine, 0.05);
+        assert!(!engine.decks[0].stem_fx.ringing());
+        let after = peaks(&record(&mut engine, 0.5));
+        assert!(after.iter().all(|&p| p > 0.25), "{after:?}");
+    }
+
+    #[test]
+    fn stem_roll_repeats_in_place_of_the_stem() {
+        let (reg, mut engine, mut input) = setup();
+        let mut t = (*vocal_tone_track(14.0)).clone();
+        // A tone that rises, so a repeat is told apart from playing on.
+        let n = (SR * 14.0) as usize;
+        let frames: Vec<_> = (0..n)
+            .map(|i| {
+                let v = (i as f32 / n as f32) * 0.5;
+                [[0.0; 2], [0.0; 2], [0.0; 2], [v, v], [0.0; 2]]
+            })
+            .collect();
+        let audio = Audio::from_frames(SR as u32, vec![[0.0; 2]; n]);
+        assert!(audio.set_stems(crate::stems::Stems::from_frames(
+            crate::stems::default_info(),
+            SR as u32,
+            &frames
+        )));
+        t.audio = Some(Arc::new(audio));
+        load(&mut input, 0, Arc::new(t));
+        run(&mut engine, 0.01);
+        reg.get("[Channel1]", "stem_fx").unwrap().set(3.0);
+        reg.get("[Channel1]", "stem_fx_beats").unwrap().set(0.5);
+        reg.get("[Channel1]", "play").unwrap().set_bool(true);
+        record(&mut engine, 2.0);
+        let fx = reg
+            .get("[QuickEffectRack1_[Channel1_Stem4]]", "enabled")
+            .unwrap();
+        fx.set_bool(true);
+        let rolled = record(&mut engine, 1.5);
+        // Playing on, the level would climb by about 0.05 over 1.5 s; the
+        // roll keeps going back to where it started.
+        let early = rolled[(SR * 0.3) as usize];
+        let late = rolled[(SR * 1.4) as usize];
+        assert!((late - early).abs() < 0.03, "{early} {late}");
+        fx.set_bool(false);
+        record(&mut engine, 0.05);
+        assert!(!engine.decks[0].stem_fx.ringing());
+    }
+
     #[test]
     fn high_quality_stems_take_over_without_a_click() {
         // The stems made on load hold the whole tone in stem 1; the better
@@ -4646,6 +5304,65 @@ mod tests {
     }
 
     #[test]
+    fn high_quality_stems_play_a_stretch_at_a_time() {
+        // As above, but the better stems only have their first chunk, as
+        // when they are separated from the play position outwards: the deck
+        // fades to them there, and back to the stems made on load before
+        // it reaches the chunk they don't have yet.
+        let mut t = (*short_track(120.0, 4.0)).clone();
+        let n = (SR * 4.0) as usize;
+        let tone = |i: usize| (std::f64::consts::TAU * 220.0 * i as f64 / SR).sin() as f32 * 0.3;
+        let audio = Audio::from_frames(SR as u32, (0..n).map(|i| [tone(i); 2]).collect());
+        let info = crate::stems::default_info();
+        let layer = |stem: bool, quality, chunks: usize| {
+            let s = Arc::new(crate::stems::Stems::separated(
+                info.clone(),
+                SR as u32,
+                n,
+                quality,
+            ));
+            for (k, start) in (0..n).step_by(crate::stems::CHUNK).enumerate().take(chunks) {
+                let end = (start + crate::stems::CHUNK).min(n);
+                let frames = (start..end)
+                    .map(|i| {
+                        let mut f = [[0i16; 2]; MAX_STEMS];
+                        if stem {
+                            f[0] = [crate::stems::to_i16(tone(i)); 2];
+                        }
+                        f
+                    })
+                    .collect();
+                s.fill(k, frames);
+            }
+            s
+        };
+        let fast = layer(true, crate::stems::Quality::Fast, usize::MAX);
+        fast.finish();
+        assert!(audio.set_stems(fast.clone()));
+        assert!(fast.set_upgrade(layer(false, crate::stems::Quality::High, 1)));
+        t.audio = Some(Arc::new(audio));
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, Arc::new(t));
+        run(&mut engine, 0.01);
+        reg.get("[Channel1_Stem1]", "mute").unwrap().set_bool(true);
+        run(&mut engine, 0.01);
+        reg.get("[Channel1]", "play").unwrap().set_bool(true);
+        let peak = |v: &[f32]| v.iter().fold(0f32, |m, x| m.max(x.abs()));
+        // The first chunk is high quality: the tone plays.
+        let first = record(&mut engine, 0.6);
+        assert!(peak(&first[first.len() / 2..]) > 0.2, "{}", peak(&first));
+        // Half a second before the second chunk, which isn't there yet, the
+        // muted stem is cut again.
+        let later = record(&mut engine, 0.8);
+        assert!(peak(&later[later.len() / 2..]) < 1e-3, "{}", peak(&later));
+        let left: Vec<f32> = first.iter().chain(&later).step_by(2).copied().collect();
+        let step = left
+            .windows(2)
+            .fold(0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(step < 0.02, "a click: {step}");
+    }
+
+    #[test]
     fn booth_follows_the_main_mix_at_its_own_level() {
         let (reg, mut engine, mut input) = setup();
         load(&mut input, 0, tone_track(440.0, "A"));
@@ -4672,6 +5389,127 @@ mod tests {
             .0
             .iter()
             .all(|f| f[4] == 0.0 && f[5] == 0.0));
+    }
+
+    /// Two engines playing the same tone at `pregain` to the main, headphone
+    /// (main only) and booth outputs, one with `room` set on its Room EQ controls
+    /// after `on_at` buffers (and back to flat `off_at`). Returns each
+    /// engine's six-channel output and recording.
+    fn room_eq_pair(
+        pregain: f64,
+        room: &[(&str, &str, f64)],
+        on_at: usize,
+        off_at: usize,
+        buffers: usize,
+    ) -> [(Vec<f32>, Vec<f32>); 2] {
+        std::array::from_fn(|n| {
+            let (reg, mut engine, mut input) = setup();
+            reg.get("[Master]", "headMix").unwrap().set(1.0);
+            load(&mut input, 0, tone_track(440.0, "A"));
+            engine.process(&mut vec![0.0; 512 * 6], 6);
+            let c = |k: &str| reg.get("[Channel1]", k).unwrap();
+            c("pregain").set(pregain);
+            c("play").set_bool(true);
+            let mut feed = engine.take_record_feed().unwrap();
+            feed.set_active(true);
+            let (mut out, mut rec) = (Vec::new(), Vec::new());
+            let mut buf = vec![0.0f32; 512 * 6];
+            for b in 0..buffers {
+                if n == 1 && (b == on_at || b == off_at) {
+                    for (g, k, v) in room {
+                        let c = reg.get(g, k).unwrap();
+                        if b == on_at {
+                            c.set(*v);
+                        } else {
+                            c.reset();
+                        }
+                    }
+                }
+                engine.process(&mut buf, 6);
+                out.extend_from_slice(&buf);
+                feed.drain_into(&mut rec);
+            }
+            (out, rec)
+        })
+    }
+
+    /// One channel of six-channel audio, from `skip` frames on: its RMS.
+    fn channel_rms(out: &[f32], channel: usize, skip: usize) -> f32 {
+        let v: Vec<f32> = out.chunks(6).skip(skip).map(|f| f[channel]).collect();
+        (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn room_eq_reaches_the_main_output_only() {
+        let bell = [
+            ("[RoomEQ_Main]", "enabled", 1.0),
+            ("[RoomEQ_Main]", "b3_freq", 440.0),
+            ("[RoomEQ_Main]", "b3_gain", -6.0),
+        ];
+        let [(plain, plain_rec), (eqd, eqd_rec)] = room_eq_pair(1.0, &bell, 10, usize::MAX, 60);
+        // The recording and the headphones are the same, sample for sample,
+        // and the recording is the main output without Room EQ.
+        assert_eq!(plain_rec, eqd_rec);
+        let main_pair = |o: &[f32]| o.chunks(6).flat_map(|f| [f[0], f[1]]).collect::<Vec<_>>();
+        assert_eq!(
+            &plain_rec[..],
+            &main_pair(&plain)[plain.len() / 6 * 2 - plain_rec.len()..]
+        );
+        for (a, b) in plain.chunks(6).zip(eqd.chunks(6)) {
+            assert_eq!(a[2..4], b[2..4], "headphones");
+            assert_eq!(a[4..6], b[4..6], "booth");
+        }
+        // The main output is about 6 dB down once the bell has glided in.
+        let skip = 20 * 512;
+        let drop = 20.0 * (channel_rms(&eqd, 0, skip) / channel_rms(&plain, 0, skip)).log10();
+        assert!((drop + 6.0).abs() < 1.0, "{drop}");
+    }
+
+    #[test]
+    fn booth_room_eq_reaches_the_booth_only() {
+        let shelf = [
+            ("[RoomEQ_Booth]", "enabled", 1.0),
+            ("[RoomEQ_Booth]", "b5_freq", 300.0),
+            ("[RoomEQ_Booth]", "b5_gain", -4.0),
+        ];
+        let [(plain, plain_rec), (eqd, eqd_rec)] = room_eq_pair(0.5, &shelf, 10, usize::MAX, 40);
+        assert_eq!(plain_rec, eqd_rec);
+        for (a, b) in plain.chunks(6).zip(eqd.chunks(6)) {
+            assert_eq!(a[..4], b[..4], "main and headphones");
+        }
+        let skip = 20 * 512;
+        let drop = 20.0 * (channel_rms(&eqd, 4, skip) / channel_rms(&plain, 4, skip)).log10();
+        assert!(drop < -3.0 && drop > -4.5, "{drop}");
+    }
+
+    #[test]
+    fn room_eq_coming_and_going_leaves_no_seam() {
+        // A boost into the limiter, on and then off again: the recording
+        // never notices, and the main output comes back to exactly what it
+        // was without Room EQ.
+        let boost = [
+            ("[RoomEQ_Main]", "enabled", 1.0),
+            ("[RoomEQ_Main]", "b2_freq", 1000.0),
+            ("[RoomEQ_Main]", "b2_gain", 6.0),
+        ];
+        let [(plain, plain_rec), (eqd, eqd_rec)] = room_eq_pair(3.0, &boost, 10, 30, 160);
+        assert_eq!(plain_rec, eqd_rec);
+        let late = 150 * 512 * 6;
+        assert_eq!(plain[late..], eqd[late..]);
+        // While on, the boost was limited, not clipped, and changed the sound.
+        let mid = &eqd[20 * 512 * 6..30 * 512 * 6];
+        assert!(mid.chunks(6).all(|f| f[0].abs() <= LIMIT_CEILING));
+        assert_ne!(&plain[20 * 512 * 6..30 * 512 * 6], mid);
+        // Left channel, sample to sample: no jump as it comes and goes.
+        let left: Vec<f32> = eqd.chunks(6).map(|f| f[0]).collect();
+        let step = left
+            .windows(2)
+            .fold(0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        let plain_left: Vec<f32> = plain.chunks(6).map(|f| f[0]).collect();
+        let plain_step = plain_left
+            .windows(2)
+            .fold(0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(step < plain_step * 1.3, "{step} vs {plain_step}");
     }
 
     /// Renders `buffers` of 512 frames at the full output width and returns
@@ -5303,6 +6141,26 @@ mod tests {
     }
 
     #[test]
+    fn beat_loop_uses_the_nearest_quantize_point() {
+        let (reg, mut engine, mut input) = setup();
+        let track = short_track(120.0, 20.0);
+        load(&mut input, 0, track.clone());
+        run(&mut engine, 0.02);
+        let ctl = |k: &str| reg.get("[Channel1]", k).unwrap();
+        ctl("playposition").set(track.seconds_at(3.8) / track.duration);
+        ctl("play").set_bool(true);
+        run(&mut engine, 0.01);
+
+        ctl("beatloop_1_activate").set_bool(true);
+        ctl("beatloop_1_activate").set_bool(false);
+        run(&mut engine, 0.01);
+
+        let start = track.beat_at(ctl("loop_start_position").get());
+        assert!((start - 4.0).abs() < 1e-6, "started on beat {start}");
+        assert!(ctl("loop_enabled").get_bool());
+    }
+
+    #[test]
     fn sync_matches_tempo_and_hotcues_catch_fast_presses() {
         let (reg, mut engine, mut input) = setup();
         load(&mut input, 0, short_track(124.0, 10.0));
@@ -5550,6 +6408,40 @@ mod tests {
     }
 
     #[test]
+    fn cue_on_a_paused_deck_is_set_on_the_beat() {
+        let (reg, mut engine, mut input) = setup();
+        let track = short_track(120.0, 30.0);
+        load(&mut input, 0, track.clone());
+        run(&mut engine, 0.02);
+        let c = |k: &str| reg.get("[Channel1]", k).unwrap();
+        // Paused just past beat 6 with quantize on (as by default): the cue
+        // point and the deck go to beat 6.
+        c("playposition").set(track.seconds_at(6.3) / track.duration);
+        run(&mut engine, 0.02);
+        press(&reg, "[Channel1]", "cue_default");
+        run(&mut engine, 0.02);
+        assert!((track.beat_at(c("cue_point").get()) - 6.0).abs() < 1e-3);
+        assert!((track.beat_at(engine.decks[0].seconds()) - 6.0).abs() < 1e-3);
+        // CUE PLAY too, from just before beat 9.
+        c("playposition").set(track.seconds_at(8.8) / track.duration);
+        run(&mut engine, 0.02);
+        c("cue_play").set_bool(true);
+        run(&mut engine, 0.01);
+        assert!((track.beat_at(c("cue_point").get()) - 9.0).abs() < 1e-3);
+        c("cue_play").set_bool(false);
+        run(&mut engine, 0.02);
+        c("play").set_bool(false);
+        run(&mut engine, 0.02);
+        // Quantize off: where the deck is.
+        c("quantize").set_bool(false);
+        c("playposition").set(track.seconds_at(4.3) / track.duration);
+        run(&mut engine, 0.02);
+        press(&reg, "[Channel1]", "cue_default");
+        run(&mut engine, 0.02);
+        assert!((track.beat_at(c("cue_point").get()) - 4.3).abs() < 0.02);
+    }
+
+    #[test]
     fn a_hot_cue_is_set_on_the_quantize_step() {
         let (reg, mut engine, mut input) = setup();
         let track = short_track(120.0, 30.0);
@@ -5569,6 +6461,160 @@ mod tests {
         press(&reg, "[Channel1]", "hotcue_2_activate");
         run(&mut engine, 0.02);
         assert!((beat_at("hotcue_2_position") - 2.27).abs() < 0.02);
+    }
+
+    #[test]
+    fn a_synced_hot_cue_waits_for_the_upcoming_quantize_point() {
+        let (reg, mut engine, mut input) = setup();
+        let leader = short_track(120.0, 30.0);
+        let follower = short_track(120.0, 30.0);
+        load(&mut input, 0, leader.clone());
+        load(&mut input, 1, follower.clone());
+        run(&mut engine, 0.02);
+        let c = |d: &str, k: &str| reg.get(d, k).unwrap();
+
+        // The leader is in the second half of its beat, so the upcoming beat
+        // is nearer than the one behind it.
+        c("[Channel1]", "playposition").set(leader.seconds_at(3.75) / leader.duration);
+        c("[Channel1]", "play").set_bool(true);
+        c("[Channel2]", "sync_enabled").set_bool(true);
+        c("[Channel2]", "hotcue_1_position").set(follower.seconds_at(8.0));
+        c("[Channel2]", "hotcue_1_enabled").set_bool(true);
+        c("[Channel2]", "hotcue_1_type").set(HOTCUE_CUE);
+        run(&mut engine, 0.01);
+        let parked = engine.decks[1].seconds();
+
+        press(&reg, "[Channel2]", "hotcue_1_activate");
+        run(&mut engine, 0.01);
+        let pending = engine.decks[1]
+            .pending_hotcue
+            .expect("hot cue should wait for the upcoming beat");
+        assert!(pending.at > engine.clock);
+        assert!(!c("[Channel2]", "play").get_bool());
+        assert!((engine.decks[1].seconds() - parked).abs() < 1e-9);
+
+        run(&mut engine, 0.3);
+        assert!(engine.decks[1].pending_hotcue.is_none());
+        assert!(c("[Channel2]", "play").get_bool());
+        assert!(phase_gap(&engine) < 0.03, "{}", phase_gap(&engine));
+    }
+
+    #[test]
+    fn a_synced_saved_loop_waits_for_the_upcoming_quantize_point() {
+        let (reg, mut engine, mut input) = setup();
+        let leader = short_track(120.0, 30.0);
+        let follower = short_track(120.0, 30.0);
+        load(&mut input, 0, leader.clone());
+        load(&mut input, 1, follower.clone());
+        run(&mut engine, 0.02);
+        let c = |d: &str, k: &str| reg.get(d, k).unwrap();
+        let (start, end) = (follower.seconds_at(8.0), follower.seconds_at(12.0));
+
+        c("[Channel1]", "playposition").set(leader.seconds_at(3.75) / leader.duration);
+        c("[Channel1]", "play").set_bool(true);
+        c("[Channel2]", "sync_enabled").set_bool(true);
+        c("[Channel2]", "hotcue_1_position").set(start);
+        c("[Channel2]", "hotcue_1_endposition").set(end);
+        c("[Channel2]", "hotcue_1_enabled").set_bool(true);
+        c("[Channel2]", "hotcue_1_type").set(HOTCUE_LOOP);
+        run(&mut engine, 0.01);
+        let parked = engine.decks[1].seconds();
+
+        press(&reg, "[Channel2]", "hotcue_1_activate");
+        run(&mut engine, 0.01);
+        let pending = engine.decks[1]
+            .pending_hotcue
+            .expect("saved loop should wait for the upcoming beat");
+        assert_eq!(pending.launch.end, Some(end));
+        assert!(!c("[Channel2]", "loop_enabled").get_bool());
+        assert!(!c("[Channel2]", "play").get_bool());
+        assert!((engine.decks[1].seconds() - parked).abs() < 1e-9);
+
+        run(&mut engine, 0.3);
+        assert!(engine.decks[1].pending_hotcue.is_none());
+        assert!(c("[Channel2]", "loop_enabled").get_bool());
+        assert!(c("[Channel2]", "play").get_bool());
+        assert_eq!(
+            (engine.decks[1].loop_start, engine.decks[1].loop_end),
+            (start, end)
+        );
+        assert!(phase_gap(&engine) < 0.03, "{}", phase_gap(&engine));
+    }
+
+    #[test]
+    fn a_playing_deck_runs_on_while_its_hot_cue_waits() {
+        let (reg, mut engine, mut input) = setup();
+        let leader = short_track(120.0, 30.0);
+        let follower = short_track(120.0, 30.0);
+        load(&mut input, 0, leader.clone());
+        load(&mut input, 1, follower.clone());
+        run(&mut engine, 0.02);
+        let c = |d: &str, k: &str| reg.get(d, k).unwrap();
+
+        for d in ["[Channel1]", "[Channel2]"] {
+            c(d, "play").set_bool(true);
+        }
+        c("[Channel2]", "sync_enabled").set_bool(true);
+        c("[Channel2]", "hotcue_1_position").set(follower.seconds_at(8.0));
+        c("[Channel2]", "hotcue_1_enabled").set_bool(true);
+        c("[Channel2]", "hotcue_1_type").set(HOTCUE_CUE);
+        run(&mut engine, 0.37);
+        let before = engine.decks[1].seconds();
+
+        press(&reg, "[Channel2]", "hotcue_1_activate");
+        run(&mut engine, 0.01);
+        let after = engine.decks[1].seconds();
+        assert!(
+            engine.decks[1].pending_hotcue.is_some(),
+            "leader beat {}, follower beat {}, following {}",
+            leader.beat_at(engine.decks[0].seconds()),
+            follower.beat_at(after),
+            engine.decks[1].following
+        );
+        assert!((0.0..0.03).contains(&(after - before)), "{before}..{after}");
+        assert!((after - follower.seconds_at(8.0)).abs() > 0.5);
+
+        run(&mut engine, 0.3);
+        assert!(engine.decks[1].pending_hotcue.is_none());
+        assert!(phase_gap(&engine) < 0.03, "{}", phase_gap(&engine));
+    }
+
+    #[test]
+    fn pausing_or_cue_cancels_a_waiting_hot_cue() {
+        for control in ["play", "cue_default"] {
+            let (reg, mut engine, mut input) = setup();
+            let leader = short_track(120.0, 30.0);
+            let follower = short_track(120.0, 30.0);
+            load(&mut input, 0, leader.clone());
+            load(&mut input, 1, follower.clone());
+            run(&mut engine, 0.02);
+            let c = |d: &str, k: &str| reg.get(d, k).unwrap();
+
+            for d in ["[Channel1]", "[Channel2]"] {
+                c(d, "play").set_bool(true);
+            }
+            c("[Channel2]", "sync_enabled").set_bool(true);
+            c("[Channel2]", "hotcue_1_position").set(follower.seconds_at(8.0));
+            c("[Channel2]", "hotcue_1_enabled").set_bool(true);
+            c("[Channel2]", "hotcue_1_type").set(HOTCUE_CUE);
+            run(&mut engine, 0.37);
+
+            press(&reg, "[Channel2]", "hotcue_1_activate");
+            run(&mut engine, 0.01);
+            assert!(engine.decks[1].pending_hotcue.is_some(), "{control}");
+
+            // Pause, or CUE on a playing deck (which stops it at the cue).
+            if control == "play" {
+                c("[Channel2]", "play").set_bool(false);
+            } else {
+                press(&reg, "[Channel2]", "cue_default");
+            }
+            run(&mut engine, 0.3);
+            assert!(engine.decks[1].pending_hotcue.is_none(), "{control}");
+            assert!(!c("[Channel2]", "play").get_bool(), "{control}");
+            let beat = follower.beat_at(engine.decks[1].seconds());
+            assert!((beat - 8.0).abs() > 0.5, "{control} launched: beat {beat}");
+        }
     }
 
     /// A controller's delete is pressed and let go between two blocks; it
@@ -5625,6 +6671,34 @@ mod tests {
     }
 
     #[test]
+    fn a_hot_cue_on_a_paused_deck_plays_from_it() {
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, short_track(120.0, 20.0));
+        run(&mut engine, 0.01);
+        let ctl = |k: &str| reg.get("[Channel1]", k).unwrap();
+        ctl("hotcue_2_position").set(6.0);
+        ctl("hotcue_2_enabled").set_bool(true);
+        ctl("hotcue_2_type").set(1.0);
+        assert!(!ctl("play").get_bool());
+        ctl("hotcue_2_activate").set_bool(true);
+        run(&mut engine, 0.01);
+        ctl("hotcue_2_activate").set_bool(false);
+        run(&mut engine, 0.3);
+        assert!(ctl("play").get_bool(), "still paused");
+        let at = ctl("playposition").get() * 20.0;
+        assert!(at > 6.1 && at < 6.5, "{at}");
+        // An empty pad on a paused deck only sets a cue.
+        ctl("play").set_bool(false);
+        run(&mut engine, 0.01);
+        ctl("hotcue_5_activate").set_bool(true);
+        run(&mut engine, 0.01);
+        ctl("hotcue_5_activate").set_bool(false);
+        run(&mut engine, 0.01);
+        assert!(ctl("hotcue_5_enabled").get_bool());
+        assert!(!ctl("play").get_bool());
+    }
+
+    #[test]
     fn a_hot_cue_on_a_synced_deck_lands_in_phase() {
         let (reg, mut engine, mut input) = setup();
         load(&mut input, 0, short_track(124.0, 30.0));
@@ -5641,7 +6715,7 @@ mod tests {
         press(&reg, "[Channel2]", "hotcue_3_activate");
         run(&mut engine, 1.33);
         press(&reg, "[Channel2]", "hotcue_3_activate");
-        run(&mut engine, 0.05);
+        run(&mut engine, 0.3);
         assert!(phase_gap(&engine) < 0.01, "{}", phase_gap(&engine));
     }
 
@@ -5853,6 +6927,23 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_loop_plays_from_its_start() {
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, short_track(120.0, 10.0));
+        run(&mut engine, 0.02);
+        let c = |k: &str| reg.get("[Channel1]", k).unwrap();
+        c("saved_loop_start").set(2.0);
+        c("saved_loop_end").set(4.0);
+        c("saved_loop_activate").set_bool(true);
+        c("saved_loop_activate").set_bool(false);
+        run(&mut engine, 0.02);
+        let d = &engine.decks[0];
+        assert!(c("loop_enabled").get_bool() && c("play").get_bool());
+        assert_eq!((d.loop_start, d.loop_end), (2.0, 4.0));
+        assert!(d.seconds() >= 2.0 && d.seconds() < 2.1, "{}", d.seconds());
+    }
+
+    #[test]
     fn an_empty_hot_cue_saves_the_playing_loop() {
         let (reg, mut engine, mut input) = setup();
         load(&mut input, 0, short_track(120.0, 10.0));
@@ -5913,6 +7004,86 @@ mod tests {
         assert_eq!(c("hotcue_5_type").get(), HOTCUE_LOOP);
         assert_eq!(c("hotcue_5_endposition").get(), 4.0);
         press("hotcue_5_activate");
+        run(&mut engine, 0.02);
+        assert!(c("loop_enabled").get_bool());
+    }
+
+    #[test]
+    fn a_hot_cue_outside_the_loop_ends_it() {
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, short_track(120.0, 10.0));
+        run(&mut engine, 0.02);
+        let c = |k: &str| reg.get("[Channel1]", k).unwrap();
+        let press = |k: &str| {
+            c(k).set_bool(true);
+            c(k).set_bool(false);
+        };
+        // A cue at 6 s, then a 4-beat loop near the start.
+        c("hotcue_1_position").set(6.0);
+        c("hotcue_1_enabled").set_bool(true);
+        c("hotcue_1_type").set(HOTCUE_CUE);
+        c("play").set_bool(true);
+        run(&mut engine, 0.5);
+        press("beatloop_4_activate");
+        run(&mut engine, 0.02);
+        assert!(c("loop_enabled").get_bool());
+
+        // Jumping to the cue leaves the loop and plays on from the cue.
+        press("hotcue_1_activate");
+        run(&mut engine, 0.1);
+        assert!(!c("loop_enabled").get_bool());
+        let at = engine.decks[0].seconds();
+        assert!((6.0..6.5).contains(&at), "at {at}");
+
+        // A cue inside the loop keeps it.
+        press("beatloop_4_activate");
+        run(&mut engine, 0.02);
+        let start = engine.decks[0].loop_start;
+        c("hotcue_2_position").set(start + 0.1);
+        c("hotcue_2_enabled").set_bool(true);
+        c("hotcue_2_type").set(HOTCUE_CUE);
+        press("hotcue_2_activate");
+        run(&mut engine, 0.02);
+        assert!(c("loop_enabled").get_bool());
+    }
+
+    #[test]
+    fn deleting_the_playing_loops_pad_ends_the_loop() {
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, short_track(120.0, 10.0));
+        run(&mut engine, 0.02);
+        let c = |k: &str| reg.get("[Channel1]", k).unwrap();
+        let press = |k: &str| {
+            c(k).set_bool(true);
+            c(k).set_bool(false);
+        };
+        c("play").set_bool(true);
+        run(&mut engine, 0.5);
+        press("beatloop_4_activate");
+        run(&mut engine, 0.02);
+        press("hotcue_1_activate");
+        run(&mut engine, 0.02);
+        assert_eq!(c("hotcue_1_type").get(), HOTCUE_LOOP);
+
+        // A second empty pad sets a cue: the loop is on pad 1 already.
+        press("hotcue_2_activate");
+        run(&mut engine, 0.02);
+        assert_eq!(c("hotcue_2_type").get(), HOTCUE_CUE);
+        assert!(c("loop_enabled").get_bool());
+
+        // Deleting pad 1 ends its loop; pressing it again sets a cue.
+        press("hotcue_1_clear");
+        run(&mut engine, 0.02);
+        assert!(!c("hotcue_1_enabled").get_bool());
+        assert!(!c("loop_enabled").get_bool());
+        press("hotcue_1_activate");
+        run(&mut engine, 0.02);
+        assert_eq!(c("hotcue_1_type").get(), HOTCUE_CUE);
+
+        // Deleting a cue pad leaves a playing loop alone.
+        press("beatloop_4_activate");
+        run(&mut engine, 0.02);
+        press("hotcue_2_clear");
         run(&mut engine, 0.02);
         assert!(c("loop_enabled").get_bool());
     }
@@ -6016,11 +7187,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The first tap only starts the count.
-        assert_eq!(taps.len(), 3, "{taps:?}");
-        for bpm in taps {
-            assert!((bpm - 96.0).abs() < 1.0, "{bpm}");
-        }
+        // The third tap gives the tempo, rounded to a whole BPM; the fourth
+        // agrees, so changes nothing.
+        assert_eq!(taps, [96.0]);
 
         // reloop_exit is Mixxx's old name for reloop_toggle.
         ctl("beatloop_2_activate").set_bool(true);
@@ -6101,11 +7270,14 @@ mod tests {
         let track = short_track(124.0, 4.0);
         let dry = render(&track, |_| {});
         for (k, name) in AVAILABLE_EFFECTS.iter().enumerate() {
+            // Solo on the whole signal keeps it all: try it on the highs.
+            let band = if *name == "Solo" { 4.0 } else { 0.0 };
             let fx = |enabled: bool, unit_on: bool| {
                 move |reg: &ControlRegistry| {
                     let slot =
                         |key: &str| reg.get("[EffectRack1_EffectUnit1_Effect1]", key).unwrap();
                     slot("loaded_effect").set((k + 1) as f64);
+                    slot("band").set(band);
                     slot("meta").set(0.8);
                     slot("enabled").set_bool(enabled);
                     reg.get("[EffectRack1_EffectUnit1]", "enabled")
@@ -6174,16 +7346,18 @@ mod tests {
         assert_eq!(slot(1, "loaded_effect").get(), 1.0);
         slot(1, "effect_selector").set(1.0);
         run(&mut engine, 0.01);
-        assert_eq!(slot(1, "loaded_effect").get(), 2.0);
+        // The list's order: Echo Out follows Echo.
+        assert_eq!(
+            crate::effect_name(slot(1, "loaded_effect").get()),
+            "Echo Out"
+        );
         assert_eq!(slot(1, "effect_selector").get(), 0.0);
         slot(1, "effect_selector").set(-1.0);
         run(&mut engine, 0.01);
         slot(1, "effect_selector").set(-1.0);
         run(&mut engine, 0.01);
-        assert_eq!(
-            slot(1, "loaded_effect").get(),
-            AVAILABLE_EFFECTS.len() as f64
-        );
+        // Back past the first effect to the last: Roll.
+        assert_eq!(crate::effect_name(slot(1, "loaded_effect").get()), "Roll");
         slot(1, "next_effect").set_bool(true);
         run(&mut engine, 0.01);
         assert_eq!(crate::effect_name(slot(1, "loaded_effect").get()), "Echo");
@@ -6266,6 +7440,22 @@ mod tests {
     }
 
     #[test]
+    fn a_held_overview_lets_go_when_a_track_loads() {
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, short_track(120.0, 60.0));
+        run(&mut engine, 0.01);
+        let ctl = |k: &str| reg.get("[Channel1]", k).unwrap();
+        // Left held: a drag whose release went to another deck.
+        ctl("seek_hold").set_bool(true);
+        ctl("play").set_bool(false);
+        load(&mut input, 0, short_track(120.0, 60.0));
+        run(&mut engine, 0.01);
+        ctl("play").set_bool(true);
+        assert!(run(&mut engine, 0.1) > 0.01, "the new track plays");
+        assert!(!ctl("seek_hold").get_bool());
+    }
+
+    #[test]
     fn scratching_backwards_and_jog() {
         let (reg, mut engine, mut input) = setup();
         load(&mut input, 0, short_track(120.0, 10.0));
@@ -6290,16 +7480,17 @@ mod tests {
         run(&mut engine, 0.5);
         assert_eq!(seconds(), 0.0);
 
-        // Jog while paused scrubs forward: 10 ms of track per unit.
+        // Jog while paused scrubs forward, as in Mixxx: 18 ms of track per
+        // unit.
         ctl("scratch2_enable").set_bool(false);
         ctl("play").set_bool(false);
         run(&mut engine, 0.02);
         ctl("playposition").set(0.2);
         run(&mut engine, 0.02);
         ctl("jog").set(20.0);
-        assert!(run(&mut engine, 0.5) > 0.01, "a nudge is heard");
+        assert!(run(&mut engine, 0.8) > 0.01, "a nudge is heard");
         assert_eq!(ctl("jog").get(), 0.0);
-        assert!((seconds() - 2.2).abs() < 0.01, "{}", seconds());
+        assert!((seconds() - 2.36).abs() < 0.01, "{}", seconds());
 
         // A fast search (SHIFT + jog) moves on silently, then sound returns.
         ctl("play").set_bool(true);
@@ -6307,7 +7498,7 @@ mod tests {
         let before = seconds();
         let mut quiet = 0.0f32;
         for i in 0..4 {
-            ctl("jog").set(75.0);
+            ctl("jog_search").set(75.0);
             let peak = run(&mut engine, 0.02);
             // The first buffer fades out.
             if i > 0 {
@@ -6318,6 +7509,54 @@ mod tests {
         assert!(quiet < 1e-3, "silent while searching: {quiet}");
         run(&mut engine, 0.3);
         assert!(run(&mut engine, 0.2) > 0.01, "heard again after searching");
+    }
+
+    #[test]
+    fn jog_while_playing_bends_the_speed_as_in_mixxx() {
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, short_track(120.0, 60.0));
+        run(&mut engine, 0.01);
+        let ctl = |k: &str| reg.get("[Channel1]", k).unwrap();
+        let seconds = || ctl("playposition").get() * 60.0;
+        ctl("play").set_bool(true);
+        run(&mut engine, 0.2);
+        // A Mixxx mapping's rim: 0.8 a tick, 180 ticks a second (a quarter
+        // turn) for about a second.
+        let turn = |engine: &mut Engine, ticks: f64| {
+            let dt = 512.0 / SR;
+            let n = 90;
+            let start = seconds();
+            for _ in 0..n {
+                ctl("jog").set(0.8 * ticks * dt);
+                run(engine, dt);
+            }
+            (seconds() - start) / (n as f64 * dt)
+        };
+        // About +14%, a little less while it builds up, and
+        // the playhead never jumps.
+        let faster = turn(&mut engine, 180.0);
+        assert!(faster > 1.1 && faster < 1.15, "clockwise: {faster}");
+        assert_eq!(ctl("jog").get(), 0.0);
+        run(&mut engine, 1.0);
+        let start = seconds();
+        run(&mut engine, 1.0);
+        assert!((seconds() - start - 1.0).abs() < 0.01, "springs back");
+        let slower = turn(&mut engine, -180.0);
+        assert!(slower < 0.9 && slower > 0.85, "counterclockwise: {slower}");
+        // A big jog (a Mixxx mapping's SHIFT search) plays fast, backwards
+        // too, and silently.
+        run(&mut engine, 1.0);
+        let start = seconds();
+        let mut quiet = 0.0f32;
+        for i in 0..20 {
+            ctl("jog").set(-200.0);
+            let peak = run(&mut engine, 0.02);
+            if i > 14 {
+                quiet = quiet.max(peak);
+            }
+        }
+        assert!(seconds() < start - 2.0, "{start} -> {}", seconds());
+        assert!(quiet < 1e-3, "silent while searching: {quiet}");
     }
 
     #[test]
@@ -6341,9 +7580,9 @@ mod tests {
             }
             (seconds() - start) / (n as f64 * dt)
         };
-        // About +14%, a little less while the bend builds up.
+        // About +2.5%, a little less while the bend builds up.
         let faster = turn(&mut engine, 180.0);
-        assert!(faster > 1.1 && faster < 1.15, "clockwise: {faster}");
+        assert!(faster > 1.018 && faster < 1.026, "clockwise: {faster}");
         assert_eq!(ctl("jog_bend").get(), 0.0);
         // It springs back once the rim stops.
         run(&mut engine, 1.0);
@@ -6355,15 +7594,19 @@ mod tests {
             seconds() - start
         );
         let slower = turn(&mut engine, -180.0);
-        assert!(slower < 0.9 && slower > 0.85, "counterclockwise: {slower}");
-        // Paused, the rim moves the track 8 ms a tick.
+        assert!(
+            slower < 0.982 && slower > 0.974,
+            "counterclockwise: {slower}"
+        );
+        // Paused, a full turn of the rim moves the track one bar: 2 s at
+        // 120 BPM.
         ctl("play").set_bool(false);
         run(&mut engine, 0.5);
         let start = seconds();
-        ctl("jog_bend").set(25.0);
+        ctl("jog_bend").set(720.0);
         run(&mut engine, 0.5);
         assert!(
-            (seconds() - start - 0.2).abs() < 0.01,
+            (seconds() - start - 2.0).abs() < 0.02,
             "{}",
             seconds() - start
         );
@@ -6793,6 +8036,9 @@ mod tests {
         run(&mut engine, 0.01);
         let ctl = |k: &str| reg.get("[Channel1]", k).unwrap();
         let seconds = || ctl("playposition").get() * 10.0;
+        // Off the grid on purpose: cue_on_a_paused_deck_is_set_on_the_beat
+        // covers quantize.
+        ctl("quantize").set_bool(false);
         ctl("playposition").set(0.2);
         run(&mut engine, 0.01);
         // Held on a stopped deck: sets the cue point there and plays.
@@ -7721,6 +8967,39 @@ mod tests {
     }
 
     #[test]
+    fn the_session_plays_on_its_own_channel() {
+        use crate::inputs::{SessionSource, MIXER};
+        struct Steady;
+        impl SessionSource for Steady {
+            fn render(&mut self, out: &mut [[f32; 2]]) {
+                out.fill([0.25; 2]);
+            }
+        }
+        let (reg, mut engine, _input) = setup();
+        let ses = |k: &str| reg.get("[Session1]", k).unwrap();
+        assert!(!ses("input_configured").get_bool());
+        assert!(engine.set_session(Some(Box::new(Steady))).is_none());
+        assert!(ses("input_configured").get_bool());
+        // Off until the channel is turned on, as the aux inputs are.
+        assert!(run(&mut engine, 0.2) < 1e-4);
+        ses("main_mix").set_bool(true);
+        run(&mut engine, 0.05);
+        assert!(run(&mut engine, 0.2) > 0.1, "the Session is heard");
+        // A deck playing the Mixer doesn't take it: it has its own channel.
+        reg.get("[Channel1]", "live_input")
+            .unwrap()
+            .set(MIXER as f64);
+        run(&mut engine, 0.05);
+        assert!(run(&mut engine, 0.2) > 0.1);
+        // Its fader turns it down.
+        ses("volume").set(0.0);
+        run(&mut engine, 0.1);
+        assert!(run(&mut engine, 0.2) < 1e-4);
+        assert!(engine.set_session(None).is_some());
+        assert!(!ses("input_configured").get_bool());
+    }
+
+    #[test]
     fn a_mixer_channel_plays_the_mixer_decks_groove_box() {
         use crate::inputs::{AUXILIARIES, MIXER};
         let (reg, mut engine, _input) = setup();
@@ -8036,6 +9315,117 @@ mod tests {
     }
 
     #[test]
+    fn loop_controls_do_not_interrupt_audio_before_the_loop_boundary() {
+        let ctl = |reg: &ControlRegistry, k: &str| reg.get("[Channel1]", k).unwrap();
+        let plain = play_tone(true, 80, |reg, n| {
+            if n == 0 {
+                ctl(reg, "rate").set(0.5);
+            }
+        });
+        let looped = play_tone(true, 80, |reg, n| match n {
+            0 => ctl(reg, "rate").set(0.5),
+            10 => ctl(reg, "beatloop_32_toggle").set_bool(true),
+            11 => ctl(reg, "beatloop_32_toggle").set_bool(false),
+            20 => ctl(reg, "beatloop_16_toggle").set_bool(true),
+            21 => ctl(reg, "beatloop_16_toggle").set_bool(false),
+            30 => ctl(reg, "loop_double").set_bool(true),
+            31 => ctl(reg, "loop_double").set_bool(false),
+            40 => ctl(reg, "loop_halve").set_bool(true),
+            41 => ctl(reg, "loop_halve").set_bool(false),
+            50 => ctl(reg, "beatloop_16_toggle").set_bool(true),
+            51 => ctl(reg, "beatloop_16_toggle").set_bool(false),
+            60 => ctl(reg, "loop_in").set_bool(true),
+            61 => ctl(reg, "loop_in").set_bool(false),
+            _ => {}
+        });
+        let difference = plain
+            .iter()
+            .zip(&looped)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            difference < 1e-4,
+            "loop controls changed the audio by {difference}"
+        );
+    }
+
+    #[test]
+    fn rapid_key_lock_toggles_do_not_interrupt_audio() {
+        // At normal speed with no key shift, key lock has no audible work to
+        // do: toggling it must leave the direct signal completely unchanged.
+        let plain = play_tone(false, 80, |_, _| {});
+        let ctl = |reg: &ControlRegistry, k: &str| reg.get("[Channel1]", k).unwrap();
+        let toggled = play_tone(false, 80, |reg, n| {
+            if (10..50).contains(&n) {
+                ctl(reg, "keylock").set_bool(n % 2 == 0);
+            }
+        });
+        let difference = plain
+            .iter()
+            .zip(&toggled)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            difference < 1e-4,
+            "key lock toggles changed the audio by {difference}"
+        );
+
+        // At +4%, turning key lock off raises the pitch by the speed factor.
+        // Compare that with the equivalent live key shift while key lock stays
+        // on: both exercise the same transpose changes, but only the former
+        // used to tear down and re-seed the stretcher on every toggle.
+        let speed = 1.04f64;
+        let speed_semitones = speed.log2() * 12.0;
+        let reference = play_tone(true, 80, |reg, n| {
+            if n == 0 {
+                ctl(reg, "rate").set(0.5);
+            }
+            if (30..60).contains(&n) {
+                ctl(reg, "pitch").set(if n % 2 == 0 { 0.0 } else { speed_semitones });
+            }
+        });
+        let toggled = play_tone(true, 80, |reg, n| {
+            if n == 0 {
+                ctl(reg, "rate").set(0.5);
+            }
+            if (30..60).contains(&n) {
+                ctl(reg, "keylock").set_bool(n % 2 == 0);
+            }
+        });
+        let difference = reference
+            .iter()
+            .zip(&toggled)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            difference < 1e-4,
+            "key lock toggles re-seeded the stretcher: {difference}"
+        );
+    }
+
+    #[test]
+    fn stretcher_lets_go_once_key_lock_is_off() {
+        // Key lock off at +4% leaves nothing for the stretcher to do: after
+        // lingering through possible quick toggles, the deck plays as a
+        // record again.
+        let (reg, mut engine, mut input) = setup();
+        load(&mut input, 0, long_tone_track(150.0, "", 30.0));
+        run(&mut engine, 0.01);
+        let ctl = |k: &str| reg.get("[Channel1]", k).unwrap();
+        ctl("rate").set(0.5);
+        ctl("keylock").set_bool(true);
+        ctl("playposition").set(0.3);
+        ctl("play").set_bool(true);
+        run(&mut engine, 0.3);
+        assert!(engine.decks[0].shifter.is_active());
+        ctl("keylock").set_bool(false);
+        run(&mut engine, SHIFT_LINGER_SECONDS / 2.0);
+        assert!(engine.decks[0].shifter.is_active());
+        run(&mut engine, SHIFT_LINGER_SECONDS);
+        assert!(!engine.decks[0].shifter.is_active());
+    }
+
+    #[test]
     fn key_lock_holds_through_nudges_without_clicks() {
         // Deck 1 plays 4% fast with key lock, so the stretcher and playing
         // as a record differ in pitch: switching between them hard clicks.
@@ -8067,6 +9457,55 @@ mod tests {
             _ => {}
         });
         assert!(scratch < 4.0 * steady, "scratch: {scratch}");
+    }
+
+    #[test]
+    fn touching_and_letting_go_of_the_platter_do_not_click() {
+        let ctl = |reg: &ControlRegistry, k: &str| reg.get("[Channel1]", k).unwrap();
+        let steady = roughness(&play_tone(false, 100, |_, _| {}));
+        // A playing deck: the hand comes down and stops it, holds it still
+        // with a little jitter, then lets go and the deck stops for good.
+        let held = play_tone(false, 100, |reg, n| match n {
+            10 => {
+                ctl(reg, "scratch2_enable").set_bool(true);
+                ctl(reg, "scratch2").set(0.5);
+            }
+            11 => ctl(reg, "scratch2").set(0.1),
+            12..=29 => ctl(reg, "scratch2").set(0.0),
+            30..=59 => ctl(reg, "scratch2").set(match n % 4 {
+                0 => 0.004,
+                2 => -0.003,
+                _ => 0.0,
+            }),
+            60 => {
+                ctl(reg, "play").set_bool(false);
+                ctl(reg, "scratch2").set(0.0);
+            }
+            61 => ctl(reg, "scratch2_enable").set_bool(false),
+            _ => {}
+        });
+        let rough = roughness(&held);
+        assert!(rough < 4.0 * steady, "touch and hold: {rough} vs {steady}");
+        // A scratch that settles to a stop on a paused deck ends quietly.
+        let scratch = play_tone(false, 60, |reg, n| match n {
+            0 => ctl(reg, "play").set_bool(false),
+            10 => {
+                ctl(reg, "scratch2_enable").set_bool(true);
+                ctl(reg, "scratch2").set(0.5);
+            }
+            11..=12 => ctl(reg, "scratch2").set(0.5 * (n - 9) as f64),
+            13..=30 => ctl(reg, "scratch2").set(1.5 * (30 - n) as f64 / 18.0),
+            31 => ctl(reg, "scratch2_enable").set_bool(false),
+            _ => {}
+        });
+        // (Pausing at the start stops at once, as play and stop do.)
+        let rough = roughness(&scratch[2 * 1024..]);
+        assert!(rough < 4.0 * steady, "scratch release: {rough} vs {steady}");
+        // Still audible while scratching.
+        let loud = scratch[15 * 1024..20 * 1024]
+            .iter()
+            .fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(loud > 0.05, "{loud}");
     }
 
     #[test]
@@ -8116,6 +9555,68 @@ mod tests {
         load(&mut input, 1, short_track(120.0, 4.0));
         run(&mut engine, 0.05);
         assert!(!g("enabled").get_bool());
+    }
+
+    #[test]
+    fn a_remix_deck_sends_or_inserts_its_source() {
+        let (reg, mut engine, mut input) = setup();
+        let ch = |n: usize, k: &str| reg.get(&format!("[Channel{n}]"), k).unwrap();
+        let rx = |k: &str| reg.get("[Remix2]", k).unwrap();
+        load(&mut input, 0, short_track(120.0, 20.0));
+        run(&mut engine, 0.05);
+        rx("enabled").set_bool(true);
+        ch(1, "play").set_bool(true);
+        assert!(run(&mut engine, 0.5) > 0.05, "deck 1 plays");
+        // Send, idle: deck 1 plays on its channel and deck 2 adds nothing.
+        ch(1, "volume").set(0.0);
+        run(&mut engine, 0.1);
+        assert!(run(&mut engine, 0.5) < 1e-4, "nothing from the Remix deck");
+        // Insert: deck 1 is heard through channel 2, its own fader down.
+        rx("mode").set(1.0);
+        run(&mut engine, 0.1);
+        assert!(
+            run(&mut engine, 0.5) > 0.05,
+            "deck 1 through the Remix deck"
+        );
+        // ... and only there: channel 2's fader down silences it.
+        ch(1, "volume").set(1.0);
+        ch(2, "volume").set(0.0);
+        run(&mut engine, 0.1);
+        assert!(
+            run(&mut engine, 0.5) < 1e-4,
+            "deck 1's own channel is quiet"
+        );
+    }
+
+    #[test]
+    fn one_remix_deck_moves_with_its_settings() {
+        let (reg, mut engine, mut input) = setup();
+        let rx = |n: usize, k: &str| reg.get(&format!("[Remix{n}]"), k).unwrap();
+        rx(2, "enabled").set_bool(true);
+        rx(2, "mode").set(1.0);
+        rx(2, "isolate_low").set(-0.5);
+        run(&mut engine, 0.01);
+        load(&mut input, 3, short_track(120.0, 4.0));
+        run(&mut engine, 0.01);
+        assert!(reg.get("[Channel4]", "track_loaded").unwrap().get_bool());
+        rx(4, "enabled").set_bool(true);
+        run(&mut engine, 0.01);
+        assert!(!rx(2, "enabled").get_bool(), "deck 2 is a track deck again");
+        assert!(rx(4, "enabled").get_bool());
+        assert_eq!(rx(4, "mode").get(), 1.0);
+        assert_eq!(rx(4, "isolate_low").get(), -0.5);
+        assert_eq!(rx(4, "source").get(), 1.0, "it still listens to deck 1");
+        assert!(!reg.get("[Channel4]", "track_loaded").unwrap().get_bool());
+        // A Groove Box picked on it takes the deck back.
+        reg.get("[Groove4]", "enabled").unwrap().set_bool(true);
+        run(&mut engine, 0.01);
+        assert!(!rx(4, "enabled").get_bool());
+        // Unloading the Remix deck makes it an empty track deck.
+        rx(2, "enabled").set_bool(true);
+        run(&mut engine, 0.01);
+        reg.get("[Channel2]", "eject").unwrap().set_bool(true);
+        run(&mut engine, 0.01);
+        assert!(!rx(2, "enabled").get_bool());
     }
 
     #[test]

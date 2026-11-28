@@ -51,6 +51,31 @@ pub struct Transport {
     pub playing: bool,
 }
 
+/// The tempo plugins are told while no deck gives one.
+pub const RESTING_BPM: f64 = 120.0;
+
+impl Transport {
+    /// What a plugin is told: always a tempo, stopped at [`RESTING_BPM`]
+    /// while no deck gives one. Some plugins (JUCE's CLAP wrapper in Vital)
+    /// crash when a preset with a tempo-synced part plays with no transport,
+    /// and others divide by the tempo.
+    pub fn for_plugins(self) -> Transport {
+        if self.bpm.is_finite() && self.bpm > 0.0 {
+            self
+        } else {
+            Transport {
+                bpm: RESTING_BPM,
+                beat: if self.beat.is_finite() {
+                    self.beat
+                } else {
+                    0.0
+                },
+                playing: false,
+            }
+        }
+    }
+}
+
 /// A plugin's own window, as the helper reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Editor {
@@ -91,6 +116,8 @@ pub struct Connection {
     gone: bool,
     missed_in_row: u32,
     health: Arc<Health>,
+    /// The MIDI the plug-in sent in the last block that came back.
+    midi_out: Vec<Midi>,
 }
 
 /// What the audio thread last saw, for the control thread to act on.
@@ -129,6 +156,7 @@ fn plugin_args(plugin: &Plugin) -> Vec<std::ffi::OsString> {
             id.into(),
         ],
         Plugin::Au { id } => vec!["--au".into(), id.into()],
+        Plugin::Pd { file } => vec!["--pd".into(), file.clone().into_os_string()],
     }
 }
 
@@ -152,6 +180,7 @@ fn read_info(info: &mut Info, line: &str) {
                 value,
             });
         }
+        Some("page") => info.pages.push(f.next().unwrap_or_default().to_string()),
         Some("all") => {
             if let (Some(id), Some(name)) = (f.next().and_then(|v| v.parse().ok()), f.next()) {
                 info.all.push((id, name.to_string()));
@@ -272,6 +301,23 @@ fn scan_with(
         .collect())
 }
 
+/// `helper` set up to start: on Windows with no console window of its own.
+/// The helper is a console program and openDJ has no console, so Windows
+/// would otherwise open a terminal for every helper, over openDJ and taking
+/// its focus. The same as `opendj_engine::process::background`, which this
+/// crate doesn't depend on.
+fn helper_command(helper: &Path) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cmd = Command::new(helper);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Runs a throwaway helper with `args` and gives the lines it wrote before
 /// `done`, killing it after `timeout`.
 fn lines(
@@ -279,7 +325,7 @@ fn lines(
     args: &[std::ffi::OsString],
     timeout: Duration,
 ) -> Result<Vec<String>, ScanError> {
-    let mut child = Command::new(helper)
+    let mut child = helper_command(helper)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -376,7 +422,7 @@ pub fn spawn(opts: &Options) -> io::Result<(Connection, Helper)> {
         std::fs::write(&state_path, state)?;
     }
     let shm = Arc::new(Shm::create(&path, opts.max_frames, opts.sample_rate)?);
-    let child = Command::new(&opts.helper)
+    let child = helper_command(&opts.helper)
         .arg("--shm")
         .arg(&path)
         .arg("--state")
@@ -461,6 +507,7 @@ pub fn spawn(opts: &Options) -> io::Result<(Connection, Helper)> {
         gone: false,
         missed_in_row: 0,
         health: helper.health.clone(),
+        midi_out: Vec::with_capacity(MAX_EVENTS),
     };
     Ok((conn, helper))
 }
@@ -572,6 +619,7 @@ impl Connection {
     }
 
     fn collect_until(&mut self, output: &mut [&mut [f32]; CHANNELS], end: Instant) -> Outcome {
+        self.midi_out.clear();
         if self.gone {
             self.awaiting = false;
             return Outcome::Gone;
@@ -590,6 +638,12 @@ impl Connection {
                 for (ch, data) in output.iter_mut().enumerate() {
                     self.shm.read(true, ch, data);
                 }
+                let n = (h.out_events_len.load(Ordering::Relaxed) as usize).min(MAX_EVENTS);
+                self.midi_out.extend(
+                    h.out_events[..n]
+                        .iter()
+                        .map(|e| Midi::unpack(e.load(Ordering::Relaxed))),
+                );
                 if self.missed_in_row != 0 {
                     self.missed_in_row = 0;
                     self.health.missed_in_row.store(0, Ordering::Relaxed);
@@ -619,6 +673,12 @@ impl Connection {
         if index < MAX_PARAMS {
             shm::store_f32(&self.shm.header().params[index], value);
         }
+    }
+
+    /// The MIDI the plug-in sent during the last block that came back
+    /// (notes from a sequencer, controllers), at frames of that block.
+    pub fn midi_out(&self) -> &[Midi] {
+        &self.midi_out
     }
 
     /// Blocks in a row that came back dry because the helper was late or busy.
@@ -781,10 +841,44 @@ impl Helper {
     }
 }
 
+impl Helper {
+    /// Where the helper puts its display for the deck, if it draws one
+    /// (see [`crate::display`]).
+    pub fn display_path(&self) -> PathBuf {
+        crate::display::path_for(&self.shm_path)
+    }
+}
+
 impl Drop for Helper {
     fn drop(&mut self) {
         self.kill();
         let _ = std::fs::remove_file(&self.shm_path);
         let _ = std::fs::remove_file(&self.state_path);
+        let _ = std::fs::remove_file(self.display_path());
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn plugins_always_get_a_tempo() {
+        let none = Transport::default().for_plugins();
+        assert_eq!(none.bpm, RESTING_BPM);
+        assert!(!none.playing);
+        let odd = Transport {
+            bpm: f64::NAN,
+            beat: f64::NAN,
+            playing: true,
+        }
+        .for_plugins();
+        assert_eq!((odd.bpm, odd.beat, odd.playing), (RESTING_BPM, 0.0, false));
+        let deck = Transport {
+            bpm: 124.0,
+            beat: 33.5,
+            playing: true,
+        };
+        assert_eq!(deck.for_plugins(), deck);
     }
 }

@@ -7,6 +7,36 @@ use opendj_engine::scan;
 use rbox_devlib::DeviceLibrary;
 use rbox_onelib::OneLibrary;
 
+// Export tests share the process environment. Hold this guard until the export
+// and its read-back checks finish so another test cannot replace or delete its cache.
+static CACHE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct TestCache {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl TestCache {
+    fn new(music: &Path) -> Self {
+        let lock = CACHE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("OPENDJ_CACHE");
+        std::env::set_var("OPENDJ_CACHE", music.join("cache"));
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for TestCache {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("OPENDJ_CACHE", value),
+            None => std::env::remove_var("OPENDJ_CACHE"),
+        }
+    }
+}
+
 /// A 16-bit mono WAV of clicks at 120 BPM.
 fn click_track(path: &Path, seconds: f64) {
     let rate = 44100u32;
@@ -59,7 +89,7 @@ fn an_export_reads_back_in_both_formats() {
     let music = tempfile::tempdir().unwrap();
     let stick = tempfile::tempdir().unwrap();
     // The analysis cache lives beside the music, not in the real one.
-    std::env::set_var("OPENDJ_CACHE", music.path().join("cache"));
+    let _cache = TestCache::new(music.path());
 
     let mut tracks = Vec::new();
     for (i, (artist, title)) in [("Ana", "One"), ("Ben", "Two"), ("Ana", "Three")]
@@ -74,6 +104,7 @@ fn an_export_reads_back_in_both_formats() {
         t.album = "Clicks".into();
         t.key = "Am".into();
         t.info.hotcues = (0..10).map(|n| hotcue(n, 0.5 + n as f64 * 0.5)).collect();
+        t.info.added = 1_709_251_200; // 2024-03-01
         tracks.push(t);
     }
     let mut gone = scan::read_track(99, &music.path().join("gone.wav"));
@@ -138,6 +169,9 @@ fn an_export_reads_back_in_both_formats() {
     );
     assert_eq!(contents[2].artist_id, one.artist_id);
     assert_eq!(one.hot_cue_auto_load, "ON");
+    // String 15, which players show as DATE ADDED, and string 10.
+    assert_eq!(one.analysis_date, "2024-03-01");
+    assert_eq!(one.date_added, "2024-03-01");
     let playlists = pdb.get_playlists().unwrap();
     let friday = playlists.iter().find(|p| p.name == "Friday").unwrap();
     let gigs = playlists.iter().find(|p| p.name == "Gigs").unwrap();
@@ -239,7 +273,7 @@ fn an_engine_dj_export_reads_back() {
     use rusqlite::Connection;
     let music = tempfile::tempdir().unwrap();
     let stick = tempfile::tempdir().unwrap();
-    std::env::set_var("OPENDJ_CACHE", music.path().join("cache"));
+    let _cache = TestCache::new(music.path());
 
     let mut tracks = Vec::new();
     for (i, title) in ["One", "Two"].iter().enumerate() {
@@ -467,7 +501,7 @@ fn memory(n: usize, seconds: f64, end: Option<f64>, color: Option<u32>) -> Hotcu
 fn a_full_stick_reads_back_in_an_independent_reader() {
     let music = tempfile::tempdir().unwrap();
     let stick = tempfile::tempdir().unwrap();
-    std::env::set_var("OPENDJ_CACHE", music.path().join("cache"));
+    let _cache = TestCache::new(music.path());
 
     // Many tracks of one file (analysed once) fill several pages and row
     // groups of export.pdb; one more has folder art.
@@ -747,7 +781,7 @@ fn a_full_stick_reads_back_in_an_independent_reader() {
 fn the_independent_reader_refuses_broken_files() {
     let music = tempfile::tempdir().unwrap();
     let stick = tempfile::tempdir().unwrap();
-    std::env::set_var("OPENDJ_CACHE", music.path().join("cache"));
+    let _cache = TestCache::new(music.path());
     let path = music.path().join("One.wav");
     click_track(&path, 3.0);
     let mut t = scan::read_track(1, &path);

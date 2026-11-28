@@ -208,6 +208,36 @@ fn an_instrument_plays_the_notes_it_is_sent() {
     assert!(l.iter().all(|&v| v == 1.0));
 }
 
+#[test]
+fn what_a_plugin_sends_comes_back() {
+    use opendj_plugin_host::Midi;
+    let (mut conn, _helper) = start("test-arp");
+    let silent = vec![0.0f32; FRAMES];
+    let (mut l, mut r) = (vec![0.0; FRAMES], vec![0.0; FRAMES]);
+    let sent = [Midi::note_on(10, 2, 60, 100), Midi::note_off(200, 2, 60)];
+    let out = conn.process_events(
+        [&silent, &silent],
+        [&mut l, &mut r],
+        Default::default(),
+        &sent,
+        DEADLINE,
+    );
+    assert_eq!(out, Outcome::Wet);
+    assert_eq!(
+        conn.midi_out(),
+        [Midi::note_on(10, 2, 72, 100), Midi::note_off(200, 2, 72)]
+    );
+    // A block with nothing sent sends nothing back.
+    conn.process_events(
+        [&silent, &silent],
+        [&mut l, &mut r],
+        Default::default(),
+        &[],
+        DEADLINE,
+    );
+    assert!(conn.midi_out().is_empty());
+}
+
 /// A plugin that hangs while the helper exits, after it has answered, must
 /// not stall the scan: the answer is kept and the helper is stopped.
 #[cfg(unix)]
@@ -223,14 +253,29 @@ fn a_helper_that_never_exits_after_answering_does_not_stall_a_scan() {
     )
     .unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let start = Instant::now();
-    let found = opendj_plugin_host::client::scan(
-        &helper,
-        std::path::Path::new("x.clap"),
-        Duration::from_secs(5),
-    )
-    .unwrap();
-    assert!(start.elapsed() < Duration::from_secs(3));
+    // Other tests in this binary spawn helpers at the same time. A child
+    // forked while the script above was still open for writing holds that
+    // descriptor until it execs, and running the script then fails with
+    // "Text file busy" (ETXTBSY). Try again once that child has moved on.
+    let scan = || {
+        opendj_plugin_host::client::scan(
+            &helper,
+            std::path::Path::new("x.clap"),
+            Duration::from_secs(5),
+        )
+    };
+    let mut tries = 0;
+    let (found, elapsed) = loop {
+        let start = Instant::now();
+        match scan() {
+            Err(e) if format!("{e:?}").contains("Text file busy") && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => break (other.unwrap(), start.elapsed()),
+        }
+    };
+    assert!(elapsed < Duration::from_secs(3));
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].name, "Name");
     let _ = std::fs::remove_dir_all(&dir);

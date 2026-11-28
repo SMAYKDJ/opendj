@@ -3,7 +3,7 @@
 //! on purpose, so the isolation can be tested without third-party plugins.
 
 use crate::client::Transport;
-use crate::shm::{Midi, CHANNELS};
+use crate::shm::{Midi, CHANNELS, MAX_EVENTS};
 
 /// One loaded effect, inside the helper, on its audio thread.
 pub trait Effect: Send {
@@ -15,6 +15,12 @@ pub trait Effect: Send {
         transport: &Transport,
         events: &[Midi],
     );
+
+    /// The MIDI the plug-in sent during the last [`Effect::process`] (a
+    /// sequencer's notes, controllers), at frames of that block.
+    fn midi_out(&self) -> &[Midi] {
+        &[]
+    }
 }
 
 /// The part of a plugin that must stay on the helper's main thread
@@ -92,11 +98,42 @@ pub trait MainThread {
         false
     }
 
+    /// An editor the helper draws itself into its window (a Pd patch's Lua
+    /// displays), instead of one the plugin puts there.
+    fn drawn_editor(&mut self) -> Option<&mut dyn DrawnEditor> {
+        None
+    }
+
     /// When `idle` next needs calling, at the latest (timers a plugin asked
     /// for, its file descriptors on Linux).
     fn next_idle(&self) -> Option<std::time::Duration> {
         None
     }
+}
+
+/// An editor the helper draws: it paints into the window's pixels and takes
+/// the mouse, in logical units (points).
+pub trait DrawnEditor {
+    /// Its size, in points.
+    fn size(&mut self) -> (f32, f32);
+
+    /// Whether it changed since the last [`DrawnEditor::paint`].
+    fn changed(&mut self) -> bool;
+
+    /// Paints into `pixels` (0RGB, `width` by `height`), `scale` pixels per
+    /// point.
+    fn paint(&mut self, pixels: &mut [u32], width: u32, height: u32, scale: f32);
+
+    /// The mouse at (x, y) points: [`Mouse`] says what it did.
+    fn mouse(&mut self, x: f32, y: f32, what: Mouse);
+}
+
+/// What the mouse did, for a [`DrawnEditor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mouse {
+    Down,
+    Up,
+    Move,
 }
 
 /// The window an editor is put in, as each platform names it.
@@ -140,6 +177,9 @@ pub struct Info {
     /// Every parameter a DJ could turn, (id, name) in the plugin's order,
     /// to pick from for a knob (up to [`ALL_PARAMS`]).
     pub all: Vec<(u32, String)>,
+    /// A name for each page of 8 knobs, from its maker's remote controls
+    /// pages ("" where none fits); empty when it has none.
+    pub pages: Vec<String>,
     /// Frames the plugin delays its output by.
     pub latency: u32,
 }
@@ -168,6 +208,8 @@ pub enum Plugin {
     },
     /// The Audio Unit `type:subtype:manufacturer` (macOS only).
     Au { id: String },
+    /// A Pure Data patch (`.pd` file), run in libpd (helper feature `pd`).
+    Pd { file: std::path::PathBuf },
 }
 
 /// The test gain's "editor": an empty window of a set size, so the editor
@@ -245,13 +287,35 @@ pub fn arrange<T>(
     all
 }
 
+/// A name for each page of 8 knobs of `params` (ids, in knob order): the
+/// name of its maker's page (name, ids) holding the page's first knob, or
+/// "" where none does. Empty when no page has a name.
+pub fn page_names(params: &[u32], pages: &[(String, Vec<u32>)]) -> Vec<String> {
+    let names: Vec<String> = params
+        .chunks(8)
+        .map(|knobs| {
+            pages
+                .iter()
+                .find(|(name, ids)| !name.is_empty() && ids.contains(&knobs[0]))
+                .map(|(name, _)| name.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    if names.iter().all(String::is_empty) {
+        Vec::new()
+    } else {
+        names
+    }
+}
+
 /// Ids of the test effects.
-pub const TEST_EFFECTS: [&str; 5] = [
+pub const TEST_EFFECTS: [&str; 6] = [
     "test-gain",
     "test-crash",
     "test-hang",
     "test-slow",
     "test-synth",
+    "test-arp",
 ];
 
 /// Loads `plugin`, or says why not.
@@ -297,6 +361,7 @@ pub fn load(
             "test-hang" => Ok(test(Box::new(Hang), id, "Hang", 1.0, 0.0)),
             "test-slow" => Ok(test(Box::new(Slow), id, "Milliseconds", 100.0, 0.0)),
             "test-synth" => Ok(test(Box::<Synth>::default(), id, "Volume", 1.0, 1.0)),
+            "test-arp" => Ok(test(Box::<Arp>::default(), id, "Octaves", 1.0, 1.0)),
             _ => Err(format!("unknown effect {id:?}")),
         },
         #[cfg(feature = "formats")]
@@ -307,6 +372,10 @@ pub fn load(
         Plugin::Au { id } => crate::au::load(id, sample_rate, max_frames, picks),
         #[cfg(all(feature = "formats", not(target_os = "macos")))]
         Plugin::Au { .. } => Err("Audio Units only run on macOS".into()),
+        #[cfg(feature = "pd")]
+        Plugin::Pd { file } => crate::pd::load(file, sample_rate, max_frames, picks),
+        #[cfg(all(feature = "formats", not(feature = "pd")))]
+        Plugin::Pd { .. } => Err("this build of openDJ runs no Pure Data patches".into()),
         #[cfg(not(feature = "formats"))]
         _ => {
             let _ = (sample_rate, max_frames);
@@ -399,6 +468,44 @@ impl Effect for Slow {
     }
 }
 
+/// A MIDI effect for tests: passes the audio and sends back every note it
+/// is sent, parameter 0 octaves up, at the same frame.
+struct Arp {
+    sent: Vec<Midi>,
+}
+
+impl Default for Arp {
+    fn default() -> Self {
+        Arp {
+            sent: Vec::with_capacity(MAX_EVENTS),
+        }
+    }
+}
+
+impl Effect for Arp {
+    fn process(
+        &mut self,
+        input: [&[f32]; CHANNELS],
+        output: [&mut [f32]; CHANNELS],
+        params: &[f32],
+        t: &Transport,
+        events: &[Midi],
+    ) {
+        self.sent.clear();
+        let up = (params[0].round() as u8).saturating_mul(12);
+        for e in events.iter().take(MAX_EVENTS) {
+            let mut m = *e;
+            m.data[1] = m.data[1].saturating_add(up).min(127);
+            self.sent.push(m);
+        }
+        Gain.process(input, output, &[1.0], t, &[]);
+    }
+
+    fn midi_out(&self) -> &[Midi] {
+        &self.sent
+    }
+}
+
 /// An instrument for tests: from a note-on it plays a steady level of
 /// `key / 127 * volume` on both channels, from the note's frame, until its
 /// note-off. It ignores its input.
@@ -461,6 +568,18 @@ mod tests {
 
     fn names(p: &[((), Param)]) -> Vec<&str> {
         p.iter().map(|(_, p)| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn knob_pages_take_the_makers_page_names() {
+        let pages = [
+            ("Osc".to_string(), vec![1, 2, 3]),
+            ("Filter".to_string(), vec![9, 10]),
+        ];
+        let knobs: Vec<u32> = (1..=20).collect();
+        // Knobs 1-8 start on "Osc", 9-16 on "Filter", 17-20 on no page.
+        assert_eq!(page_names(&knobs, &pages), ["Osc", "Filter", ""]);
+        assert!(page_names(&knobs, &[]).is_empty());
     }
 
     #[test]

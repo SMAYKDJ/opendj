@@ -13,12 +13,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::audio_ports::{
+    AudioPortInfoBuffer, AudioPortRescanFlags, HostAudioPorts, HostAudioPortsImpl, PluginAudioPorts,
+};
 use clack_extensions::gui::{
     GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui, Window,
 };
-use clack_extensions::latency::PluginLatency;
-use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
+use clack_extensions::latency::{HostLatency, HostLatencyImpl, PluginLatency};
+use clack_extensions::log::{HostLog, HostLogImpl, LogSeverity};
+use clack_extensions::note_ports::{
+    HostNotePorts, HostNotePortsImpl, NoteDialects, NotePortRescanFlags,
+};
+use clack_extensions::params::{
+    HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamInfoBuffer,
+    ParamInfoFlags, ParamRescanFlags, PluginParams,
+};
 #[cfg(all(unix, not(target_os = "macos")))]
 use clack_extensions::posix_fd::{FdFlags, HostPosixFd, HostPosixFdImpl, PluginPosixFd};
 use clack_extensions::preset_discovery::indexer::IndexerImpl;
@@ -28,7 +37,8 @@ use clack_extensions::preset_discovery::prelude::{
     UniversalPluginId,
 };
 use clack_extensions::remote_controls::{PluginRemoteControls, RemoteControlsPageBuffer};
-use clack_extensions::state::PluginState;
+use clack_extensions::state::{HostState, HostStateImpl, PluginState};
+use clack_extensions::thread_check::{HostThreadCheck, HostThreadCheckImpl};
 use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_host::events::event_types::{
     MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
@@ -42,6 +52,9 @@ use crate::client::Transport;
 use crate::descriptor::Descriptor;
 use crate::effects::{arrange, EditorSize, Effect, Info, Loaded, MainThread, Param, ParentWindow};
 use crate::shm::{Midi, CHANNELS, MAX_EVENTS, MAX_PARAMS};
+
+/// The most channels one audio port gets buffers for.
+const MAX_PORT_CHANNELS: usize = 64;
 
 fn text(s: Option<&CStr>) -> String {
     s.map(|s| s.to_string_lossy().into_owned())
@@ -290,13 +303,25 @@ fn host_info() -> Result<HostInfo, String> {
 
 struct Host;
 
-#[derive(Default)]
 struct HostShared {
+    /// The helper's main thread, where the instance was made.
+    main_thread: std::thread::ThreadId,
     callback: AtomicBool,
     /// A size the editor asked its window to take.
     resize: Mutex<Option<GuiSize>>,
     /// The plugin closed (or lost) its editor.
     gui_closed: AtomicBool,
+}
+
+impl Default for HostShared {
+    fn default() -> Self {
+        HostShared {
+            main_thread: std::thread::current().id(),
+            callback: AtomicBool::new(false),
+            resize: Mutex::new(None),
+            gui_closed: AtomicBool::new(false),
+        }
+    }
 }
 
 impl<'a> SharedHandler<'a> for HostShared {
@@ -326,6 +351,60 @@ impl HostGuiImpl for HostShared {
     fn closed(&self, _was_destroyed: bool) {
         self.gui_closed.store(true, Ordering::Release);
     }
+}
+
+// The host extensions below do little: the helper processes every block
+// anyway and keeps no automation, so a flush, a rescan or a dirty state
+// needs nothing more. They are here because some plugins (JUCE's CLAP
+// wrapper in Vital among them) call them without checking the host offers
+// them, and crash on a missing one, for instance when a preset loads.
+
+impl HostParamsImplShared for HostShared {
+    fn request_flush(&self) {}
+}
+
+impl HostLogImpl for HostShared {
+    fn log(&self, severity: LogSeverity, message: &str) {
+        // stdout carries the helper's replies; the app logs stderr.
+        eprintln!("plugin log ({severity:?}): {message}");
+    }
+}
+
+impl HostThreadCheckImpl for HostShared {
+    fn is_main_thread(&self) -> bool {
+        std::thread::current().id() == self.main_thread
+    }
+
+    fn is_audio_thread(&self) -> bool {
+        std::thread::current().id() != self.main_thread
+    }
+}
+
+impl HostParamsImplMainThread for HostMain {
+    fn rescan(&self, _flags: ParamRescanFlags) {}
+    fn clear(&self, _param_id: ClapId, _flags: ParamClearFlags) {}
+}
+
+impl HostStateImpl for HostMain {
+    fn mark_dirty(&self) {}
+}
+
+impl HostLatencyImpl for HostMain {
+    fn changed(&self) {}
+}
+
+impl HostAudioPortsImpl for HostMain {
+    fn is_rescan_flag_supported(&self, _flag: AudioPortRescanFlags) -> bool {
+        false
+    }
+    fn rescan(&self, _flags: AudioPortRescanFlags) {}
+}
+
+impl HostNotePortsImpl for HostMain {
+    fn supported_dialects(&self) -> NoteDialects {
+        NoteDialects::CLAP | NoteDialects::MIDI
+    }
+    fn rescan(&self, _flags: NotePortRescanFlags) {}
 }
 
 /// Timers (and, on Linux, file descriptors) the plugin asked for, served
@@ -390,7 +469,16 @@ impl HostHandlers for Host {
     type AudioProcessor<'a> = ();
 
     fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
-        builder.register::<HostGui>().register::<HostTimer>();
+        builder
+            .register::<HostGui>()
+            .register::<HostTimer>()
+            .register::<HostParams>()
+            .register::<HostState>()
+            .register::<HostLatency>()
+            .register::<HostLog>()
+            .register::<HostThreadCheck>()
+            .register::<HostAudioPorts>()
+            .register::<HostNotePorts>();
         #[cfg(all(unix, not(target_os = "macos")))]
         builder.register::<HostPosixFd>();
     }
@@ -666,23 +754,26 @@ impl MainThread for ClapMain {
 
 /// Loads plugin `id` from `file` and activates it for blocks of up to
 /// `max_frames`.
-/// The parameters on the plugin's remote controls pages, page by page,
-/// each once; none if it has no pages.
-fn remote_controls(handle: &PluginMainThreadHandle) -> Vec<ClapId> {
-    let mut ids = Vec::new();
+/// The plugin's remote controls pages, each as its name and the
+/// parameters on it; none if it has no pages.
+fn remote_controls(handle: &PluginMainThreadHandle) -> Vec<(String, Vec<u32>)> {
+    let mut pages = Vec::new();
     if let Some(ext) = handle.get_extension::<PluginRemoteControls>() {
         let mut buf = RemoteControlsPageBuffer::new();
         for i in 0..ext.count(handle) {
             if let Some(page) = ext.get(handle, i, &mut buf) {
-                for id in page.param_ids.into_iter().flatten() {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
-                }
+                pages.push((
+                    String::from_utf8_lossy(page.page_name).into_owned(),
+                    page.param_ids
+                        .into_iter()
+                        .flatten()
+                        .map(|id| id.get())
+                        .collect(),
+                ));
             }
         }
     }
-    ids
+    pages
 }
 
 pub fn load(
@@ -732,12 +823,30 @@ pub fn load(
             return Err(format!("{name} is not a stereo effect or instrument"));
         }
     }
+    // Every port it has gets buffers, as CLAP asks: plugins read all the
+    // ports they declare (Cardinal's extra inputs and outputs, a side
+    // chain), and one handed fewer reads past the end and crashes. The
+    // deck plays through the first stereo pair; the rest are silent in and
+    // ignored out.
+    let mut layout = |is_input: bool| -> Vec<usize> {
+        (0..ports.count(&handle, is_input))
+            .map(|i| {
+                ports
+                    .get(&handle, i, is_input, &mut buf)
+                    .map_or(0, |p| p.channel_count as usize)
+                    .min(MAX_PORT_CHANNELS)
+            })
+            .collect()
+    };
+    let in_layout = layout(true);
+    let out_layout = layout(false);
 
     // Its first parameters, as the slot's parameters: the DJ's picks, then
     // those on its remote controls pages, in the pages' order (what its
     // maker picked for hardware knobs), then the rest in its own order.
     let mut params = Vec::new();
     let mut listed = Vec::new();
+    let mut page_list = Vec::new();
     if let Some(ext) = handle.get_extension::<PluginParams>() {
         let mut all = Vec::new();
         let mut buf = ParamInfoBuffer::new();
@@ -763,8 +872,16 @@ pub fn load(
                 },
             ));
         }
-        let pages: Vec<u32> = remote_controls(&handle).iter().map(|id| id.get()).collect();
-        listed = arrange(&mut all, &pages, picks);
+        let pages = remote_controls(&handle);
+        let mut on_pages: Vec<u32> = Vec::new();
+        for id in pages.iter().flat_map(|(_, ids)| ids) {
+            if !on_pages.contains(id) {
+                on_pages.push(*id);
+            }
+        }
+        listed = arrange(&mut all, &on_pages, picks);
+        let ids: Vec<u32> = all.iter().map(|(_, p)| p.id).collect();
+        page_list = crate::effects::page_names(&ids, &pages);
         params = all;
     }
 
@@ -786,13 +903,15 @@ pub fn load(
 
     let effect = ClapEffect {
         processor: processor.into(),
-        input: [vec![0.0; max_frames], vec![0.0; max_frames]],
-        output: [vec![0.0; max_frames], vec![0.0; max_frames]],
-        in_ports: AudioPorts::with_capacity(CHANNELS, 1),
-        has_input,
-        out_ports: AudioPorts::with_capacity(CHANNELS, 1),
+        input: vec![vec![0.0; max_frames]; in_layout.iter().sum()],
+        output: vec![vec![0.0; max_frames]; out_layout.iter().sum()],
+        in_ports: AudioPorts::with_capacity(in_layout.iter().sum(), in_layout.len()),
+        out_ports: AudioPorts::with_capacity(out_layout.iter().sum(), out_layout.len()),
+        in_layout,
+        out_layout,
         events: EventBuffer::with_capacity(MAX_PARAMS + MAX_EVENTS + 4),
         out_events: EventBuffer::with_capacity(64),
+        midi_out: Vec::with_capacity(MAX_EVENTS),
         ids: params.iter().map(|(id, _)| *id).collect(),
         sent: params.iter().map(|(_, p)| p.value as f32).collect(),
         steady: 0,
@@ -810,6 +929,7 @@ pub fn load(
             name,
             params: params.into_iter().map(|(_, p)| p).collect(),
             all: listed,
+            pages: page_list,
             latency,
         },
     })
@@ -817,14 +937,20 @@ pub fn load(
 
 struct ClapEffect {
     processor: PluginAudioProcessor<Host>,
-    input: [Vec<f32>; CHANNELS],
-    output: [Vec<f32>; CHANNELS],
+    /// Every channel of every input port, in port order; the deck's audio
+    /// goes in the first two. An instrument has none.
+    input: Vec<Vec<f32>>,
+    /// Every channel of every output port; the first two come back.
+    output: Vec<Vec<f32>>,
     in_ports: AudioPorts,
-    /// False for an instrument, which takes notes instead of audio.
-    has_input: bool,
     out_ports: AudioPorts,
+    /// Channels per input port, and per output port.
+    in_layout: Vec<usize>,
+    out_layout: Vec<usize>,
     events: EventBuffer,
     out_events: EventBuffer,
+    /// What the plug-in sent in the last block, as MIDI.
+    midi_out: Vec<Midi>,
     ids: Vec<ClapId>,
     /// The values last sent to the plugin.
     sent: Vec<f32>,
@@ -857,7 +983,47 @@ fn transport_event(t: &Transport) -> TransportEvent {
     }
 }
 
+impl ClapEffect {
+    /// The plug-in's note and MIDI events from the last block, as MIDI 1.
+    fn collect_midi_out(&mut self) {
+        use clack_host::events::spaces::CoreEventSpace;
+        let byte = |v: f64| ((v * 127.0).round() as u8).clamp(1, 127);
+        let ch = |c: i16| c.clamp(0, 15) as u8;
+        for e in self.out_events.iter() {
+            if self.midi_out.len() == MAX_EVENTS {
+                break;
+            }
+            let frame = e.header().time();
+            let m = match e.as_core_event() {
+                Some(CoreEventSpace::NoteOn(n)) => {
+                    let p = n.pckn();
+                    Midi::note_on(
+                        frame,
+                        ch(p.raw_channel()),
+                        p.raw_key().clamp(0, 127) as u8,
+                        byte(n.velocity()),
+                    )
+                }
+                Some(CoreEventSpace::NoteOff(n)) => {
+                    let p = n.pckn();
+                    Midi::note_off(frame, ch(p.raw_channel()), p.raw_key().clamp(0, 127) as u8)
+                }
+                Some(CoreEventSpace::Midi(m)) => Midi {
+                    frame,
+                    data: m.data(),
+                },
+                _ => continue,
+            };
+            self.midi_out.push(m);
+        }
+    }
+}
+
 impl Effect for ClapEffect {
+    fn midi_out(&self) -> &[Midi] {
+        &self.midi_out
+    }
+
     fn process(
         &mut self,
         input: [&[f32]; CHANNELS],
@@ -899,30 +1065,41 @@ impl Effect for ClapEffect {
             }
         }
         for (ch, data) in input.iter().enumerate() {
-            self.input[ch][..frames].copy_from_slice(data);
+            if let Some(buf) = self.input.get_mut(ch) {
+                buf[..frames].copy_from_slice(data);
+            }
+        }
+        for buf in self.input.iter_mut().skip(CHANNELS) {
+            buf[..frames].fill(0.0);
         }
         let transport = (transport.bpm > 0.0).then(|| transport_event(transport));
-        let [in_l, in_r] = &mut self.input;
-        let ports = usize::from(self.has_input);
-        let inputs = self.in_ports.with_input_buffers(
-            [AudioPortBuffer {
-                latency: 0,
-                channels: AudioPortBufferType::f32_input_only(
-                    [&mut in_l[..frames], &mut in_r[..frames]]
-                        .into_iter()
-                        .map(InputChannel::variable),
-                ),
-            }]
-            .into_iter()
-            .take(ports),
-        );
-        let [out_l, out_r] = &mut self.output;
-        let mut outputs = self.out_ports.with_output_buffers([AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_output_only(
-                [&mut out_l[..frames], &mut out_r[..frames]].into_iter(),
-            ),
-        }]);
+        let mut rest: &mut [Vec<f32>] = &mut self.input;
+        let inputs = self
+            .in_ports
+            .with_input_buffers(self.in_layout.iter().map(|&n| {
+                let (port, after) = std::mem::take(&mut rest).split_at_mut(n);
+                rest = after;
+                AudioPortBuffer {
+                    latency: 0,
+                    channels: AudioPortBufferType::f32_input_only(
+                        port.iter_mut()
+                            .map(|c| InputChannel::variable(&mut c[..frames])),
+                    ),
+                }
+            }));
+        let mut rest: &mut [Vec<f32>] = &mut self.output;
+        let mut outputs = self
+            .out_ports
+            .with_output_buffers(self.out_layout.iter().map(|&n| {
+                let (port, after) = std::mem::take(&mut rest).split_at_mut(n);
+                rest = after;
+                AudioPortBuffer {
+                    latency: 0,
+                    channels: AudioPortBufferType::f32_output_only(
+                        port.iter_mut().map(|c| &mut c[..frames]),
+                    ),
+                }
+            }));
         self.out_events.clear();
         let ok = match self.processor.as_started_mut() {
             Ok(p) => p
@@ -938,6 +1115,10 @@ impl Effect for ClapEffect {
             Err(_) => false,
         };
         self.steady += frames as u64;
+        self.midi_out.clear();
+        if ok {
+            self.collect_midi_out();
+        }
         for (ch, o) in output.into_iter().enumerate() {
             if ok {
                 o.copy_from_slice(&self.output[ch][..frames]);

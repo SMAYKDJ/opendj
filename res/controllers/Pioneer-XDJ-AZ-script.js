@@ -171,11 +171,10 @@ PioneerXDJAZ.jogDisplayUpdate = function() {
         if (engine.getValue(group, "track_loaded")) {
             const duration = engine.getValue(group, "duration");
             bar = degrees(engine.getValue(group, "playposition") * duration);
-            const samples = engine.getValue(group, "track_samples");
-            const rate = engine.getValue(group, "track_samplerate");
+            // openDJ: cue_point is in seconds.
             const point = engine.getValue(group, "cue_point");
-            if (samples > 0 && rate > 0 && point >= 0) {
-                cue = degrees(point / rate / 2);
+            if (point >= 0) {
+                cue = degrees(point);
             }
         }
         const last = PioneerXDJAZ.jogDisplays[i];
@@ -360,7 +359,9 @@ PioneerXDJAZ.jogTurn = function(channel, _control, value, _status, group) {
 };
 
 PioneerXDJAZ.jogSearch = function(_channel, _control, value, _status, group) {
-    engine.setValue(group, "jog", (value - 64) * PioneerXDJAZ.fastSeekScale);
+    // openDJ: SHIFT + turn moves the position (jog_search); plain jog bends
+    // the speed as in Mixxx.
+    engine.setValue(group, "jog_search", (value - 64) * PioneerXDJAZ.fastSeekScale);
 };
 
 PioneerXDJAZ.jogTouch = function(channel, _control, value) {
@@ -494,11 +495,12 @@ PioneerXDJAZ.beatFxLevelDepthRotate = function(_channel, _control, value) {
     engine.setParameter(PioneerXDJAZ.beatFxSlot, "meta", value / 0x7F);
 };
 
+// Halves (-1) or doubles (+1) the effect's length, within the effect's
+// own limits; effects without a length stay as they are.
 PioneerXDJAZ.changeBeatFxBeats = function(direction) {
-    const beats = engine.getValue(PioneerXDJAZ.beatFxSlot, "beats");
-    if (beats <= 0) { return; }
-    const next = Math.min(4, Math.max(1 / 16, direction > 0 ? beats * 2 : beats / 2));
-    engine.setValue(PioneerXDJAZ.beatFxSlot, "beats", next);
+    const key = direction > 0 ? "beats_double" : "beats_halve";
+    engine.setValue(PioneerXDJAZ.beatFxSlot, key, 1);
+    engine.setValue(PioneerXDJAZ.beatFxSlot, key, 0);
 };
 
 PioneerXDJAZ.pushBeatFxUnit = function(key) {
@@ -533,22 +535,27 @@ PioneerXDJAZ.beatFxLight = function(value) {
     midi.sendShortMsg(0xB4, 0x72, value ? 0x7F : 0x00);
 };
 
-// CH SELECT, by the CC each position sends, to the decks it sends the Beat
-// FX: CH1 to CH4 that deck, MASTER all four, MIC none; CF.A and CF.B the
-// decks the crossfader assign puts on that side.
-PioneerXDJAZ.beatFxChannels = {
-    0x23: [1], 0x24: [2], 0x22: [3], 0x25: [4], 0x29: [1, 2, 3, 4], 0x1C: [],
+// CH SELECT, by the CC each position sends, to the Beat FX unit's route:
+// CH1 to CH4 that deck (1 to 4), MASTER the main mix (6), MIC nowhere (0).
+// CF.A and CF.B send it to the decks the crossfader assign puts on that
+// side.
+PioneerXDJAZ.beatFxRoutes = {
+    0x23: 1, 0x24: 2, 0x22: 3, 0x25: 4, 0x29: 6, 0x1C: 0,
 };
 
 PioneerXDJAZ.beatFxChannelSelect = function(_channel, control, value) {
     if (value !== 0x7F) { return; }
-    let decks = PioneerXDJAZ.beatFxChannels[control];
-    if (control === 0x27 || control === 0x28) {
-        const side = control === 0x27 ? 0 : 2;
-        decks = [1, 2, 3, 4].filter(function(deck) {
-            return engine.getValue("[Channel" + deck + "]", "orientation") === side;
-        });
+    const route = PioneerXDJAZ.beatFxRoutes[control];
+    if (route !== undefined) {
+        engine.setValue(PioneerXDJAZ.beatFxUnit, "route", route);
+        return;
     }
+    if (control !== 0x27 && control !== 0x28) { return; }
+    const side = control === 0x27 ? 0 : 2;
+    const decks = [1, 2, 3, 4].filter(function(deck) {
+        return engine.getValue("[Channel" + deck + "]", "orientation") === side;
+    });
+    engine.setValue(PioneerXDJAZ.beatFxUnit, "group_[Master]_enable", 0);
     PioneerXDJAZ.decks.forEach(function(group, i) {
         engine.setValue(PioneerXDJAZ.beatFxUnit, "group_" + group + "_enable", decks.indexOf(i + 1) >= 0 ? 1 : 0);
     });

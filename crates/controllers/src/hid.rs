@@ -21,6 +21,11 @@ pub struct Product {
     pub usage_page: Option<u16>,
     pub usage: Option<u16>,
     pub interface: Option<i32>,
+    /// openDJ: `keys="midi"`, a keyboard whose keys (and touch strips, pedal)
+    /// come in over its own USB MIDI port while the HID side runs the
+    /// buttons, knobs and screen. That MIDI port then plays instruments as
+    /// any keyboard does, rather than being the HID mapping's silent twin.
+    pub keys: bool,
 }
 
 /// Parses `0x17cc` or `17cc`: Mixxx reads these as hexadecimal either way.
@@ -47,6 +52,7 @@ impl Product {
             usage_page: num("usage_page").and_then(|v| u16::try_from(v).ok()),
             usage: num("usage").and_then(|v| u16::try_from(v).ok()),
             interface: num("interface_number").and_then(|v| i32::try_from(v).ok()),
+            keys: attr("keys").is_some_and(|k| k.eq_ignore_ascii_case("midi")),
         })
     }
 
@@ -94,6 +100,9 @@ pub trait Io {
     fn get_feature(&self, id: u8) -> Option<Vec<u8>>;
 }
 
+/// How many reports sent with `useNonSkippingFIFO` can wait at once.
+const FIFO_REPORTS: usize = 4096;
+
 /// Output reports waiting to be sent, kept as Mixxx keeps them: a report
 /// sent in the default mode replaces any of the same ID not yet sent, and
 /// isn't sent at all if it's what the device already has. One sent with
@@ -114,8 +123,10 @@ impl Outputs {
             // What the device has is no longer known.
             self.cached.remove(&id);
             self.last.remove(&id);
-            // Mixxx's FIFO holds 32 reports; a script flooding it loses the oldest.
-            if self.fifo.len() >= 32 {
+            // Mixxx's FIFO holds 32 reports; ours holds more, for screens
+            // uploading a waveform (the DDJ-FLX10's take thousands). A
+            // script flooding it still loses the oldest.
+            if self.fifo.len() >= FIFO_REPORTS {
                 self.fifo.pop_front();
             }
             self.fifo.push_back(report);
@@ -193,10 +204,12 @@ pub fn match_mapping<'a>(
 }
 
 /// Finds the HID devices plugged in, and opens them.
+#[cfg(not(target_os = "ios"))]
 pub(crate) struct Hid {
     api: hidapi::HidApi,
 }
 
+#[cfg(not(target_os = "ios"))]
 impl Hid {
     pub(crate) fn new() -> Result<Self, String> {
         hidapi::HidApi::new()
@@ -238,8 +251,10 @@ impl Hid {
 pub(crate) const BUFFER: usize = 255;
 
 /// An open HID device.
+#[cfg(not(target_os = "ios"))]
 pub(crate) struct Device(hidapi::HidDevice);
 
+#[cfg(not(target_os = "ios"))]
 impl Device {
     /// Waits up to `timeout_ms` for an input report; `Ok(0)` when none came.
     pub(crate) fn read(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, String> {
@@ -249,6 +264,7 @@ impl Device {
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 impl Io for Device {
     fn write(&self, report: &[u8]) -> Result<(), String> {
         self.0.write(report).map(|_| ()).map_err(|e| e.to_string())
@@ -273,6 +289,55 @@ impl Io for Device {
         buf[0] = id;
         let n = self.0.get_feature_report(&mut buf).ok()?;
         (n > 1).then(|| buf[1..n].to_vec())
+    }
+}
+
+/// iPadOS: apps can't open HID devices, so none are ever found.
+#[cfg(target_os = "ios")]
+pub(crate) struct Hid;
+
+#[cfg(target_os = "ios")]
+impl Hid {
+    pub(crate) fn new() -> Result<Self, String> {
+        Err("HID controllers aren't available on iPadOS".into())
+    }
+
+    pub(crate) fn scan(&mut self, _vendors: &[u16]) -> Vec<DeviceInfo> {
+        Vec::new()
+    }
+
+    pub(crate) fn open(&self, _d: &DeviceInfo) -> Result<Device, String> {
+        Err("HID controllers aren't available on iPadOS".into())
+    }
+}
+
+/// No HID device can be open on iPadOS.
+#[cfg(target_os = "ios")]
+pub(crate) enum Device {}
+
+#[cfg(target_os = "ios")]
+impl Device {
+    pub(crate) fn read(&self, _buf: &mut [u8], _timeout_ms: i32) -> Result<usize, String> {
+        match *self {}
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl Io for Device {
+    fn write(&self, _report: &[u8]) -> Result<(), String> {
+        match *self {}
+    }
+
+    fn send_feature(&self, _report: &[u8]) -> Result<(), String> {
+        match *self {}
+    }
+
+    fn get_input(&self, _id: u8) -> Option<Vec<u8>> {
+        match *self {}
+    }
+
+    fn get_feature(&self, _id: u8) -> Option<Vec<u8>> {
+        match *self {}
     }
 }
 

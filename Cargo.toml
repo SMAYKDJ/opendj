@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/control", "crates/engine", "crates/controllers", "crates/waveform", "crates/library", "crates/export", "crates/plugins", "crates/plugin-host", "crates/plugin-host/test-plugin", "crates/plugin-host/test-vst3", "crates/separation", "crates/stem-bench", "crates/phrase-bench", "crates/script", "crates/remote", "crates/osc", "crates/broadcast", "crates/live", "crates/app"]
+members = ["crates/control", "crates/engine", "crates/controllers", "crates/waveform", "crates/library", "crates/export", "crates/plugins", "crates/plugin-host", "crates/plugin-host/test-plugin", "crates/plugin-host/test-vst3", "crates/separation", "crates/stem-bench", "crates/phrase-bench", "crates/script", "crates/remote", "crates/osc", "crates/broadcast", "crates/live", "crates/app", "crates/karaoke-render", "crates/tablet", "crates/studio", "crates/studio-engine"]
 exclude = ["third_party"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.9.5"
 edition = "2021"
 license = "GPL-2.0-or-later"
 
@@ -53,6 +53,35 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package.rubato]
+opt-level = 2
+
+# Quick rebuilds that still play smoothly: `cargo run --profile fast --bin opendj`.
+# Dependencies are built once at full speed and cached; openDJ's own crates
+# are built incrementally at a light optimisation level, so a change to one
+# file rebuilds in a fraction of the time `--release` takes.
+[profile.fast]
+inherits = "release"
+opt-level = 1
+incremental = true
+codegen-units = 256
+debug = false
+
+[profile.fast.package."*"]
+opt-level = 3
+codegen-units = 16
+incremental = false
+
+[profile.fast.package.opendj-engine]
+opt-level = 2
+
+[profile.fast.package.opendj-waveform]
+opt-level = 2
+
+[profile.fast.package.opendj-separation]
+opt-level = 2
+
+# The tablet app draws its waveforms on the CPU every frame.
+[profile.fast.package.opendj-tablet]
 opt-level = 2
 
 # femtovg (Slint's renderer) with a fix for its pipeline cache, which threw

@@ -240,6 +240,42 @@ pub trait SearchSource: Send {
         false
     }
 
+    /// Whether it has a place in the rail. A source that only plays other
+    /// sources' tracks (through [`Self::sites`] and [`Self::plays`]) can
+    /// stay out of it, working behind the service whose links it takes.
+    fn in_rail(&self) -> bool {
+        true
+    }
+
+    /// The streaming service whose catalog it browses for the app, e.g.
+    /// "tidal": the app's own source for that service then signs in, lists
+    /// playlists and searches through [`Self::browse`] instead of the
+    /// service's public API, so the DJ signs in once.
+    fn catalog(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Answers the app's source for [`Self::catalog`]. `ask["ask"]` says
+    /// what it wants:
+    ///
+    /// - `"connect"`: `{ "user", "playlists": [{ "key", "name", "count" }] }`
+    ///   once signed in, or `{ "waiting": link }` while a sign-in waits for
+    ///   the DJ (the app asks again).
+    /// - `"tracks"` with `"key"` (a playlist's key, `"liked"`,
+    ///   `"search:<words>"`, `"album:<id>"` or `"artist:<id>"`): `[track]`.
+    /// - `"lookup"` with `"ids"`: `[track]`.
+    /// - `"search"` with `"words"`: `{ "artists", "albums", "tracks" }`.
+    /// - `"artist"` with `"id"`: their page, `{ "tracks", "albums" }`
+    ///   (top tracks first).
+    /// - `"sign_out"`.
+    ///
+    /// A track is `{ "id", "isrc", "title", "artists": [..], "album",
+    /// "duration", "cover" }`; an artist `{ "id", "name", "picture" }`; an
+    /// album `{ "id", "title", "artist", "cover", "count" }`.
+    fn browse(&mut self, _ask: &serde_json::Value) -> Result<serde_json::Value, PluginError> {
+        Err(PluginError::NotSupported)
+    }
+
     /// Whether the DJ can hear a file from its searches before downloading
     /// it, with [`Self::preview`].
     fn previews(&self) -> bool {
@@ -284,8 +320,9 @@ pub trait SearchSource: Send {
 
     /// A short line for each download still queued or running, by key:
     /// where it is in the other user's queue, or how fast it comes ("4th in
-    /// line", "1.2 MB/s"). Asked with [`Self::progress`], so it must answer
-    /// quickly.
+    /// line", "1.2 MB/s"). For a finished download, a short quality line
+    /// ("256 kbps") that replaces the search result's in the Downloads
+    /// list. Asked with [`Self::progress`], so it must answer quickly.
     fn notes(&mut self) -> Vec<(String, String)> {
         Vec::new()
     }

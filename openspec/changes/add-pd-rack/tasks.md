@@ -1,0 +1,36 @@
+# Tasks
+
+## 1. Pd in the plugin helper (PR 1, experimental)
+
+- [x] 1.1 `Plugin::Pd` and helper `--pd <patch>`, running the patch in libpd behind the `pd` feature
+- [x] 1.2 Read parameters from the patch text (`@hv_param` receives, number boxes with a receive name), ids from the receive name
+- [x] 1.3 Whole-tick blocks with no added latency; other block sizes through a one-tick FIFO
+- [x] 1.4 Transport to `opendj-bpm`, `opendj-beat`, `opendj-playing`; MIDI notes, CC and bend in
+- [x] 1.5 Example patches (gain, beat-synced echo), helper tests and a round-trip benchmark
+- [x] 1.6 App feature `pd`: patches from the Pd folder listed as effects or instruments, with a Pd chip in Settings › Plugins
+- [ ] 1.7 Try it on macOS and Windows; turn the feature on in release builds once it builds everywhere
+
+## 2. Patches that last
+
+- [x] 2.1 Save the patch's knob values with the slot, and the arguments its Lua objects keep with `self:set_args` (the patch reopens with them)
+- [ ] 2.4 Reload a patch when its file is saved
+- [x] 2.5 A patch that only plays (`[dac~]`, no `[notein]` or `[adc~]`) lists as an instrument; sliders and radio buttons with a receive name become knobs, and the patch keeps its own values until a knob moves
+- [ ] 2.2 "Open in plugdata" (or Pd) from the slot
+- [ ] 2.3 Sample-exact MIDI within a block
+
+## 3. Libraries
+
+- [x] 3.1 Build cyclone and ELSE into the helper (their abstractions and a few objects needing ffmpeg, aubio, networking or Pd 0.56 left out)
+- [ ] 3.2 Understand plugdata's `[param]` objects
+
+## 4. Displays
+
+- [ ] 4.1 `.opendj.json` hints next to a patch: pages, knob, slider, XY pad or switch, units, macro for the FX bar
+- [x] 4.2 pd-lua in the helper; its `paint(g)` drawing caught and drawn by the helper in the plugin's editor window (OPEN), with mouse input
+- [x] 4.3 The same drawing shared with openDJ and shown on the instrument deck (a DISPLAY tab that fills the panel), with mouse input
+- [x] 4.4 The same display for an FX slot's Pd patch, in a panel opened from the slot's VIEW button
+- [x] 4.5 Move the VIEW panel by its title bar and resize it from its corner (it keeps the picture's shape); the area a display leaves around it takes the colour of its edge
+
+## 5. Max for Live devices
+
+- [ ] 5.1 Take an `.amxd` → `.pd` converter's output (patch, params and layout from Live dials) into the Pd folder
